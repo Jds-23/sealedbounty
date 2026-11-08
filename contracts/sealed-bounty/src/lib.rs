@@ -56,6 +56,8 @@ pub struct Program {
     pub commit: String,
     pub model_id: String,
     pub system_prompt_hash: String,
+    /// sha256hex of the canonical code bundle (64 lowercase hex). v2.
+    pub code_hash: String,
     pub payouts: Payouts,
     pub owner_enc_pubkey: String,
     pub dispute_secs: u64,
@@ -148,26 +150,83 @@ struct JudgeMessage {
     content: serde_json::Value,
 }
 
-/// `None` if the request matches the program, else the reject reason.
-fn tamper_reason(program: &Program, request_body: &str) -> Option<&'static str> {
-    const TAMPERED: &str = "system prompt tampered";
+pub(crate) const TAMPERED: &str = "system prompt tampered";
+pub(crate) const MODEL_MISMATCH: &str = "model mismatch";
+pub(crate) const CODE_MISMATCH: &str = "code mismatch";
+pub(crate) const HUNTER_MISMATCH: &str = "hunter mismatch";
+pub(crate) const REPORT_MISSING: &str = "report missing";
+
+/// `None` if the revealed request matches the program and the claim's hunter, else the FIRST
+/// failing reject reason (INTERFACE.md v2 order):
+/// 1. system prompt tampered (also: not JSON, or more than 3 messages)
+/// 2. model mismatch
+/// 3. code mismatch (messages[1] role/TARGET line/CODE framing/code hash)
+/// 4. hunter mismatch (only the HUNTER line differs from `hunter`)
+/// 5. report missing
+fn tamper_reason(
+    program: &Program,
+    hunter: &AccountId,
+    request_body: &str,
+) -> Option<&'static str> {
     let Ok(req) = serde_json::from_str::<JudgeRequest>(request_body) else {
         return Some(TAMPERED);
     };
-    let prompt_ok = match req.messages.first() {
-        Some(m) if m.role == "system" => match m.content.as_str() {
-            Some(c) => tee::sha256_hex(c.as_bytes()) == program.system_prompt_hash,
-            None => false,
-        },
+    let prompt_ok = req.messages.len() <= 3
+        && match req.messages.first() {
+            Some(m) if m.role == "system" => m
+                .content
+                .as_str()
+                .is_some_and(|c| tee::sha256_hex(c.as_bytes()) == program.system_prompt_hash),
+            _ => false,
+        };
+    if !prompt_ok {
+        return Some(TAMPERED);
+    }
+    if req.model != program.model_id {
+        return Some(MODEL_MISMATCH);
+    }
+    if let Err(r) = code_check(program, hunter, req.messages.get(1)) {
+        return Some(r);
+    }
+    let report_ok = match req.messages.get(2) {
+        Some(m) if m.role == "user" => m
+            .content
+            .as_str()
+            .is_some_and(|c| c.starts_with("REPORT\n")),
         _ => false,
     };
-    if !prompt_ok {
-        Some(TAMPERED)
-    } else if req.model != program.model_id {
-        Some("model mismatch")
-    } else {
-        None
+    if !report_ok {
+        return Some(REPORT_MISSING);
     }
+    None
+}
+
+/// messages[1] must be exactly `TARGET <repo>@<commit>\nHUNTER <hunter>\n\nCODE\n<bundle>` with
+/// sha256hex(bundle) == code_hash. The TARGET line is checked first, then the CODE framing and
+/// hash; only if everything but the HUNTER line matches is it a hunter mismatch.
+fn code_check(
+    program: &Program,
+    hunter: &AccountId,
+    msg: Option<&JudgeMessage>,
+) -> Result<(), &'static str> {
+    let content = match msg {
+        Some(m) if m.role == "user" => m.content.as_str().ok_or(CODE_MISMATCH)?,
+        _ => return Err(CODE_MISMATCH),
+    };
+    let target = format!("TARGET {}@{}\n", program.repo_url, program.commit);
+    let rest = content
+        .strip_prefix(target.as_str())
+        .and_then(|r| r.strip_prefix("HUNTER "))
+        .ok_or(CODE_MISMATCH)?;
+    let (claimed_hunter, rest) = rest.split_once('\n').ok_or(CODE_MISMATCH)?;
+    let bundle = rest.strip_prefix("\nCODE\n").ok_or(CODE_MISMATCH)?;
+    if tee::sha256_hex(bundle.as_bytes()) != program.code_hash {
+        return Err(CODE_MISMATCH);
+    }
+    if claimed_hunter != hunter.as_str() {
+        return Err(HUNTER_MISMATCH);
+    }
+    Ok(())
 }
 
 #[near]
@@ -245,6 +304,7 @@ impl Contract {
         commit: String,
         model_id: String,
         system_prompt_hash: String,
+        code_hash: String,
         payouts: Payouts,
         owner_enc_pubkey: String,
         dispute_secs: u64,
@@ -252,6 +312,8 @@ impl Contract {
     ) -> u64 {
         let system_prompt_hash = tee::normalize_hash_hex(&system_prompt_hash)
             .unwrap_or_else(|_| env::panic_str("system_prompt_hash must be 64 hex chars"));
+        let code_hash = tee::normalize_hash_hex(&code_hash)
+            .unwrap_or_else(|_| env::panic_str("code_hash must be 64 hex chars"));
         require!(min_confidence <= 100, "min_confidence must be <= 100");
         require!(
             dispute_secs.checked_mul(NANOS_PER_SEC).is_some(),
@@ -273,6 +335,7 @@ impl Contract {
                 commit,
                 model_id: model_id.clone(),
                 system_prompt_hash,
+                code_hash,
                 payouts,
                 owner_enc_pubkey,
                 dispute_secs,
@@ -437,7 +500,9 @@ impl Contract {
     }
 
     /// Program owner only, while the claim is Pending and the dispute window is open.
-    /// Reveals the exact judge request body; rejects the claim if it was not the program's judge.
+    /// Reveals the exact judge request body; rejects the claim if it was not the program's judge
+    /// request for this hunter. On "hunter mismatch" (front-run) the req_hash is released so the
+    /// real hunter can resubmit the same signed verdict.
     pub fn dispute(&mut self, claim_id: u64, request_body: String) {
         let claim = self
             .claims
@@ -458,10 +523,14 @@ impl Contract {
             "body mismatch"
         );
 
-        let reason = tamper_reason(program, &request_body)
-            .unwrap_or_else(|| env::panic_str("dispute invalid: prompt matches"));
+        let reason = tamper_reason(program, &claim.hunter, &request_body)
+            .unwrap_or_else(|| env::panic_str("dispute invalid: request matches program"));
 
         let (program_id, payout) = (claim.program_id, claim.payout.0);
+        if reason == HUNTER_MISMATCH {
+            let req_hash = claim.req_hash.clone();
+            self.used_req_hashes.remove(&req_hash);
+        }
         let c = self.claims.get_mut(&claim_id).unwrap();
         c.status = ClaimStatus::Rejected;
         c.reject_reason = Some(reason.to_string());

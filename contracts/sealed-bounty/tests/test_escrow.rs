@@ -1,4 +1,6 @@
 //! Sandbox end-to-end test of the escrow with the REAL live TEE fixtures (ed25519 + ecdsa).
+//! The live fixtures use the v1 single-user-message request format, so under the v2 dispute
+//! rules an honest-prompt dispute now rejects them with "code mismatch".
 
 use near_api::{AccountId, NearGas, NearToken};
 use near_sdk::serde::de::DeserializeOwned;
@@ -6,6 +8,9 @@ use near_sdk::serde_json::{self, Value, json};
 
 const NEAR: u128 = 10u128.pow(24);
 const DISPUTE_SECS: u64 = 20;
+/// code_hash for programs judged with v1 (live) bodies; never matches.
+const PLACEHOLDER_CODE_HASH: &str =
+    "00000000000000000000000000000000000000000000000000000000000000c0";
 
 struct Fx(Value);
 
@@ -223,6 +228,7 @@ impl Env {
         let args = json!({
             "name": "demo", "repo_url": "https://github.com/x/y", "commit": "abc123",
             "model_id": f.s("model"), "system_prompt_hash": hash,
+            "code_hash": PLACEHOLDER_CODE_HASH,
             "payouts": { "low": (NEAR / 2).to_string(), "medium": NEAR.to_string(),
                          "high": (2 * NEAR).to_string(), "critical": (4 * NEAR).to_string() },
             "owner_enc_pubkey": "b3duZXJwdWI=", "dispute_secs": DISPUTE_SECS, "min_confidence": min_conf,
@@ -260,8 +266,9 @@ impl Env {
     }
 }
 
-#[tokio::test]
-async fn escrow_end_to_end_live_fixtures() -> testresult::TestResult<()> {
+/// Build the wasm, start a sandbox, create admin/owner/stranger and the given hunter account
+/// (sandbox accounts are state patches, so any name works, e.g. a `.testnet` one).
+async fn start(hunter: &str) -> testresult::TestResult<Env> {
     let wasm_path = cargo_near_build::build_with_cli(Default::default())?;
     let wasm = std::fs::read(&wasm_path)?;
     println!("wasm size: {} bytes", wasm.len());
@@ -285,8 +292,14 @@ async fn escrow_end_to_end_live_fixtures() -> testresult::TestResult<()> {
     };
     e.admin = e.new_account("admin.sandbox", 10).await;
     e.owner = e.new_account("owner.sandbox", 100).await;
-    e.hunter = e.new_account("hunter.sandbox", 10).await;
+    e.hunter = e.new_account(hunter, 10).await;
     e.stranger = e.new_account("stranger.sandbox", 10).await;
+    Ok(e)
+}
+
+#[tokio::test]
+async fn escrow_end_to_end_live_fixtures() -> testresult::TestResult<()> {
+    let e = start("hunter.sandbox").await?;
 
     let ed = Fx::load("live.ed25519.json");
     let ec = Fx::load("live.ecdsa.json");
@@ -350,17 +363,8 @@ async fn escrow_end_to_end_live_fixtures() -> testresult::TestResult<()> {
         )
         .await;
 
-        // honest dispute attempt fails; finalize too early fails
+        // finalize too early fails
         let rb = json!({ "claim_id": cid, "request_body": f.s("request_body") });
-        e.fail(
-            &c,
-            &e.owner,
-            "dispute",
-            rb.clone(),
-            0,
-            "dispute invalid: prompt matches",
-        )
-        .await;
         e.fail(
             &c,
             &e.stranger,
@@ -503,6 +507,208 @@ async fn escrow_end_to_end_live_fixtures() -> testresult::TestResult<()> {
             .view(&c, "list_claims", json!({ "program_id": pid }))
             .await;
         assert_eq!(claims.len(), 1);
+
+        // ---- program 3 (fresh escrow): right prompt + model, v1 body -> "code mismatch" ----
+        let c = e.deploy(&format!("esc3-{algo}.sandbox")).await;
+        let pid = e
+            .create_program(&c, f, f.system_prompt_hash(), 0, 10 * NEAR)
+            .await;
+        let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
+        assert_eq!(p["code_hash"], PLACEHOLDER_CODE_HASH);
+        let bal0 = u128_of(&p["balance"]);
+        let cid: u64 = e
+            .ok(&c, &e.hunter, "submit_claim", f.claim_args(pid), NEAR / 10)
+            .await
+            .json()?;
+        let rb = json!({ "claim_id": cid, "request_body": f.s("request_body") });
+        let r = e.ok(&c, &e.owner, "dispute", rb, 0).await;
+        println!(
+            "  [GAS] dispute v1 body ({algo}): {}",
+            tgas(r.total_gas_burnt)
+        );
+        let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
+        assert_eq!(claim["status"], "Rejected");
+        assert_eq!(claim["reject_reason"], "code mismatch");
+        let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
+        assert_eq!(u128_of(&p["balance"]), bal0);
+        assert_eq!(u128_of(&p["reserved"]), 0);
+        // not a hunter mismatch: the req_hash stays used
+        e.fail(
+            &c,
+            &e.hunter,
+            "submit_claim",
+            f.claim_args(pid),
+            NEAR / 10,
+            "already claimed",
+        )
+        .await;
     }
+    Ok(())
+}
+
+fn read_fixture_text(name: &str) -> String {
+    let p = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(p).unwrap().trim().to_string()
+}
+
+/// v2 E2E with REAL v2 TEE-signed demo fixtures (spec v2: code bundle + HUNTER line).
+/// - front-runner copies the sqli claim -> dispute "hunter mismatch" -> req_hash released
+/// - real hunter resubmits -> dispute panics "request matches program" -> finalize pays
+/// - fakecode (TEE said valid/critical about invented code) -> dispute "code mismatch"
+#[tokio::test]
+async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
+    let sqli = Fx::load("demo.sqli.json");
+    let sqli_ec = Fx::load("demo.sqli.ecdsa.json");
+    let fake = Fx::load("demo.fakecode.json");
+    let bogus = Fx::load("demo.bogus.json");
+    for f in [&sqli, &sqli_ec, &fake, &bogus] {
+        assert_eq!(f.0["spec"], "v2");
+    }
+    let inputs = &sqli.0["inputs"];
+    let hunter_id = inputs["hunter"].as_str().unwrap();
+    let e = start(hunter_id).await?;
+    assert_eq!(e.hunter.as_str(), hunter_id);
+
+    let code_hash = read_fixture_text("demo.code.sha256");
+    let prompt_hash = read_fixture_text("demo.system-prompt.sha256");
+    assert_eq!(sqli.system_prompt_hash(), prompt_hash);
+
+    let c = e.deploy("esc-v2.sandbox").await;
+    let args = json!({
+        "name": "vuln-app", "repo_url": inputs["repoUrl"], "commit": inputs["commit"],
+        "model_id": sqli.s("model"), "system_prompt_hash": prompt_hash,
+        "code_hash": code_hash.to_uppercase(),
+        "payouts": { "low": (NEAR / 2).to_string(), "medium": NEAR.to_string(),
+                     "high": (2 * NEAR).to_string(), "critical": (3 * NEAR).to_string() },
+        "owner_enc_pubkey": "b3duZXJwdWI=", "dispute_secs": DISPUTE_SECS, "min_confidence": 80,
+    });
+    let pid: u64 = e
+        .ok(&c, &e.owner, "create_program", args, 10 * NEAR)
+        .await
+        .json()?;
+    let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
+    assert_eq!(p["code_hash"], code_hash, "stored lowercase");
+    let bal0 = u128_of(&p["balance"]);
+
+    // bogus report: TEE said not valid
+    e.fail(
+        &c,
+        &e.hunter,
+        "submit_claim",
+        bogus.claim_args(pid),
+        NEAR / 10,
+        "verdict not payable",
+    )
+    .await;
+
+    // ---- front-running: stranger copies the hunter's signed sqli claim ----
+    let front: u64 = e
+        .ok(
+            &c,
+            &e.stranger,
+            "submit_claim",
+            sqli.claim_args(pid),
+            NEAR / 10,
+        )
+        .await
+        .json()?;
+    e.fail(
+        &c,
+        &e.hunter,
+        "submit_claim",
+        sqli.claim_args(pid),
+        NEAR / 10,
+        "already claimed",
+    )
+    .await;
+    let rb_front = json!({ "claim_id": front, "request_body": sqli.s("request_body") });
+    let r = e.ok(&c, &e.owner, "dispute", rb_front, 0).await;
+    println!(
+        "  [GAS] dispute hunter mismatch: {}",
+        tgas(r.total_gas_burnt)
+    );
+    let claim: Value = e.view(&c, "get_claim", json!({ "id": front })).await;
+    assert_eq!(claim["status"], "Rejected");
+    assert_eq!(claim["reject_reason"], "hunter mismatch");
+    let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
+    assert_eq!(u128_of(&p["balance"]), bal0);
+    assert_eq!(u128_of(&p["reserved"]), 0);
+
+    // ---- real hunter resubmits the same signed verdict ----
+    let cid: u64 = e
+        .ok(
+            &c,
+            &e.hunter,
+            "submit_claim",
+            sqli.claim_args(pid),
+            NEAR / 10,
+        )
+        .await
+        .json()?;
+    let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
+    assert_eq!(claim["hunter"], hunter_id);
+    assert_eq!(claim["verdict"]["severity"], "critical");
+    assert_eq!(u128_of(&claim["payout"]), 3 * NEAR);
+    // same request signed by the other (ecdsa) signer can't double-claim
+    e.fail(
+        &c,
+        &e.hunter,
+        "submit_claim",
+        sqli_ec.claim_args(pid),
+        NEAR / 10,
+        "already claimed",
+    )
+    .await;
+    let rb = json!({ "claim_id": cid, "request_body": sqli.s("request_body") });
+    e.fail(
+        &c,
+        &e.owner,
+        "dispute",
+        rb.clone(),
+        0,
+        "dispute invalid: request matches program",
+    )
+    .await;
+
+    // ---- fakecode: TEE judged invented code valid/critical; owner proves code mismatch ----
+    assert_eq!(fake.0["verdict"]["severity"], "critical");
+    let fid: u64 = e
+        .ok(
+            &c,
+            &e.hunter,
+            "submit_claim",
+            fake.claim_args(pid),
+            NEAR / 10,
+        )
+        .await
+        .json()?;
+    let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
+    assert_eq!(u128_of(&p["reserved"]), 6 * NEAR);
+    assert_eq!(u128_of(&p["balance"]), bal0 - 6 * NEAR);
+    let rf = json!({ "claim_id": fid, "request_body": fake.s("request_body") });
+    let r = e.ok(&c, &e.owner, "dispute", rf, 0).await;
+    println!("  [GAS] dispute code mismatch: {}", tgas(r.total_gas_burnt));
+    let claim: Value = e.view(&c, "get_claim", json!({ "id": fid })).await;
+    assert_eq!(claim["status"], "Rejected");
+    assert_eq!(claim["reject_reason"], "code mismatch");
+    let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
+    assert_eq!(u128_of(&p["reserved"]), 3 * NEAR, "fakecode payout back");
+    assert_eq!(u128_of(&p["balance"]), bal0 - 3 * NEAR);
+
+    // ---- finalize the honest sqli claim ----
+    let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
+    e.advance_past(claim["finalize_after"].as_str().unwrap().parse::<u64>()?)
+        .await;
+    let before = e.balance(&e.hunter).await;
+    e.ok(&c, &e.stranger, "finalize", json!({ "claim_id": cid }), 0)
+        .await;
+    assert_eq!(e.balance(&e.hunter).await - before, 3 * NEAR);
+    let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
+    assert_eq!(claim["status"], "Paid");
+    e.fail(&c, &e.owner, "dispute", rb, 0, "claim not pending")
+        .await;
+    let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
+    assert_eq!(u128_of(&p["reserved"]), 0);
+    assert_eq!(u128_of(&p["balance"]), bal0 - 3 * NEAR);
     Ok(())
 }
