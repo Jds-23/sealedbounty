@@ -1,12 +1,15 @@
-// Offline demo: re-verifies every fixtures/demo.*.json (no key, no network) and checks the
-// owner encrypt -> decrypt roundtrip. Exit code 1 on any failure.
+// Offline demo: re-verifies every fixtures/demo.*.json (no key, no network), runs the v2 dispute
+// pre-check (checkRequestAgainstProgram) against the demo program, simulates a front-run, and checks
+// the owner encrypt -> decrypt roundtrip. Exit code 1 on any failure.
 import { readFileSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
-  verifyFixture, systemPromptHash, SYSTEM_PROMPT,
+  verifyFixture, systemPromptHash, SYSTEM_PROMPT, DEFAULT_MODEL,
+  buildCodeBundle, codeHash, checkRequestAgainstProgram,
   encryptForOwner, decryptAsOwner, generateOwnerKeypair,
 } from './judge.mjs';
+import { DEMO_TARGET, DEMO_HUNTER, DEMO_FRONTRUNNER } from './demo-data.mjs';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 let fail = 0;
@@ -19,7 +22,23 @@ const promptOk = txt === SYSTEM_PROMPT && realHash === fileHash && realHash === 
 console.log(`system prompt sha256 ${realHash}  ${promptOk ? 'OK' : 'MISMATCH (run pnpm gen:prompt)'}`);
 if (!promptOk) fail++;
 
-// 2. fixtures
+// 2. program code bundle: src/server.ts -> bundle.txt -> bundle.sha256
+const bundle = readFileSync(here('../fixtures/vuln-app/bundle.txt'), 'utf8');
+const bundleHash = readFileSync(here('../fixtures/vuln-app/bundle.sha256'), 'utf8').trim();
+const rebuiltBundle = buildCodeBundle([{ path: 'src/server.ts', content: readFileSync(here('../fixtures/vuln-app/src/server.ts'), 'utf8') }]);
+const bundleOk = rebuiltBundle === bundle && codeHash(bundle) === bundleHash;
+console.log(`code bundle sha256   ${bundleHash}  ${bundleOk ? 'OK' : 'MISMATCH (bundle.txt/.sha256 stale vs src/server.ts)'}`);
+if (!bundleOk) fail++;
+
+// Demo program as the contract stores it (Program view, snake_case).
+const program = {
+  repo_url: DEMO_TARGET.repoUrl, commit: DEMO_TARGET.commit, model_id: DEFAULT_MODEL,
+  system_prompt_hash: systemPromptHash(), code_hash: bundleHash,
+};
+// Expected dispute outcome per fixture: null = dispute fails ("request matches program").
+const EXPECT_DISPUTE = { fakecode: 'code mismatch' };
+
+// 3. fixtures
 const dir = here('../fixtures/');
 const files = readdirSync(dir).filter((f) => /^demo\..+\.json$/.test(f)).sort();
 if (!files.length) { console.log('no fixtures/demo.*.json found'); fail++; }
@@ -27,19 +46,33 @@ const rows = [];
 const ciphertextChecks = [];
 for (const f of files) {
   const obj = JSON.parse(readFileSync(dir + f, 'utf8'));
-  const r = verifyFixture(obj, { systemPromptHash: systemPromptHash() });
-  if (!r.ok) {
-    fail++;
-    for (const c of r.checks.filter((c) => !c.ok)) console.log(`  FAIL ${f}: ${c.name} [${c.detail}]`);
-  }
+  const name = f.replace(/^demo\.|\.json$/g, '');
+  const r = verifyFixture(obj, { systemPromptHash: systemPromptHash(), codeBundle: bundle });
+  const specOk = obj.spec === 'v2' && obj.inputs?.hunter === DEMO_HUNTER;
+  if (!specOk) console.log(`  FAIL ${f}: not a v2 fixture for ${DEMO_HUNTER}`);
+  if (!r.ok) for (const c of r.checks.filter((c) => !c.ok)) console.log(`  FAIL ${f}: ${c.name} [${c.detail}]`);
+  const d = checkRequestAgainstProgram(obj.request_body, program, obj.inputs?.hunter);
+  const want = EXPECT_DISPUTE[name.split('.')[0]] ?? null;
+  const dOk = d.reason === want;
+  if (!dOk) console.log(`  FAIL ${f}: dispute pre-check got ${d.reason ?? 'matches'}, expected ${want ?? 'matches'}`);
+  if (!r.ok || !specOk || !dOk) fail++;
   const v = r.verdict;
   rows.push({
-    exploit: f.replace(/^demo\.|\.json$/g, ''),
+    exploit: name,
     verdict: v ? `${v.valid ? 'VALID' : 'invalid'} ${v.severity} ${v.cwe ?? '-'} conf=${v.confidence}` : '?',
     kind: obj.signature_kind,
     'sig ok': r.ok ? 'yes' : 'NO',
     signer: r.signer ?? '?',
+    dispute: d.ok ? 'fails (request matches)' : `REJECT: ${d.reason}`,
+    expected: dOk ? 'yes' : 'NO',
   });
+  if (name === 'sqli') {
+    // Front-run: someone copies the pending submit_claim args (same body) and claims as themselves.
+    const fr = checkRequestAgainstProgram(obj.request_body, program, DEMO_FRONTRUNNER);
+    const frOk = fr.reason === 'hunter mismatch';
+    console.log(`  front-run sim: sqli body claimed by ${DEMO_FRONTRUNNER} -> ${fr.reason ?? 'matches'}  ${frOk ? 'OK' : 'FAIL'}`);
+    if (!frOk) fail++;
+  }
   ciphertextChecks.push(obj.request_body);
 }
 const cols = Object.keys(rows[0] ?? {});

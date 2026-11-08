@@ -7,6 +7,7 @@
   "exports": {
     ".": "./judge.mjs",
     "./judge.mjs": "./judge.mjs",
+    "./demo-data.mjs": "./demo-data.mjs",
     "./system-prompt.mjs": "./system-prompt.mjs",
     "./system-prompt.txt": "./system-prompt.txt"
   },

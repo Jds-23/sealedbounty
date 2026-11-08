@@ -1,6 +1,7 @@
 // SealedBounty shared judge library (ESM, isomorphic: Node >= 22 and browsers, no node:* imports).
 //
-// Stable API used by cli/ and web/. Spec: docs/INTERFACE.md ("Canonical judge request body").
+// Stable API used by cli/ and web/. Spec: docs/INTERFACE.md ("v2": code bundle + hunter bound into
+// the request; "Canonical judge request v2").
 // Recording/verification logic is ported from spike/sign/{lib,record}.mjs (Phase 0, proven live).
 //
 // Never logs or returns the API key. Error messages have the key redacted.
@@ -72,17 +73,97 @@ export function systemPromptHash() {
   return SYSTEM_PROMPT_SHA256;
 }
 
+// ---------------------------------------------------------------- code bundle (v2)
+
+/**
+ * Build the canonical code bundle the program owner publishes (docs/INTERFACE.md v2).
+ * Files are sorted by path in utf8 byte order; each entry is
+ * `// file: <path>\n<content>` with a trailing `\n` appended to content if missing; entries are
+ * concatenated with no separator.
+ * @param {{path: string, content: string}[]} files
+ * @returns {string} bundle; Program.code_hash = codeHash(bundle)
+ */
+export function buildCodeBundle(files) {
+  if (!Array.isArray(files) || files.length === 0) throw new Error('buildCodeBundle: files must be a non-empty array');
+  const enc = (s) => utf8(s);
+  const cmp = (a, b) => {
+    const x = enc(a), y = enc(b);
+    for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i] - y[i];
+    return x.length - y.length;
+  };
+  const seen = new Set();
+  for (const f of files) {
+    if (typeof f?.path !== 'string' || !f.path || typeof f.content !== 'string') throw new Error('buildCodeBundle: each file needs string path and content');
+    if (seen.has(f.path)) throw new Error(`buildCodeBundle: duplicate path ${f.path}`);
+    seen.add(f.path);
+  }
+  return [...files]
+    .sort((a, b) => cmp(a.path, b.path))
+    .map((f) => `// file: ${f.path}\n${f.content.endsWith('\n') ? f.content : f.content + '\n'}`)
+    .join('');
+}
+
+/**
+ * Program.code_hash: sha256hex(utf8(bundle)).
+ * @param {string} bundle output of buildCodeBundle
+ * @returns {string} 64 lowercase hex chars
+ */
+export function codeHash(bundle) {
+  if (typeof bundle !== 'string') throw new Error('codeHash: bundle must be a string');
+  return sha256hex(bundle);
+}
+
+/**
+ * Exact prefix of messages[1].content before the code bundle (what the contract's dispute checks).
+ * @param {{repoUrl: string, commit: string, hunter: string}} p
+ * @returns {string} `TARGET <repoUrl>@<commit>\nHUNTER <hunter>\n\nCODE\n`
+ */
+export function codeMessagePrefix({ repoUrl, commit, hunter }) {
+  return `TARGET ${repoUrl}@${commit}\nHUNTER ${hunter}\n\nCODE\n`;
+}
+
 // ---------------------------------------------------------------- request body
 
 /**
- * Build the canonical judge request body (exact string that is sent AND hashed).
- * Key order and content are fixed by docs/INTERFACE.md; do not re-serialize the result.
- * @param {{model: string, repoUrl: string, commit: string, codeExcerpt: string, report: string}} p
+ * Build the canonical v2 judge request body (exact string that is sent AND hashed).
+ * messages = [system prompt, user `TARGET..\nHUNTER..\n\nCODE\n<codeBundle>`, user `REPORT\n<report>`].
+ * Key order and content are fixed by docs/INTERFACE.md (v2); do not re-serialize the result.
+ * @param {{model: string, repoUrl: string, commit: string, hunter: string, codeBundle: string, report: string}} p
+ *   hunter = the NEAR account that will call submit_claim; codeBundle = the program's published bundle, byte for byte
  * @returns {string} JSON string; req_hash = sha256hex(this string)
  */
-export function buildRequestBody({ model, repoUrl, commit, codeExcerpt, report }) {
-  for (const [k, v] of Object.entries({ model, repoUrl, commit, codeExcerpt, report })) {
+export function buildRequestBody({ model, repoUrl, commit, hunter, codeBundle, report, ...rest }) {
+  if ('codeExcerpt' in rest && codeBundle === undefined) {
+    throw new Error('buildRequestBody: v1 codeExcerpt is gone; pass hunter + codeBundle (v2) or use buildRequestBodyV1');
+  }
+  for (const [k, v] of Object.entries({ model, repoUrl, commit, hunter, codeBundle, report })) {
     if (typeof v !== 'string' || v.length === 0) throw new Error(`buildRequestBody: ${k} must be a non-empty string`);
+  }
+  if (/\s/.test(hunter)) throw new Error('buildRequestBody: hunter must not contain whitespace');
+  return JSON.stringify({
+    model,
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: codeMessagePrefix({ repoUrl, commit, hunter }) + codeBundle },
+      { role: 'user', content: `REPORT\n${report}` },
+    ],
+    response_format: VERDICT_RESPONSE_FORMAT,
+    chat_template_kwargs: { enable_thinking: false },
+    temperature: 0,
+    max_tokens: 400,
+  });
+}
+
+/**
+ * LEGACY v1 body (single user message, hunter-supplied excerpt). Only for re-verifying v1 records;
+ * a v2 contract rejects these on dispute ("code mismatch").
+ * @deprecated use buildRequestBody (v2)
+ * @param {{model: string, repoUrl: string, commit: string, codeExcerpt: string, report: string}} p
+ * @returns {string}
+ */
+export function buildRequestBodyV1({ model, repoUrl, commit, codeExcerpt, report }) {
+  for (const [k, v] of Object.entries({ model, repoUrl, commit, codeExcerpt, report })) {
+    if (typeof v !== 'string' || v.length === 0) throw new Error(`buildRequestBodyV1: ${k} must be a non-empty string`);
   }
   return JSON.stringify({
     model,
@@ -95,6 +176,60 @@ export function buildRequestBody({ model, repoUrl, commit, codeExcerpt, report }
     temperature: 0,
     max_tokens: 400,
   });
+}
+
+/**
+ * Pre-check a request body against a program the way the v2 contract's `dispute` does (after its
+ * sha256 == req_hash check), returning the FIRST failing reason in contract order:
+ * 1 "system prompt tampered" (unparsable JSON, messages[0] not system / hash != system_prompt_hash,
+ *   or more than 3 messages), 2 "model mismatch", 3 "code mismatch" (messages[1] not user, TARGET line,
+ *   malformed HUNTER/CODE header, or sha256(code) != code_hash), 4 "hunter mismatch" (only the HUNTER
+ *   line differs from `hunter`: front-running), 5 "report missing" (messages[2] missing / not user /
+ *   not starting with "REPORT\n").
+ * ok:true means a dispute would fail with "dispute invalid: request matches program".
+ * @param {string} requestBody exact request body
+ * @param {{repo_url: string, commit: string, model_id: string, system_prompt_hash: string, code_hash: string}} program
+ *   contract Program view (snake_case, as returned by get_program)
+ * @param {string} hunter the account that submits (or submitted) the claim
+ * @returns {{ok: boolean, reason: null|'system prompt tampered'|'model mismatch'|'code mismatch'|'hunter mismatch'|'report missing'}}
+ */
+export function checkRequestAgainstProgram(requestBody, program, hunter) {
+  const fail = (reason) => ({ ok: false, reason });
+  let req;
+  try { req = JSON.parse(requestBody); } catch { return fail('system prompt tampered'); }
+  if (req === null || typeof req !== 'object' || typeof req.model !== 'string' || !Array.isArray(req.messages)) {
+    return fail('system prompt tampered');
+  }
+  const msgs = req.messages;
+  const isMsg = (m) => m !== null && typeof m === 'object' && typeof m.role === 'string' && 'content' in m;
+  if (!msgs.every(isMsg)) return fail('system prompt tampered'); // contract: messages fail to deserialize
+  const m0 = msgs[0];
+  if (!m0 || m0.role !== 'system' || typeof m0.content !== 'string' || sha256hex(m0.content) !== program.system_prompt_hash) {
+    return fail('system prompt tampered');
+  }
+  if (msgs.length > 3) return fail('system prompt tampered');
+  if (req.model !== program.model_id) return fail('model mismatch');
+
+  const m1 = msgs[1];
+  if (!m1 || m1.role !== 'user' || typeof m1.content !== 'string') return fail('code mismatch');
+  const target = `TARGET ${program.repo_url}@${program.commit}\n`;
+  if (!m1.content.startsWith(target)) return fail('code mismatch');
+  const afterTarget = m1.content.slice(target.length);
+  if (!afterTarget.startsWith('HUNTER ')) return fail('code mismatch');
+  const nl = afterTarget.indexOf('\n');
+  if (nl < 0) return fail('code mismatch');
+  const claimedHunter = afterTarget.slice('HUNTER '.length, nl);
+  const codeHdr = '\n\nCODE\n';
+  if (!afterTarget.startsWith(codeHdr, nl)) return fail('code mismatch');
+  const code = afterTarget.slice(nl + codeHdr.length);
+  if (sha256hex(code) !== program.code_hash) return fail('code mismatch');
+  if (claimedHunter !== String(hunter)) return fail('hunter mismatch');
+
+  const m2 = msgs[2];
+  if (!m2 || m2.role !== 'user' || typeof m2.content !== 'string' || !m2.content.startsWith('REPORT\n')) {
+    return fail('report missing');
+  }
+  return { ok: true, reason: null };
 }
 
 // ---------------------------------------------------------------- verdict + signatures
@@ -274,13 +409,14 @@ export async function signRecord({ apiKey, baseUrl, record, algo = 'ed25519', ch
  * Run one judge completion on NEAR AI Cloud, fetch its TEE signature, verify everything locally.
  * Throws on HTTP errors, unparsable verdicts, signature/text mismatch or (by default) a signer that
  * is not in a fresh attestation report.
- * @param {{apiKey: string, baseUrl?: string, model?: string, repoUrl: string, commit: string, codeExcerpt: string, report: string, signingAlgo?: 'ed25519'|'ecdsa', checkAttestation?: boolean, fetchImpl?: typeof fetch}} p
+ * The request is the v2 body from buildRequestBody (hunter + program code bundle bound in).
+ * @param {{apiKey: string, baseUrl?: string, model?: string, repoUrl: string, commit: string, hunter: string, codeBundle: string, report: string, signingAlgo?: 'ed25519'|'ecdsa', checkAttestation?: boolean, fetchImpl?: typeof fetch}} p
  * @returns {Promise<JudgeRecord>}
  */
-export async function judge({ apiKey, baseUrl, model = DEFAULT_MODEL, repoUrl, commit, codeExcerpt, report, signingAlgo = 'ed25519', checkAttestation = true, fetchImpl = fetch }) {
+export async function judge({ apiKey, baseUrl, model = DEFAULT_MODEL, repoUrl, commit, hunter, codeBundle, report, signingAlgo = 'ed25519', checkAttestation = true, fetchImpl = fetch }) {
   if (!apiKey) throw new Error('judge: apiKey required');
   const redact = redactor(apiKey);
-  const request_body = buildRequestBody({ model, repoUrl, commit, codeExcerpt, report });
+  const request_body = buildRequestBody({ model, repoUrl, commit, hunter, codeBundle, report });
   const res = await fetchImpl(`${trimBase(baseUrl)}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -305,10 +441,14 @@ export async function judge({ apiKey, baseUrl, model = DEFAULT_MODEL, repoUrl, c
 
 /**
  * Offline re-verification of a recorded judge result (no network, no key).
- * If `obj.inputs` ({repoUrl, commit, codeExcerpt, report}) is present, also checks that
- * buildRequestBody(inputs) reproduces request_body byte for byte.
- * @param {JudgeRecord & {inputs?: {repoUrl: string, commit: string, codeExcerpt: string, report: string}}} obj
- * @param {{systemPromptHash?: string}} [opts] when set, messages[0].content must hash to it
+ * If `obj.inputs` is present, also checks that the inputs rebuild request_body byte for byte:
+ * - v2 inputs {repoUrl, commit, hunter, report, codeBundle?}: codeBundle comes from inputs, else
+ *   opts.codeBundle, else it is taken from the body's CODE section (structure is still checked).
+ * - legacy v1 inputs {repoUrl, commit, codeExcerpt, report}: rebuilt with buildRequestBodyV1.
+ * Whether the CODE matches a program is NOT checked here; use checkRequestAgainstProgram (or opts.codeHash).
+ * @param {JudgeRecord & {spec?: string, inputs?: {repoUrl: string, commit: string, hunter?: string, codeBundle?: string, codeExcerpt?: string, report: string}}} obj
+ * @param {{systemPromptHash?: string, codeBundle?: string, codeHash?: string}} [opts]
+ *   systemPromptHash: messages[0].content must hash to it; codeHash: the body's CODE section must hash to it
  * @returns {{ok: boolean, checks: {name: string, ok: boolean, detail: string}[], verdict: object|null, signer: string|null}}
  */
 export function verifyFixture(obj, opts = {}) {
@@ -339,9 +479,26 @@ export function verifyFixture(obj, opts = {}) {
       const h = req.messages?.[0]?.role === 'system' ? sha256hex(req.messages[0].content) : 'no system message';
       add('system prompt hash matches', h === opts.systemPromptHash, h);
     }
+    const bodyCode = () => {
+      const c = req.messages?.[1]?.content;
+      const i = typeof c === 'string' ? c.indexOf('\n\nCODE\n') : -1;
+      return i < 0 ? null : c.slice(i + '\n\nCODE\n'.length);
+    };
     if (obj.inputs) {
-      const rebuilt = buildRequestBody({ model: obj.model, ...obj.inputs });
+      const { codeExcerpt, codeBundle, ...rest } = obj.inputs;
+      let rebuilt;
+      if (codeExcerpt !== undefined && rest.hunter === undefined) {
+        rebuilt = buildRequestBodyV1({ model: obj.model, ...obj.inputs });
+      } else {
+        const cb = codeBundle ?? opts.codeBundle ?? bodyCode();
+        rebuilt = cb == null ? null : buildRequestBody({ model: obj.model, ...rest, codeBundle: cb });
+      }
       add('inputs rebuild request_body exactly', rebuilt === obj.request_body);
+    }
+    if (opts.codeHash) {
+      const c = bodyCode();
+      const h = c == null ? 'no CODE section' : sha256hex(c);
+      add('code hash matches', h === opts.codeHash, h);
     }
   } catch (e) {
     add('fixture well-formed', false, e.message);
