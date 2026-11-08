@@ -20,7 +20,7 @@ Config is read from the repo-root `.env`:
 | var | default | used for |
 |---|---|---|
 | `ESCROW_CONTRACT_ID` | `escrow.baldingsucks7993.testnet` | escrow contract (`--contract` overrides it). `CONTRACT_ID` is ignored because it points at the Phase 0 spike. |
-| `NEAR_NETWORK` / `NEAR_RPC_URL` | `testnet` / `https://rpc.testnet.near.org` | RPC |
+| `NEAR_NETWORK` / `NEAR_RPC_URL` | `testnet` / `https://test.rpc.fastnear.com` | RPC |
 | `NEAR_TESTNET_ACCOUNT_ID` | none | default signer (`--account` overrides it) |
 | `NEAR_CREDENTIALS_PATH` | `~/.near-credentials/<network>/<account>.json` | signing key (near-cli JSON format) |
 | `NEARAI_API_KEY`, `NEARAI_BASE_URL`, `NEARAI_MODEL`, `NEARAI_SIGNING_ALGO` | none, `https://cloud-api.near.ai/v1`, `Qwen/Qwen3.8-27B`, `ed25519` | judging (`submit` without `--fixture`) |

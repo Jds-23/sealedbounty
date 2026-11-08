@@ -37,7 +37,7 @@ export function config(): Config {
   const algo = (e.NEARAI_SIGNING_ALGO || 'ed25519').toLowerCase();
   return {
     network,
-    rpcUrl: e.NEAR_RPC_URL || `https://rpc.${network}.near.org`,
+    rpcUrl: e.NEAR_RPC_URL || (network === "mainnet" ? "https://free.rpc.fastnear.com" : "https://test.rpc.fastnear.com"),
     // Deliberately NOT falling back to CONTRACT_ID: in .env that points at the Phase 0 spike contract.
     contractId: e.ESCROW_CONTRACT_ID || 'escrow.baldingsucks7993.testnet',
     accountId: e.NEAR_TESTNET_ACCOUNT_ID || e.NEAR_ACCOUNT_ID || undefined,
