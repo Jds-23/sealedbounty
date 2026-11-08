@@ -54,7 +54,7 @@ are in the [`Makefile`](./Makefile). No NEAR AI key, NEAR account or `.env` is n
    - `sb submit --program 0 --fixture ../fixtures/demo.sqli.json --dry-run`: you should see the local verification
      passing, the request body encrypted to the owner, the exact `submit_claim` args, the storage deposit
      (about 0.115 NEAR), and `--dry-run: not sent.`. No network is used.
-4. Run `make test-cli` to see `Tests 20 passed`, and `make test-web` to see `Tests 42 passed`.
+4. Run `make test-cli` to see `Tests 20 passed`, and `make test-web` to see `Tests 51 passed | 1 skipped (52)` (the skipped test needs the owner key file, which only exists on the deployer's machine).
 5. Run `make test-contract` (the first run takes a few minutes to compile and download `near-sandbox`). You should see
    `55 passed` unit tests plus the near-sandbox E2E tests in `tests/test_escrow.rs` and `tests/test_verify.rs`, 57
    in total. The E2E tests deploy the wasm to a local sandbox and submit **real** TEE-signed responses
