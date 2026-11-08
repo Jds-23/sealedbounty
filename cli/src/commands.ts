@@ -17,7 +17,7 @@ import {
 } from './args.js';
 import { buildBundleFromFiles, readBundle } from './bundle.js';
 import { REPO_ROOT, config, nearaiApiKey } from './config.js';
-import { finalizeOwnerKey, loadOwnerKey, savePendingOwnerKey, tryLoadOwnerKey } from './crypto.js';
+import { finalizeOwnerKey, loadOwnerKey, ownerKeyPath, savePendingOwnerKey, tryLoadOwnerKey } from './crypto.js';
 import { shared as api, demo, verifySignerSig, type ProgramBinding } from './shared.js';
 import { callContract, getSigners, listClaims, listPrograms, loadAccount, mustGetClaim, mustGetProgram } from './near.js';
 import type { CheckRow, Claim, JudgeRecord, Program } from './types.js';
@@ -347,7 +347,7 @@ export async function cmdSubmit(o: {
     ownerPubSrc = '--owner-pubkey';
   } else if (tryLoadOwnerKey(programId)) {
     ownerPub = tryLoadOwnerKey(programId)!.publicKey;
-    ownerPubSrc = `local ~/.sealedbounty/owner-${programId}.json`;
+    ownerPubSrc = `local ${ownerKeyPath(programId)}`;
   } else {
     ownerPub = api.generateOwnerKeypair().publicKey;
     ownerPubSrc = 'THROWAWAY key (offline dry-run; ciphertext size is exact, content unreadable)';

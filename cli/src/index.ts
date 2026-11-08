@@ -37,7 +37,7 @@ program
 
 program
   .command('create-program')
-  .description('Create and fund a bounty program bound to a code bundle (code_hash); generates the owner encryption keypair (secret saved to ~/.sealedbounty/owner-<id>.json)')
+  .description('Create and fund a bounty program bound to a code bundle (code_hash); generates the owner encryption keypair (secret saved to ~/.sealedbounty/owner-<contract>-<id>.json)')
   .requiredOption('--name <name>', 'program name')
   .requiredOption('--repo <url>', 'repository URL')
   .requiredOption('--commit <sha>', 'commit under review')

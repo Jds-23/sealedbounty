@@ -33,16 +33,18 @@ describe('owner encryption (shared/judge.mjs)', () => {
 });
 
 describe('owner key file', () => {
-  it('saves pending, then renames to owner-<id>.json with mode 600', () => {
+  it('saves pending, then renames to owner-<contract>-<id>.json with mode 600', () => {
     const home = mkdtempSync(join(tmpdir(), 'sb-'));
     const kp = shared.generateOwnerKeypair();
     const pending = savePendingOwnerKey(kp, 'escrow.x.testnet', 'testnet', home);
     expect(statSync(pending).mode & 0o777).toBe(0o600);
     const dest = finalizeOwnerKey(pending, 7, home);
-    expect(dest).toBe(join(home, 'owner-7.json'));
+    expect(dest).toBe(join(home, 'owner-escrow.x.testnet-7.json'));
     expect(statSync(dest).mode & 0o777).toBe(0o600);
-    const loaded = loadOwnerKey(7, home);
+    const loaded = loadOwnerKey(7, home, 'escrow.x.testnet');
     expect(loaded).toMatchObject({ ...kp, program_id: 7, contract_id: 'escrow.x.testnet' });
-    expect(() => finalizeOwnerKey(savePendingOwnerKey(shared.generateOwnerKeypair(), 'c', 'testnet', home), 7, home)).toThrow(/already exists/);
+    expect(() => finalizeOwnerKey(savePendingOwnerKey(shared.generateOwnerKeypair(), 'escrow.x.testnet', 'testnet', home), 7, home)).toThrow(/already exists/);
+    // a different contract can reuse program id 7
+    expect(finalizeOwnerKey(savePendingOwnerKey(shared.generateOwnerKeypair(), 'other.testnet', 'testnet', home), 7, home)).toBe(join(home, 'owner-other.testnet-7.json'));
   });
 });
