@@ -10,8 +10,7 @@ import {
   estimateClaimStorageDeposit,
   finalizeArgs,
   payabilityChecks,
-  promptBindingChecks,
-  splitUserMessage,
+  splitRequest,
   submitClaimArgs,
 } from '../src/args.js';
 import { verifyClaimChecks } from '../src/commands.js';
@@ -23,15 +22,17 @@ const load = (f: string): JudgeRecord => JSON.parse(readFileSync(new URL(`../../
 const live = load('live.ed25519.json');
 const liveEcdsa = load('live.ecdsa.json');
 const sqli = load('demo.sqli.json');
+const DEMO_CODE_HASH = '82faf3a0cd6148f95ba3b8011f8e9af67d5f9d5b8f8638002be7787a37285abd';
 
 const program = (o: Partial<Program> = {}): Program => ({
   id: 0,
   owner: 'owner.testnet',
   name: 'demo',
-  repo_url: 'https://github.com/sealedbounty/vuln-app',
+  repo_url: 'https://github.com/sealedbounty/sealedbounty/tree/main/fixtures/vuln-app',
   commit: 'demo-commit-0001',
   model_id: 'Qwen/Qwen3.8-27B',
   system_prompt_hash: shared.systemPromptHash(),
+  code_hash: DEMO_CODE_HASH,
   payouts: { low: '1', medium: '2', high: nearToYocto(3).toString(), critical: nearToYocto(5).toString() },
   owner_enc_pubkey: shared.generateOwnerKeypair().publicKey,
   dispute_secs: 60,
@@ -78,6 +79,7 @@ describe('create_program args', () => {
     commit: 'demo-commit-0001',
     modelId: 'Qwen/Qwen3.8-27B',
     systemPromptHash: shared.systemPromptHash(),
+    codeHash: DEMO_CODE_HASH,
     payoutsNear: { low: '0.1', medium: '0.5', high: '1', critical: '2.5' },
     ownerEncPubkey: shared.generateOwnerKeypair().publicKey,
     disputeSecs: 300,
@@ -87,8 +89,9 @@ describe('create_program args', () => {
   it('maps to contract field names with yocto U128 strings', () => {
     const { args, deposit } = createProgramArgs(base);
     expect(Object.keys(args)).toEqual([
-      'name', 'repo_url', 'commit', 'model_id', 'system_prompt_hash', 'payouts', 'owner_enc_pubkey', 'dispute_secs', 'min_confidence',
+      'name', 'repo_url', 'commit', 'model_id', 'system_prompt_hash', 'code_hash', 'payouts', 'owner_enc_pubkey', 'dispute_secs', 'min_confidence',
     ]);
+    expect(args.code_hash).toBe(DEMO_CODE_HASH);
     expect(args.payouts).toEqual({
       low: '100000000000000000000000',
       medium: '500000000000000000000000',
@@ -102,6 +105,8 @@ describe('create_program args', () => {
     expect(() => createProgramArgs({ ...base, minConfidence: 101 })).toThrow();
     expect(() => createProgramArgs({ ...base, ownerEncPubkey: 'AAAA' })).toThrow();
     expect(() => createProgramArgs({ ...base, systemPromptHash: 'xyz' })).toThrow();
+    expect(() => createProgramArgs({ ...base, codeHash: 'xyz' })).toThrow(/code_hash/);
+    expect(() => createProgramArgs({ ...base, codeHash: DEMO_CODE_HASH.toUpperCase() })).toThrow(/code_hash/);
   });
 });
 
@@ -169,15 +174,17 @@ describe('local pre-checks', () => {
     expect(payabilityChecks(v, program({ balance: '0' })).some((r) => !r[1])).toBe(true);
     expect(payabilityChecks({ valid: false, severity: 'none', cwe: null, confidence: 100 }, program()).filter((r) => !r[1]).length).toBe(2);
   });
-  it('prompt binding: demo fixture matches shared prompt, phase-0 fixture does not', () => {
-    expect(promptBindingChecks(sqli.request_body, program(), shared.sha256hex).every((r) => r[1])).toBe(true);
-    expect(promptBindingChecks(live.request_body, program(), shared.sha256hex).every((r) => r[1])).toBe(false);
+  it('v2 request check: demo fixture matches the demo program for its own hunter, phase-0 fixture does not', () => {
+    const hunter = (sqli as any).inputs.hunter;
+    expect(shared.checkRequestAgainstProgram(sqli.request_body, program(), hunter)).toEqual({ ok: true, reason: null });
+    expect(shared.checkRequestAgainstProgram(live.request_body, program(), hunter).ok).toBe(false);
   });
-  it('splitUserMessage recovers the inputs', () => {
-    const u = splitUserMessage(sqli.request_body);
+  it('splitRequest recovers the v2 inputs', () => {
+    const u = splitRequest(sqli.request_body);
     const inputs = (sqli as any).inputs;
     expect(u.target).toBe(`${inputs.repoUrl}@${inputs.commit}`);
-    expect(u.code).toBe(inputs.codeExcerpt);
+    expect(u.hunter).toBe(inputs.hunter);
+    expect(shared.codeHash(u.code!)).toBe(DEMO_CODE_HASH);
     expect(u.report).toBe(inputs.report);
   });
 });

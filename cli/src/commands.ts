@@ -4,17 +4,21 @@ import {
   GAS,
   addSignerArgs,
   createProgramArgs,
+  DISPUTE_INVALID_PANIC,
+  codeHashRow,
   disputeArgs,
+  disputeOutcome,
   estimateClaimStorageDeposit,
   finalizeArgs,
   payabilityChecks,
-  promptBindingChecks,
-  splitUserMessage,
+  splitRequest,
   submitClaimArgs,
+  submitPrecheck,
 } from './args.js';
-import { config, nearaiApiKey } from './config.js';
+import { buildBundleFromFiles, readBundle } from './bundle.js';
+import { REPO_ROOT, config, nearaiApiKey } from './config.js';
 import { finalizeOwnerKey, loadOwnerKey, savePendingOwnerKey, tryLoadOwnerKey } from './crypto.js';
-import { shared as api, verifySignerSig } from './shared.js';
+import { shared as api, demo, verifySignerSig, type ProgramBinding } from './shared.js';
 import { callContract, getSigners, listClaims, listPrograms, loadAccount, mustGetClaim, mustGetProgram } from './near.js';
 import type { CheckRow, Claim, JudgeRecord, Program } from './types.js';
 import { formatNear, nsToIso, printChecks, printKv, printTable, short } from './util.js';
@@ -97,10 +101,24 @@ export async function cmdCreateProgram(o: {
   disputeSecs: string;
   minConfidence: string;
   model?: string;
+  code?: string;
+  codeFiles?: string[];
+  codeRoot?: string;
   account?: string;
   dryRun?: boolean;
 }) {
   const cfg = config();
+  if (!!o.code === !!o.codeFiles?.length) throw new Error('pass exactly one of --code <bundle file> or --code-files <paths/globs...>');
+  let bundle: string;
+  if (o.code) {
+    bundle = readBundle(o.code);
+    console.log(`code bundle: ${o.code} (${Buffer.byteLength(bundle)} B)`);
+  } else {
+    const b = buildBundleFromFiles(o.codeFiles!, o.codeRoot ?? '.');
+    bundle = b.bundle;
+    console.log(`code bundle: ${b.paths.length} file(s) [${b.paths.join(', ')}] -> wrote ${b.outPath} (${Buffer.byteLength(bundle)} B)`);
+    console.log('publish bundle.txt with the program: hunters must judge against it byte for byte.');
+  }
   const kp = api.generateOwnerKeypair();
   const { args, deposit } = createProgramArgs({
     name: o.name,
@@ -108,6 +126,7 @@ export async function cmdCreateProgram(o: {
     commit: o.commit,
     modelId: o.model ?? cfg.nearaiModel,
     systemPromptHash: api.systemPromptHash(),
+    codeHash: api.codeHash(bundle),
     payoutsNear: { low: o.payoutLow, medium: o.payoutMedium, high: o.payoutHigh, critical: o.payoutCritical },
     ownerEncPubkey: kp.publicKey,
     disputeSecs: int('dispute-secs', o.disputeSecs),
@@ -163,6 +182,7 @@ export function printProgram(p: Program) {
     ['target', `${p.repo_url}@${p.commit}`],
     ['model_id', p.model_id],
     ['system_prompt_hash', p.system_prompt_hash],
+    ['code_hash', p.code_hash ?? '(missing: v1 contract?)'],
     ['owner_enc_pubkey', p.owner_enc_pubkey],
     ['payouts', `low ${formatNear(p.payouts.low)} | medium ${formatNear(p.payouts.medium)} | high ${formatNear(p.payouts.high)} | critical ${formatNear(p.payouts.critical)}`],
     ['balance', formatNear(p.balance)],
@@ -179,6 +199,7 @@ export async function cmdProgram(id: string) {
   printProgram(p);
   const local = api.systemPromptHash();
   console.log(`\n  prompt hash ${p.system_prompt_hash === local ? 'matches' : 'DIFFERS FROM'} the local shared/system-prompt.txt (${short(local)})`);
+  if (!p.code_hash) console.log('  no code_hash: this looks like a v1 contract (set --contract / $ESCROW_CONTRACT_ID to the v2 escrow)');
   console.log(`  owner key on this machine: ${tryLoadOwnerKey(p.id) ? 'yes' : 'no'}`);
 }
 
@@ -203,6 +224,24 @@ export async function cmdClaims(programId: string, o: { from?: string; limit?: s
 }
 
 // =============================================================== submit
+/** Published demo bundle, used as the assumed program code in an offline dry-run. */
+export const DEMO_BUNDLE_PATH = join(REPO_ROOT, 'fixtures', 'vuln-app', 'bundle.txt');
+
+/**
+ * What an offline dry-run checks against when the program cannot be fetched: the demo program
+ * (shared/demo-data.mjs target, local system prompt, $NEARAI_MODEL) with code_hash from --code or
+ * fixtures/vuln-app/bundle.txt.
+ */
+export function offlineProgramBinding(model: string, codeBundle?: string): ProgramBinding {
+  return {
+    repo_url: demo.DEMO_TARGET.repoUrl,
+    commit: demo.DEMO_TARGET.commit,
+    model_id: model,
+    system_prompt_hash: api.systemPromptHash(),
+    code_hash: api.codeHash(codeBundle ?? readBundle(DEMO_BUNDLE_PATH)),
+  };
+}
+
 export async function cmdSubmit(o: {
   program: string;
   code?: string;
@@ -218,40 +257,69 @@ export async function cmdSubmit(o: {
   const cfg = config();
   const programId = int('program', o.program);
   const offline = !!(o.dryRun && o.fixture);
+  const refuse = (msg: string) => {
+    if (!o.force) throw new Error(`${msg}; not sending (use --force to override)`);
+    console.warn(`WARNING (--force): ${msg}`);
+  };
 
   let program: Program | undefined;
   if (!offline) program = await mustGetProgram(programId);
+  const codeBundle = o.code ? readBundle(o.code) : undefined;
+  const binding: ProgramBinding = program ?? offlineProgramBinding(cfg.nearaiModel, codeBundle);
+  if (!program) {
+    console.log(`offline dry-run: program ${programId} not fetched; checking against the demo program`);
+    console.log(`  target ${binding.repo_url}@${binding.commit}, model ${binding.model_id}, code_hash ${short(binding.code_hash)} (${o.code ?? 'fixtures/vuln-app/bundle.txt'})`);
+  }
 
-  // 1. obtain a signed judge record
+  // 0. the hunter = the account that signs submit_claim (bound into the request's HUNTER line)
+  const account = o.dryRun ? undefined : loadAccount(o.account);
+  let hunter = account?.accountId ?? o.account ?? cfg.accountId;
+
+  // 1. the code bundle must be the program's, byte for byte
+  if (codeBundle !== undefined) {
+    const row = codeHashRow(codeBundle, binding.code_hash);
+    if (!printChecks('Code bundle', [row])) refuse(`code mismatch: --code ${o.code} does not hash to program.code_hash`);
+  }
+
+  // 2. obtain a signed judge record
   let record: JudgeRecord;
   if (o.fixture) {
     record = JSON.parse(readFileSync(o.fixture, 'utf8'));
     console.log(`using pre-recorded fixture ${o.fixture} (chat_id ${record.chat_id}, ${record.signing_algo})`);
+    if (!hunter) {
+      hunter = splitRequest(record.request_body).hunter;
+      if (!hunter) throw new Error('no hunter account: pass --account or set NEAR_TESTNET_ACCOUNT_ID');
+      console.log(`(no --account / NEAR_TESTNET_ACCOUNT_ID: pre-checking as the fixture's own hunter ${hunter})`);
+    }
   } else {
-    if (!o.code || !o.report) throw new Error('need --code and --report (or --fixture)');
+    if (!codeBundle || !o.report) throw new Error('need --code <program bundle> and --report (or --fixture)');
+    if (!hunter) throw new Error('no hunter account: pass --account or set NEAR_TESTNET_ACCOUNT_ID');
+    const inputs = { repoUrl: binding.repo_url, commit: binding.commit, hunter, codeBundle, report: readFileSync(o.report, 'utf8') };
+    // Pre-check the exact body before spending a NEAR AI call on it.
+    const pre = submitPrecheck(api.buildRequestBody({ model: binding.model_id, ...inputs }), binding, hunter, false);
+    if (pre.refuse) refuse(pre.refuse);
     const apiKey = nearaiApiKey();
     if (!apiKey) throw new Error('NEARAI_API_KEY not set (use --fixture to submit a pre-recorded judgement)');
     const algo = (o.algo ?? cfg.nearaiAlgo) as 'ed25519' | 'ecdsa';
-    console.log(`judging on NEAR AI (${program!.model_id}, ${algo})…`);
-    record = await api.judge({
-      apiKey,
-      baseUrl: cfg.nearaiBaseUrl,
-      model: program!.model_id,
-      repoUrl: program!.repo_url,
-      commit: program!.commit,
-      codeExcerpt: readFileSync(o.code, 'utf8'),
-      report: readFileSync(o.report, 'utf8'),
-      signingAlgo: algo,
-    });
+    console.log(`judging on NEAR AI (${binding.model_id}, ${algo}) as hunter ${hunter}…`);
+    record = await api.judge({ apiKey, baseUrl: cfg.nearaiBaseUrl, model: binding.model_id, ...inputs, signingAlgo: algo });
   }
 
-  // 2. verify locally
-  const v = api.verifyFixture(record, program ? { systemPromptHash: program.system_prompt_hash } : {});
+  // 3. verify locally
+  const v = api.verifyFixture(record, { systemPromptHash: binding.system_prompt_hash });
   const rows: CheckRow[] = v.checks.map((c) => [c.name, c.ok, c.detail]);
   if (program) rows.push(['request model == program.model_id', record.model === program.model_id, record.model]);
   const verOk = printChecks('Local verification', rows);
   if (!v.verdict) throw new Error('verdict did not parse');
   console.log(`\nverdict: ${JSON.stringify(v.verdict)}`);
+
+  // 4. request vs program (exactly what the owner's dispute checks)
+  const pre = submitPrecheck(record.request_body, binding, hunter, !!o.fixture);
+  printChecks(`Request vs program (v2 dispute rules, hunter ${hunter})`, [
+    ['checkRequestAgainstProgram', pre.check.ok, pre.check.ok ? 'ok: a dispute would fail' : pre.check.reason],
+  ]);
+  if (pre.warn) console.warn(`WARNING: ${pre.warn}`);
+  if (pre.refuse) refuse(pre.refuse);
 
   let payOk = true;
   if (program) {
@@ -261,17 +329,13 @@ export async function cmdSubmit(o: {
     const meta = allow.get(signer);
     payOk = printChecks('Signer allowlist', [['signer allowlisted with matching kind', meta?.kind === record.signature_kind, meta ? meta.kind : `${signer} not in get_signers`]]) && payOk;
   } else {
-    console.log('\n(offline dry-run: program not fetched; payability and allowlist not checked)');
-    const offlineRows = promptBindingChecks(record.request_body, { model_id: record.model, system_prompt_hash: api.systemPromptHash() }, api.sha256hex)
-      .filter((r) => r[0].startsWith('sha256'))
-      .map(([, ok, d]) => ['system prompt == shared/system-prompt.txt (what create-program registers)', ok, d] as CheckRow);
+    console.log('\n(offline dry-run: payability and allowlist not checked)');
     printChecks('Offline hints', [
-      ...offlineRows,
       ['verdict payable (valid && severity != none)', v.verdict.valid && v.verdict.severity !== 'none', `valid=${v.verdict.valid} severity=${v.verdict.severity}; needs program.min_confidence <= ${v.verdict.confidence}`],
     ]);
   }
 
-  // 3. encrypt the exact request body to the owner
+  // 5. encrypt the exact request body to the owner
   let ownerPub: string;
   let ownerPubSrc: string;
   if (program) {
@@ -297,12 +361,11 @@ export async function cmdSubmit(o: {
   console.log(`gas: ${GAS.submitClaim / 10n ** 12n} Tgas`);
 
   if (o.dryRun) {
-    console.log('\n--dry-run: not sent.');
-    return;
+    console.log(`\n--dry-run: not sent (would be signed by ${hunter}).`);
+    return { args, check: pre.check, hunter };
   }
   if ((!verOk || !payOk) && !o.force) throw new Error('pre-checks failed; not sending (use --force to send anyway)');
-  const account = loadAccount(o.account);
-  const r = await callContract(account, 'submit_claim', args, { gas: GAS.submitClaim, deposit });
+  const r = await callContract(account!, 'submit_claim', args, { gas: GAS.submitClaim, deposit });
   if (!r.ok) {
     process.exitCode = 1;
     return;
@@ -336,15 +399,26 @@ export async function cmdInbox(o: { program: string; status?: string }) {
       console.log(`decrypt FAILED: ${(e as Error).message}`);
       continue;
     }
-    const binding = promptBindingChecks(body, program, api.sha256hex);
-    const tampered = binding.filter((b) => !b[1]);
-    console.log(`prompt/model binding: ${tampered.length ? 'TAMPERED -> dispute with `sealedbounty dispute --claim ' + c.id + '`' : 'PASS (matches program)'}`);
-    for (const t of tampered) console.log(`  FAIL ${t[0]}: ${t[2]}`);
-    const u = splitUserMessage(body);
-    if (u.target) {
-      console.log(`\n-- TARGET ${u.target}\n-- CODE\n${u.code}\n-- REPORT\n${u.report}`);
+    const check = api.checkRequestAgainstProgram(body, program, c.hunter);
+    if (check.ok) {
+      console.log('request vs program: OK (prompt, model, code bundle, hunter, report all match; a dispute would fail)');
     } else {
-      console.log(`\n-- USER MESSAGE (non-canonical format)\n${u.raw}`);
+      console.log(`request vs program: MISMATCH -> ${check.reason}`);
+      console.log(
+        c.status === 'Pending'
+          ? `  dispute it: sealedbounty dispute --claim ${c.id}   (${disputeOutcome(check)})`
+          : `  (claim is ${c.status}; only Pending claims can be disputed)`,
+      );
+    }
+    const u = splitRequest(body);
+    if (u.target) {
+      const codeOk = api.codeHash(u.code!) === program.code_hash;
+      console.log(`\n-- TARGET ${u.target}\n-- HUNTER ${u.hunter}`);
+      console.log(`-- CODE ${Buffer.byteLength(u.code!)} B, sha256 ${short(api.codeHash(u.code!))} ${codeOk ? '(== program.code_hash; not shown)' : 'DIFFERS from program.code_hash:'}`);
+      if (!codeOk) console.log(u.code);
+      console.log(`-- REPORT\n${u.report ?? '(missing)'}`);
+    } else {
+      console.log(`\n-- USER MESSAGES (non-canonical format)\n${u.raw}`);
     }
   }
 }
@@ -360,15 +434,23 @@ export async function cmdDispute(o: { claim: string; account?: string; dryRun?: 
     ['sha256(decrypted body) == req_hash', hashOk, short(c.req_hash)],
   ];
   printChecks('Dispute preconditions', rows);
-  const binding = promptBindingChecks(body, program, api.sha256hex);
-  const bindingOk = printChecks('Prompt/model binding (a dispute succeeds only if one of these FAILS)', binding);
+  const check = api.checkRequestAgainstProgram(body, program, c.hunter);
+  printChecks(`Request vs program (a dispute succeeds only if this FAILS; hunter ${c.hunter})`, [
+    ['checkRequestAgainstProgram', check.ok, check.ok ? 'ok' : check.reason],
+  ]);
+  console.log(`\nexpected: ${disputeOutcome(check)}`);
   const args = disputeArgs(c.id, body);
   showArgs('dispute', args);
   if (o.dryRun) return console.log('\n--dry-run: not sent.');
   if (!rows.every((r) => r[1]) && !o.force) throw new Error('preconditions failed; not sending (use --force)');
-  if (bindingOk && !o.force) throw new Error('request matches the program prompt and model: the contract would panic "dispute invalid: prompt matches" (use --force)');
+  if (check.ok && !o.force) throw new Error(`request matches the program: the contract would panic "${DISPUTE_INVALID_PANIC}" (use --force)`);
   const r = await callContract(loadAccount(o.account), 'dispute', args, { gas: GAS.dispute });
-  if (!r.ok) process.exitCode = 1;
+  if (!r.ok) {
+    process.exitCode = 1;
+    return;
+  }
+  const after = await mustGetClaim(c.id);
+  console.log(`\nclaim ${c.id}: ${after.status}${after.reject_reason ? ` (reason "${after.reject_reason}")` : ''}${check.ok ? '' : `; expected "${check.reason}"`}`);
 }
 
 export async function cmdFinalize(o: { claim: string; account?: string; dryRun?: boolean }) {
@@ -415,7 +497,8 @@ export async function cmdVerifyClaim(o: { claim: string }) {
     try {
       const { body, hashOk } = decryptClaim(c, key.secretKey);
       rows.push(['[owner] sha256(decrypted body) == req_hash', hashOk, '']);
-      rows.push(...promptBindingChecks(body, program, api.sha256hex).map(([n, ok, d]) => [`[owner] ${n}`, ok, d] as CheckRow));
+      const check = api.checkRequestAgainstProgram(body, program, c.hunter);
+      rows.push(['[owner] request matches program (v2 dispute rules)', check.ok, check.ok ? 'ok' : `${check.reason}: dispute it`]);
     } catch (e) {
       rows.push(['[owner] decrypt ciphertext', false, (e as Error).message]);
     }

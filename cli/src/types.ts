@@ -27,6 +27,8 @@ export interface Program {
   commit: string;
   model_id: string;
   system_prompt_hash: string;
+  /** v2: sha256hex of the published code bundle (buildCodeBundle). */
+  code_hash: string;
   payouts: Payouts;
   owner_enc_pubkey: string;
   dispute_secs: number;

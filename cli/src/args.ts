@@ -1,5 +1,5 @@
 // Pure builders for contract call args (no network). Unit-tested in test/args.test.ts.
-import { shared } from './shared.js';
+import { shared, type ProgramBinding, type RequestCheck } from './shared.js';
 import type { CheckRow, JudgeRecord, Payouts, Program, SigKind, Signer, Verdict } from './types.js';
 import { formatNear, nearToYocto } from './util.js';
 
@@ -32,6 +32,8 @@ export interface CreateProgramInput {
   commit: string;
   modelId: string;
   systemPromptHash: string;
+  /** sha256hex of the published code bundle (shared.codeHash). */
+  codeHash: string;
   payoutsNear: { low: string; medium: string; high: string; critical: string };
   ownerEncPubkey: string;
   disputeSecs: number;
@@ -41,6 +43,7 @@ export interface CreateProgramInput {
 
 export function createProgramArgs(i: CreateProgramInput) {
   if (!/^[0-9a-f]{64}$/.test(i.systemPromptHash)) throw new Error('system_prompt_hash must be 64 lowercase hex');
+  if (!/^[0-9a-f]{64}$/.test(i.codeHash)) throw new Error('code_hash must be 64 lowercase hex');
   if (!Number.isInteger(i.minConfidence) || i.minConfidence < 0 || i.minConfidence > 100)
     throw new Error('min-confidence must be an integer 0..100');
   if (!Number.isInteger(i.disputeSecs) || i.disputeSecs < 0) throw new Error('dispute-secs must be a non-negative integer');
@@ -57,6 +60,7 @@ export function createProgramArgs(i: CreateProgramInput) {
     commit: i.commit,
     model_id: i.modelId,
     system_prompt_hash: i.systemPromptHash,
+    code_hash: i.codeHash, // v2: right after system_prompt_hash
     payouts,
     owner_enc_pubkey: i.ownerEncPubkey,
     dispute_secs: i.disputeSecs,
@@ -103,28 +107,57 @@ export function payabilityChecks(v: Verdict, program: Program): CheckRow[] {
   ];
 }
 
-/** What the program owner would check in a dispute: is the request bound to this program's prompt + model? */
-export function promptBindingChecks(requestBody: string, program: Pick<Program, 'model_id' | 'system_prompt_hash'>, sha: (s: string) => string): CheckRow[] {
+/** Contract panic when a dispute is sent for a request that passes every v2 check. */
+export const DISPUTE_INVALID_PANIC = 'dispute invalid: request matches program';
+
+export interface SubmitPrecheck {
+  check: RequestCheck;
+  /** Non-null: do not send (unless --force). */
+  refuse: string | null;
+  /** Non-null: send is allowed but the owner can dispute. */
+  warn: string | null;
+}
+
+/**
+ * Hunter-side pre-check of the exact request body against the program (v2 dispute rules).
+ * A fresh judgement must pass outright. A pre-recorded fixture is bound to whoever recorded it, so
+ * a "hunter mismatch" there is only a warning (the owner can dispute it; nothing else is wrong).
+ */
+export function submitPrecheck(requestBody: string, program: ProgramBinding, hunter: string, fromFixture: boolean): SubmitPrecheck {
+  const check = shared.checkRequestAgainstProgram(requestBody, program, hunter);
+  if (check.ok) return { check, refuse: null, warn: null };
+  if (check.reason === 'hunter mismatch' && fromFixture) {
+    const bound = splitRequest(requestBody).hunter ?? '?';
+    return { check, refuse: null, warn: `hunter mismatch: the owner can dispute (request is bound to ${bound}, you submit as ${hunter})` };
+  }
+  return { check, refuse: `${check.reason}: the program owner's dispute would reject this claim`, warn: null };
+}
+
+/** Bundle supplied by the hunter/owner must hash to program.code_hash. */
+export function codeHashRow(bundle: string, expected: string): CheckRow {
+  const h = shared.codeHash(bundle);
+  return ['sha256(code bundle) == program.code_hash', h === expected, h];
+}
+
+/** Human summary of what a dispute will do for a given check result. */
+export function disputeOutcome(check: RequestCheck): string {
+  if (check.ok) return `contract would panic "${DISPUTE_INVALID_PANIC}"`;
+  const extra = check.reason === 'hunter mismatch' ? '; req_hash is freed so the real hunter can resubmit' : '';
+  return `claim -> Rejected, reason "${check.reason}"; payout returns to the pool${extra}`;
+}
+
+/** Splits a v2 request body into its parts (best effort, for display). */
+export function splitRequest(requestBody: string): { target?: string; hunter?: string; code?: string; report?: string; raw: string } {
   let req: any;
   try {
     req = JSON.parse(requestBody);
-  } catch (e) {
-    return [['request_body is JSON', false, (e as Error).message]];
+  } catch {
+    return { raw: requestBody };
   }
-  const m0 = req?.messages?.[0];
-  const h = m0?.role === 'system' && typeof m0.content === 'string' ? sha(m0.content) : '(no system message)';
-  return [
-    ['messages[0].role == system', m0?.role === 'system', String(m0?.role)],
-    ['sha256(system prompt) == program.system_prompt_hash', h === program.system_prompt_hash, h],
-    ['model == program.model_id', req?.model === program.model_id, String(req?.model)],
-  ];
-}
-
-/** Extracts the hunter's user message ("TARGET ...\n\n<code>\n\nREPORT\n<report>"). */
-export function splitUserMessage(requestBody: string): { target?: string; code?: string; report?: string; raw: string } {
-  const req = JSON.parse(requestBody);
-  const raw: string = req?.messages?.find((m: any) => m.role === 'user')?.content ?? '';
-  const m = /^TARGET (.*?)\n\n([\s\S]*)\n\nREPORT\n([\s\S]*)$/.exec(raw);
+  const m1: string = typeof req?.messages?.[1]?.content === 'string' ? req.messages[1].content : '';
+  const m2: string = typeof req?.messages?.[2]?.content === 'string' ? req.messages[2].content : '';
+  const raw = [m1, m2].filter(Boolean).join('\n\n');
+  const m = /^TARGET ([^\n]*)\nHUNTER ([^\n]*)\n\nCODE\n([\s\S]*)$/.exec(m1);
   if (!m) return { raw };
-  return { target: m[1], code: m[2], report: m[3], raw };
+  return { target: m[1], hunter: m[2], code: m[3], report: m2.startsWith('REPORT\n') ? m2.slice(7) : undefined, raw };
 }

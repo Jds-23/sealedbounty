@@ -8,7 +8,7 @@ loadEnv();
 const program = new Command()
   .name('sealedbounty')
   .description('SealedBounty CLI: TEE-judged, encrypted bug bounties on NEAR')
-  .option('--contract <id>', 'escrow contract id (default $ESCROW_CONTRACT_ID or escrow.baldingsucks7993.testnet)')
+  .option('--contract <id>', 'escrow contract id (default $ESCROW_CONTRACT_ID or sealedbounty-v2.testnet)')
   .hook('preAction', (cmd) => {
     const contract = cmd.opts().contract;
     if (contract) process.env.ESCROW_CONTRACT_ID = contract;
@@ -37,7 +37,7 @@ program
 
 program
   .command('create-program')
-  .description('Create and fund a bounty program; generates the owner encryption keypair (secret saved to ~/.sealedbounty/owner-<id>.json)')
+  .description('Create and fund a bounty program bound to a code bundle (code_hash); generates the owner encryption keypair (secret saved to ~/.sealedbounty/owner-<id>.json)')
   .requiredOption('--name <name>', 'program name')
   .requiredOption('--repo <url>', 'repository URL')
   .requiredOption('--commit <sha>', 'commit under review')
@@ -48,9 +48,12 @@ program
   .requiredOption('--fund <NEAR>', 'initial pool (attached deposit; a 0.05 NEAR storage allowance is added)')
   .option('--dispute-secs <n>', 'dispute window in seconds', '86400')
   .option('--min-confidence <n>', 'minimum judge confidence 0-100', '70')
+  .option('--code <file>', 'published code bundle file (e.g. fixtures/vuln-app/bundle.txt); code_hash = sha256(file)')
+  .option('--code-files <paths...>', 'build the bundle from these files/globs (relative to --code-root) and write <code-root>/bundle.txt')
+  .option('--code-root <dir>', 'base dir for --code-files; bundle paths are relative to it', '.')
   .option('--model <model>', 'judge model id (default $NEARAI_MODEL)')
   .option('--account <id>', 'owner account (default $NEAR_TESTNET_ACCOUNT_ID)')
-  .option('--dry-run', 'print args without sending or saving the key')
+  .option('--dry-run', 'print args without sending or saving the key (--code-files still writes bundle.txt)')
   .action(run((o) => c.cmdCreateProgram(o)));
 
 program
@@ -78,27 +81,27 @@ program
   .command('submit')
   .description('Judge a report on NEAR AI (TEE), verify it locally, encrypt it to the program owner and submit_claim')
   .requiredOption('--program <id>', 'program id')
-  .option('--code <file>', 'code excerpt file')
+  .option('--code <file>', "the program's code bundle (bundle.txt); must hash to program.code_hash")
   .option('--report <file>', 'exploit report file')
   .option('--fixture <file>', 'submit a pre-recorded signed judgement (no API key needed)')
   .option('--algo <algo>', 'NEAR AI signing algo ed25519|ecdsa (default $NEARAI_SIGNING_ALGO)')
   .option('--owner-pubkey <b64>', 'offline dry-run only: owner key to encrypt to')
-  .option('--account <id>', 'hunter account (default $NEAR_TESTNET_ACCOUNT_ID)')
-  .option('--dry-run', 'print verdict + args, do not send (with --fixture: no network at all)')
+  .option('--account <id>', 'hunter account = submit_claim signer, bound into the request (default $NEAR_TESTNET_ACCOUNT_ID)')
+  .option('--dry-run', 'print verdict + args, do not send (with --fixture: no network at all; checks against the demo program)')
   .option('--full', 'print args without eliding long strings')
-  .option('--force', 'send even if local pre-checks fail')
+  .option('--force', 'send even if local pre-checks fail (code/request mismatch, payability)')
   .action(run((o) => c.cmdSubmit(o)));
 
 program
   .command('inbox')
-  .description('Program owner: decrypt every claim report and check sha256(body) == req_hash and the prompt binding')
+  .description('Program owner: decrypt every claim, check sha256(body) == req_hash and the request against the program (prompt, model, code, hunter, report)')
   .requiredOption('--program <id>', 'program id')
   .option('--status <s>', 'only Pending | Rejected | Paid')
   .action(run((o) => c.cmdInbox(o)));
 
 program
   .command('dispute')
-  .description('Program owner: reveal the decrypted request body on-chain to reject a claim whose prompt/model was tampered')
+  .description('Program owner: reveal the decrypted request body on-chain to reject a claim that does not match the program')
   .requiredOption('--claim <id>', 'claim id')
   .option('--account <id>', 'owner account (default $NEAR_TESTNET_ACCOUNT_ID)')
   .option('--dry-run', 'print args, do not send')
