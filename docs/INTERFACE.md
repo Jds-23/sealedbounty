@@ -18,7 +18,7 @@
   - `confidence` = the probability that the VERDICT is correct (×100), so `valid:false, confidence:100` means "surely bogus".
   - `min_confidence` gates payable verdicts only.
   - JSON schema `cwe` = `{"type":["string","null"]}`.
-- System prompt: `shared/system-prompt.txt` (no trailing newline), sha256 `4fdd9ec80e291d38021d5f4545f6575b6057c4033f8ffa93b24a17cb73e930db`. Helpers live in `shared/judge.mjs` (browser-safe).
+- System prompt: `shared/system-prompt.txt` (no trailing newline), sha256 `aede4ebac53d6bae5f3ceefc8d60175faff90276ac7751fb26aebff39e5172c2` (v2; v1 was 4fdd9ec8…). Helpers live in `shared/judge.mjs` (browser-safe).
 - Demo target: `https://github.com/sealedbounty/vuln-app` @ `demo-commit-0001`. Fixtures: `fixtures/demo.{sqli,sqli.ecdsa,idor,bogus,injection}.json`.
 - Amounts: `U128` yoctoNEAR as a decimal string. Timestamps: nanoseconds as `U64` strings.
 - Owner encryption key: tweetnacl `box` keypair (x25519). The public key is base64 and goes onchain. The secret key stays local at `~/.sealedbounty/owner-<program_id>.json`, never committed.
@@ -109,3 +109,5 @@ Everything else is unchanged (json_schema, `chat_template_kwargs.enable_thinking
   5. `"report missing"`: messages[2] is missing, not role user, or doesn't start with `"REPORT\n"`. (Any extra messages beyond index 2 → `"system prompt tampered"`.)
   - All checks pass → panic `"dispute invalid: request matches program"`. NOTE: the panic string changes from v1's "prompt matches".
 - Everything else is the same as v1. Deploy target: **`sealedbounty-v2.testnet`** (fresh state, admin `baldingsucks7993.testnet`). v1 `escrow.baldingsucks7993.testnet` stays as history.
+
+- v2 demo hashes: system_prompt_hash `aede4ebac53d6bae5f3ceefc8d60175faff90276ac7751fb26aebff39e5172c2`, code_hash `82faf3a0cd6148f95ba3b8011f8e9af67d5f9d5b8f8638002be7787a37285abd`. Fixtures `fixtures/demo.{sqli,sqli.ecdsa,idor,bogus,injection,fakecode}.json` (spec v2). Helpers: `shared/judge.mjs` checkRequestAgainstProgram, buildCodeBundle, codeHash, codeMessagePrefix; `shared/demo-data.mjs`.
