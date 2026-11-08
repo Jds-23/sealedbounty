@@ -120,6 +120,13 @@ export function verifyClaim(claim: Claim, program: Program | undefined, signers:
   }
 
   // 6. Report contents
-  checks.push({ label: 'Report hashes to req_hash', status: 'na', detail: 'Encrypted to the program owner. Owner can check it in the Inbox.' });
+  checks.push({
+    label: 'Report hashes to req_hash',
+    status: 'na',
+    detail:
+      program?.code_hash
+        ? 'Encrypted to the program owner. The Inbox checks it against req_hash, the prompt, model, code_hash and this hunter.'
+        : 'Encrypted to the program owner. Owner can check it in the Inbox.',
+  });
   return checks;
 }

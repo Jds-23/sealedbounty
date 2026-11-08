@@ -117,6 +117,11 @@ footer { text-align: center; padding: 24px; }
 .claim-meta { margin-top: 8px; display: grid; gap: 4px; }
 .pending { color: var(--warn); }
 .rejected { color: var(--bad); }
+.rejected .small { color: var(--text); margin-top: 2px; }
+.dispute-hint { margin-top: 10px; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--bad); background: var(--bad-bg); }
+.dispute-hint.ok { border-color: var(--ok); background: var(--ok-bg); }
+.check-ok { color: var(--ok); }
+.check-bad { color: var(--bad); }
 .sev { font-family: var(--mono); text-transform: uppercase; }
 .sev-critical, .sev-high { color: var(--bad); }
 .sev-medium { color: var(--warn); }

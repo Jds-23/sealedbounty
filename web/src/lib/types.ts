@@ -26,6 +26,8 @@ export interface Program {
   commit: string;
   model_id: string;
   system_prompt_hash: string;
+  /** v2: sha256hex of the published code bundle. null for v1 programs (no code binding). */
+  code_hash: string | null;
   payouts: Payouts;
   owner_enc_pubkey: string;
   dispute_secs: number;
@@ -55,6 +57,11 @@ export interface Claim {
   submitted_at: string;
   finalize_after: string;
   reject_reason: string | null;
+  /**
+   * Demo only: this attempt never reached the chain because submit_claim reverted (e.g. "verdict not payable").
+   * Shown so the real TEE outputs for refused reports are visible; never set from RPC data.
+   */
+  refused_at_submit?: string;
 }
 
 export interface SignerMeta {

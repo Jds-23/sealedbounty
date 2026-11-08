@@ -3,6 +3,7 @@ import { useData } from '../data';
 import { decryptReport, parseOwnerSecret, reportMatchesHash } from '../lib/crypto';
 import { DEMO_OWNER_SECRET } from '../lib/demo';
 import { sha256hex } from '../lib/verify';
+import { auditRequest, REASON_TEXT, type RequestAudit } from '../lib/requestChecks';
 import type { Claim, Program } from '../lib/types';
 import { Badge, Hash, StatusIcon } from '../components/ui';
 
@@ -11,6 +12,55 @@ interface Decrypted {
   program?: Program;
   plaintext?: string;
   error?: string;
+}
+
+/** Splits a decrypted request into report text and the TARGET/HUNTER/CODE part (v2: separate messages; v1: one). */
+function splitRequest(pt: string): { report: string; targetAndCode: string | null } {
+  let req: { messages?: { role: string; content: string }[] } | null = null;
+  try {
+    req = JSON.parse(pt);
+  } catch {
+    return { report: pt, targetAndCode: null };
+  }
+  const users = (req?.messages ?? []).filter((m) => m?.role === 'user' && typeof m.content === 'string');
+  if (users.length >= 2 && users[1].content.startsWith('REPORT\n')) return { report: users[1].content.slice(7), targetAndCode: users[0].content };
+  const u = users[0]?.content ?? '';
+  const cut = u.lastIndexOf('\n\nREPORT\n');
+  return cut >= 0 ? { report: u.slice(cut + 9), targetAndCode: u.slice(0, cut) } : { report: u || pt, targetAndCode: null };
+}
+
+function DisputeHint({ claim, audit }: { claim: Claim; audit: RequestAudit }) {
+  if (audit.ok) {
+    return (
+      <div className="dispute-hint ok small">
+        Request matches the program{audit.v1 ? ' (v1: prompt + model only)' : ''}. A dispute would fail, so this claim pays out after the window.
+      </div>
+    );
+  }
+  const why = audit.reason ? REASON_TEXT[audit.reason] : '';
+  if (claim.status === 'Pending') {
+    return (
+      <div className="dispute-hint">
+        <strong>
+          Disputable: run <code>sb dispute --claim {claim.id}</code>
+        </strong>{' '}
+        before the window closes. The contract will reject it with &quot;{audit.reason}&quot; ({why}).
+      </div>
+    );
+  }
+  if (claim.status === 'Rejected') {
+    return (
+      <div className="dispute-hint">
+        Already rejected onchain{claim.reject_reason ? <> with &quot;{claim.reject_reason}&quot;</> : null}. This is what{' '}
+        <code>sb dispute --claim {claim.id}</code> proves: {why}.
+      </div>
+    );
+  }
+  return (
+    <div className="dispute-hint">
+      Would have been disputable (&quot;{audit.reason}&quot;: {why}), but the claim is already {claim.status}.
+    </div>
+  );
 }
 
 function Report({ d }: { d: Decrypted }) {
@@ -24,25 +74,13 @@ function Report({ d }: { d: Decrypted }) {
   }
   const pt = plaintext!;
   const hashOk = reportMatchesHash(pt, claim.req_hash);
-  let req: { model?: string; messages?: { role: string; content: string }[] } | null = null;
-  try {
-    req = JSON.parse(pt);
-  } catch {
-    /* not JSON */
-  }
-  const sys = req?.messages?.[0];
-  const user = req?.messages?.find((m) => m.role === 'user');
-  const sysOk = !!(sys && sys.role === 'system' && program && sha256hex(sys.content) === program.system_prompt_hash);
-  const modelOk = !!(req && program && req.model === program.model_id);
-  const userMsg = user?.content ?? '';
-  const cut = userMsg.lastIndexOf('\n\nREPORT\n');
-  const reportText = cut >= 0 ? userMsg.slice(cut + 9) : userMsg || pt;
-  const targetAndCode = cut >= 0 ? userMsg.slice(0, cut) : null;
+  const audit = program ? auditRequest(pt, program, claim.hunter) : null;
+  const { report, targetAndCode } = splitRequest(pt);
   return (
     <div className="card">
       <div className="row between wrap">
         <strong>
-          Claim #{claim.id} · {program?.name ?? `program ${claim.program_id}`}
+          Claim #{claim.id} · {program?.name ?? `program ${claim.program_id}`} · <span className="mono small">{claim.hunter}</span>
         </strong>
         <Badge tone={claim.status === 'Pending' ? 'warn' : claim.status === 'Paid' ? 'ok' : 'bad'}>{claim.status}</Badge>
       </div>
@@ -53,25 +91,23 @@ function Report({ d }: { d: Decrypted }) {
             sha256(decrypted) == req_hash <Hash value={claim.req_hash} />
           </div>
         </li>
-        <li>
-          <StatusIcon status={sysOk ? 'pass' : 'fail'} />
-          <div>
-            System prompt matches program.system_prompt_hash
-            {!sysOk && claim.status === 'Pending' && (
-              <div className="small bad">Mismatch: you can `dispute` this claim with the CLI before the window closes.</div>
-            )}
-          </div>
-        </li>
-        <li>
-          <StatusIcon status={modelOk ? 'pass' : 'fail'} />
-          <div>Request model == program model ({req?.model ?? '?'})</div>
-        </li>
+        {audit?.checks.map((x) => (
+          <li key={x.key}>
+            <StatusIcon status={x.ok === null ? 'na' : x.ok ? 'pass' : 'fail'} />
+            <div>
+              <div className={x.ok === false ? 'check-bad' : undefined}>{x.label}</div>
+              <div className="muted small mono-wrap">{x.detail}</div>
+            </div>
+          </li>
+        ))}
       </ul>
+      {hashOk && audit && <DisputeHint claim={claim} audit={audit} />}
+      {!hashOk && <div className="dispute-hint small">Decrypted text does not hash to req_hash: this ciphertext is not the judged request.</div>}
       <h3>Report</h3>
-      <pre className="report">{reportText}</pre>
+      <pre className="report">{report}</pre>
       {targetAndCode && (
         <details>
-          <summary className="small">Target and code excerpt sent to the judge</summary>
+          <summary className="small">Target, hunter and code sent to the judge</summary>
           <pre className="report small">{targetAndCode}</pre>
         </details>
       )}
@@ -102,7 +138,7 @@ export function Inbox() {
     const { secretKey, publicKeyB64 } = parsed.ok;
     const mine = programs.filter((p) => p.owner_enc_pubkey === publicKeyB64);
     const out: Decrypted[] = claims
-      .filter((c) => mine.some((p) => p.id === c.program_id))
+      .filter((c) => !c.refused_at_submit && mine.some((p) => p.id === c.program_id))
       .map((claim) => {
         const program = mine.find((p) => p.id === claim.program_id);
         try {

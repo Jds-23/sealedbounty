@@ -39,8 +39,8 @@ export function HowItWorks() {
 
       <ol>
         <li>
-          The <strong>hunter</strong> sends the exploit report and the target code to a NEAR AI model that runs in a TEE (Intel TDX CPU + NVIDIA
-          confidential GPU). The request goes only to the TEE.
+          The <strong>hunter</strong> sends the exploit report, the program's published code bundle and their own NEAR account to a NEAR AI model
+          that runs in a TEE (Intel TDX CPU + NVIDIA confidential GPU). The request goes only to the TEE.
         </li>
         <li>
           The TEE returns a JSON verdict <code>{'{valid, severity, cwe, confidence}'}</code> and signs{' '}
@@ -55,10 +55,18 @@ export function HowItWorks() {
           Only the <strong>project owner</strong> can decrypt the report (x25519 box). They can check that it hashes to <code>req_hash</code>.
         </li>
         <li>
-          During the dispute window the owner can reveal the request. If the system prompt or model were changed, the claim is rejected. After the
-          window, <em>anyone</em> can call <code>finalize</code> and the hunter is paid.
+          During the dispute window the owner can reveal the request. If the system prompt, model, code bundle or hunter don&apos;t match, the claim
+          is rejected. After the window, <em>anyone</em> can call <code>finalize</code> and the hunter is paid.
         </li>
       </ol>
+
+      <h2>Code and hunter binding (v2)</h2>
+      <p>
+        The owner publishes a code bundle and its hash goes onchain as <code>program.code_hash</code>. The request&apos;s CODE section must hash to
+        it, so a hunter can&apos;t invent vulnerable code and get a &quot;valid&quot; verdict for it (the TEE judges whatever it is shown; dispute
+        rejects it with <code>code mismatch</code>). The request also names the hunter (<code>HUNTER &lt;account&gt;</code>), so copying a pending
+        claim&apos;s args from another account is rejected with <code>hunter mismatch</code>, and the real hunter can resubmit.
+      </p>
 
       <h2>What this page verifies</h2>
       <p>
@@ -74,12 +82,18 @@ export function HowItWorks() {
           plausible but wrong report can still get a positive verdict. The severity caps and the dispute window limit the damage.
         </li>
         <li>
-          <strong>Prompt injection is mitigated, not proven.</strong> The system prompt tells the model to ignore instructions inside the report,
-          and the owner can dispute a tampered prompt. The contract can't prove onchain that the model wasn't talked into a verdict.
+          <strong>Prompt injection is mitigated, not proven.</strong> The report is a separate, untrusted message and the system prompt tells the
+          model to ignore instructions in it. The owner can dispute a tampered prompt, but the contract can&apos;t prove onchain that the model
+          wasn&apos;t talked into a verdict.
         </li>
         <li>
           <strong>First claim wins.</strong> Each <code>req_hash</code> pays once. Two hunters who find the same bug with different reports can both
           be paid, and the contract can't deduplicate them semantically.
+        </li>
+        <li>
+          <strong>Code binding needs the owner to act.</strong> The contract only sees hashes, so a request with the wrong code or hunter is
+          caught when the owner decrypts it and disputes inside the window. An owner who never checks pays it out. The bundle is what the owner
+          chose to publish: bugs outside it, or a bundle that differs from the real deployment, are out of scope.
         </li>
         <li>
           <strong>You trust the TEE vendor chain.</strong> That means Intel, NVIDIA and NEAR AI's attested deployment. Signers rotate when NEAR AI

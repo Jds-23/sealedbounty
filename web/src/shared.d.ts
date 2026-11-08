@@ -11,4 +11,22 @@ declare module '@sealedbounty/shared' {
   export function encryptForOwner(requestBody: string, ownerPubB64: string): string;
   export function decryptAsOwner(ciphertextB64: string, ownerSecretB64: string): string;
   export function generateOwnerKeypair(): { publicKey: string; secretKey: string };
+  // v2: code bundle + hunter binding
+  export type DisputeReason = 'system prompt tampered' | 'model mismatch' | 'code mismatch' | 'hunter mismatch' | 'report missing';
+  export function buildCodeBundle(files: { path: string; content: string }[]): string;
+  export function codeHash(bundle: string): string;
+  export function codeMessagePrefix(p: { repoUrl: string; commit: string; hunter: string }): string;
+  export function checkRequestAgainstProgram(
+    requestBody: string,
+    program: { repo_url: string; commit: string; model_id: string; system_prompt_hash: string; code_hash: string },
+    hunter: string,
+  ): { ok: true; reason: null } | { ok: false; reason: DisputeReason };
+}
+
+declare module '@sealedbounty/shared/demo-data.mjs' {
+  export const DEMO_TARGET: { repoUrl: string; commit: string };
+  export const DEMO_HUNTER: string;
+  export const DEMO_FRONTRUNNER: string;
+  export const FAKE_CODE_BUNDLE: string;
+  export const FAKE_CODE_REPORT: string;
 }

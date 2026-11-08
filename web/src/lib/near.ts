@@ -1,12 +1,12 @@
 // Read-only NEAR JSON-RPC (call_function). No wallet, no writes.
-// Shapes checked against the live contract (src/fixtures/live-views.json):
+// Shapes checked against the live v1 contract (src/fixtures/live-views.json); v2 adds Program.code_hash:
 //   list_programs {from_index, limit}  get_program {id}  list_claims {program_id, from_index, limit}
 //   get_claim {id}  get_signers {} -> [[signer, {kind, model}]]  get_owner {} -> account id
 // ids are u64 JSON numbers, amounts U128 decimal strings, timestamps U64 nanosecond strings.
 import type { Claim, ClaimStatus, Program, SignerEntry } from './types';
 import { normaliseSigners } from './verify';
 
-export const CONTRACT_ID: string = import.meta.env.VITE_ESCROW_CONTRACT_ID || 'escrow.baldingsucks7993.testnet';
+export const CONTRACT_ID: string = import.meta.env.VITE_ESCROW_CONTRACT_ID || 'sealedbounty-v2.testnet';
 /**
  * Configured RPC first, then public fallbacks. FastNEAR is the default: rpc.testnet.near.org rate-limits
  * hard (HTTP 429 without CORS headers, so the browser sees a CORS error).
@@ -86,6 +86,11 @@ const str = (v: unknown, f: string): string => {
   return v;
 };
 const hex = (v: unknown, f: string): string => str(v, f).toLowerCase().replace(/^0x/, '');
+const sha256Hex = (v: unknown, f: string): string => {
+  const h = hex(v, f);
+  if (!/^[0-9a-f]{64}$/.test(h)) throw new Error(`${f}: expected 64 hex chars`);
+  return h;
+};
 const STATUSES: ClaimStatus[] = ['Pending', 'Rejected', 'Paid'];
 
 export function parseProgram(r: unknown): Program {
@@ -99,6 +104,8 @@ export function parseProgram(r: unknown): Program {
     commit: str(p.commit, 'commit'),
     model_id: str(p.model_id, 'model_id'),
     system_prompt_hash: hex(p.system_prompt_hash, 'system_prompt_hash'),
+    // v2 programs carry code_hash; v1 (escrow.baldingsucks7993.testnet) data has none.
+    code_hash: p.code_hash == null ? null : sha256Hex(p.code_hash, 'code_hash'),
     payouts: {
       low: big(p.payouts?.low, 'payouts.low'),
       medium: big(p.payouts?.medium, 'payouts.medium'),

@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url';
 import nacl from 'tweetnacl';
 import { encryptForOwner } from '@sealedbounty/shared';
 
+const sha256hexNode = (t) => createHash('sha256').update(t, 'utf8').digest('hex');
+
 const here = dirname(fileURLToPath(import.meta.url));
 const src = join(here, '..', '..', 'fixtures');
 const out = join(here, '..', 'src', 'fixtures');
@@ -43,21 +45,29 @@ for (const algo of ['ed25519', 'ecdsa']) {
 }
 write('attestation.summary.json', summaries);
 
-// Real recorded judge runs (provider_tee signatures) against the demo target.
-const DEMO_CASES = ['sqli', 'sqli.ecdsa', 'idor', 'bogus', 'injection'];
+// Real recorded judge runs (spec v2, provider_tee signatures) against the demo target.
+const DEMO_CASES = ['sqli', 'sqli.ecdsa', 'idor', 'bogus', 'injection', 'fakecode'];
 const cases = {};
 for (const c of DEMO_CASES) {
   const { inputs, ...rest } = read(`demo.${c}.json`);
-  cases[c] = { ...rest, target: { repoUrl: inputs?.repoUrl, commit: inputs?.commit } };
+  if (rest.spec !== 'v2') throw new Error(`demo.${c}.json is not spec v2`);
+  cases[c] = { ...rest, target: { repoUrl: inputs.repoUrl, commit: inputs.commit }, hunter: inputs.hunter };
 }
 
+// The program's published code bundle (fixtures/vuln-app/bundle.txt) and its hash (program.code_hash).
+const codeBundle = readFileSync(join(src, 'vuln-app', 'bundle.txt'), 'utf8');
+const codeHash = readFileSync(join(src, 'vuln-app', 'bundle.sha256'), 'utf8').trim();
+if (sha256hexNode(codeBundle) !== codeHash) throw new Error('bundle.txt does not hash to bundle.sha256');
+
 // DEMO owner key: derived from a public, fixed seed. Anyone can derive it. Demo only.
-const seed = createHash('sha256').update('sealedbounty-demo-owner-key-DO-NOT-USE').digest();
+const seed = createHash('sha256').update('sealedbounty-demo-owner-key-v2-DO-NOT-USE').digest();
 const owner = nacl.box.keyPair.fromSecretKey(new Uint8Array(seed));
 const ownerPub = Buffer.from(owner.publicKey).toString('base64');
 const ciphertexts = Object.fromEntries(Object.entries(cases).map(([k, v]) => [k, encryptForOwner(v.request_body, ownerPub)]));
 write('demo.json', {
-  note: 'DEMO ONLY. Owner key derived from a public seed; not a secret. Cases are real recorded TEE outputs from fixtures/demo.*.json.',
+  note: 'DEMO ONLY. Owner key derived from a public seed; not a secret. Cases are real recorded TEE outputs from fixtures/demo.*.json (spec v2).',
+  spec: 'v2',
+  code_bundle: { source: 'fixtures/vuln-app/bundle.txt', code_hash: codeHash, bundle: codeBundle },
   // Same shape as the CLI's ~/.sealedbounty/owner-<id>.json
   owner_secret: {
     publicKey: ownerPub,
@@ -65,7 +75,7 @@ write('demo.json', {
     program_id: 0,
     contract_id: 'demo',
     network: 'demo',
-    created_at: '2026-11-08T00:00:00.000Z',
+    created_at: '2026-11-10T00:00:00.000Z',
   },
   cases,
   ciphertexts,

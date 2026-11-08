@@ -12,7 +12,7 @@ export function Programs() {
       <p className="muted">Escrowed bug bounties. Payouts are released when a TEE-signed AI verdict is verified onchain.</p>
       <div className="grid">
         {programs.map((p) => {
-          const n = claims.filter((c) => c.program_id === p.id).length;
+          const n = claims.filter((c) => c.program_id === p.id && !c.refused_at_submit).length;
           return (
             <Link to={`/program/${p.id}`} className="card card-link" key={p.id}>
               <div className="row between">
@@ -30,6 +30,10 @@ export function Programs() {
                 </dd>
                 <dt>Model</dt>
                 <dd className="mono small">{p.model_id}</dd>
+                <dt>Code hash</dt>
+                <dd className="small" onClick={(e) => e.preventDefault()}>
+                  {p.code_hash ? <Hash value={p.code_hash} /> : <span className="muted">none (v1)</span>}
+                </dd>
                 <dt>Claims</dt>
                 <dd>{n}</dd>
               </dl>

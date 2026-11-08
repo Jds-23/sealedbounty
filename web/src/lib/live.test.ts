@@ -1,4 +1,4 @@
-// Parses the recorded real view JSON from escrow.baldingsucks7993.testnet and runs the browser checks on it.
+// Parses the recorded real view JSON from the v1 contract escrow.baldingsucks7993.testnet (no code_hash) and runs the browser checks on it.
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +9,7 @@ import { normaliseSigners, sha256hex } from './verify';
 import { verifyClaim } from './checks';
 import { decryptReport, parseOwnerSecret, reportMatchesHash } from './crypto';
 import { fmtSecs, yoctoToNear } from './format';
+import { auditRequest } from './requestChecks';
 
 const V = live.views;
 const programs = V.list_programs.result.map(parseProgram);
@@ -26,6 +27,7 @@ describe('live view shapes', () => {
     const p = programs[0];
     expect(p.id).toBe(0);
     expect(p.name).toBe('vuln-app demo');
+    expect(p.code_hash).toBeNull();
     expect(yoctoToNear(p.balance)).toBe('0.74');
     expect(yoctoToNear(p.reserved)).toBe('0.00');
     expect(yoctoToNear(p.payouts.high, 1)).toBe('0.3');
@@ -106,5 +108,6 @@ describe.skipIf(!existsSync(OWNER_FILE))('owner inbox with the real program-0 ke
     expect(req.model).toBe(programs[0].model_id);
     expect(req.messages[0].role).toBe('system');
     expect(sha256hex(req.messages[0].content)).toBe(programs[0].system_prompt_hash);
+    expect(auditRequest(pt, programs[0], claims[0].hunter)).toMatchObject({ ok: true, v1: true });
   });
 });
