@@ -77,3 +77,35 @@ Methods:
 - Allowlisted signers (attested 9 Nov):
   - `ed25519:89154a43a47684742c3d1753252bb6f49f61da9d8c84fc9b1def2df130cb2d93`
   - `eth:0x835ab53d20294ef795906dff21ae4c045336aa26`
+
+---
+# v2 (10 Nov 2026): binds the judged CODE and the HUNTER (supersedes v1 where they conflict)
+
+Fresh-clone judge finding: in v1 the hunter supplied the code excerpt, so they could invent vulnerable code and get paid. v1 also allowed front-running (anyone could copy pending submit_claim args).
+
+## Code bundle (owner publishes it; the hunter must use it byte-for-byte)
+- `buildCodeBundle(files: {path, content}[])`: sort by path (byte order), each entry = `// file: <path>\n<content>`, ensure content ends with `\n` (append one if missing), concatenate with no separator.
+- `program.code_hash` = sha256hex(utf8(bundle)).
+- Demo bundle = `[{path:"src/server.ts", content: fixtures/vuln-app/src/server.ts}]`. Write it to `fixtures/vuln-app/bundle.txt`, with its hash in `fixtures/vuln-app/bundle.sha256` (no trailing newline).
+- Demo `repo_url` = `https://github.com/sealedbounty/sealedbounty/tree/main/fixtures/vuln-app` (placeholder org; the README says the code lives in fixtures/vuln-app). Commit stays `demo-commit-0001`.
+
+## Canonical judge request v2 (`buildRequestBody({model, repoUrl, commit, hunter, codeBundle, report})`)
+```
+messages = [
+  {"role":"system","content": SYSTEM_PROMPT},
+  {"role":"user","content": "TARGET <repo_url>@<commit>\nHUNTER <hunter_account_id>\n\nCODE\n<codeBundle>"},
+  {"role":"user","content": "REPORT\n<report>"}
+]
+```
+Everything else is unchanged (json_schema, `chat_template_kwargs.enable_thinking=false`, temperature 0, max_tokens 400). The system prompt may be updated to explain the two user messages (the CODE is trusted scope, the REPORT is untrusted). If it changes, its hash changes, so update `shared/system-prompt.sha256`.
+
+## Contract v2 changes
+- `Program` gains `code_hash: String` (64 lowercase hex). `create_program(..., code_hash, ...)` is a new required arg, placed after `system_prompt_hash`.
+- `dispute(claim_id, request_body)`: after the existing sha256 == req_hash check, Reject with the FIRST failing reason, in this order:
+  1. `"system prompt tampered"`: messages[0] is not system, or its hash ≠ system_prompt_hash
+  2. `"model mismatch"`
+  3. `"code mismatch"`: messages[1] is not role user, OR its content doesn't start with the exact prefix `format!("TARGET {}@{}\nHUNTER {}\n\nCODE\n", program.repo_url, program.commit, claim.hunter)`, OR sha256hex(rest after the prefix) ≠ program.code_hash. To tell hunter mismatch apart, check the TARGET line first, then the HUNTER line; if only the HUNTER line differs → reason 4.
+  4. `"hunter mismatch"`: the HUNTER line ≠ claim.hunter (front-running). Special: on this reason ALSO remove req_hash from `used_req_hashes`, so the real hunter can resubmit.
+  5. `"report missing"`: messages[2] is missing, not role user, or doesn't start with `"REPORT\n"`. (Any extra messages beyond index 2 → `"system prompt tampered"`.)
+  - All checks pass → panic `"dispute invalid: request matches program"`. NOTE: the panic string changes from v1's "prompt matches".
+- Everything else is the same as v1. Deploy target: **`sealedbounty-v2.testnet`** (fresh state, admin `baldingsucks7993.testnet`). v1 `escrow.baldingsucks7993.testnet` stays as history.
