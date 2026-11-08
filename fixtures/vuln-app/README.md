@@ -3,10 +3,11 @@
 > **Warning:** this is deliberately insecure demo code for the SealedBounty hackathon demo.
 > Do not deploy it, expose it to a network, or copy patterns from it.
 
-A tiny Express + Postgres API used as the bounty target. The judge sees `src/server.ts`
-verbatim as the code excerpt.
+A tiny Express + Postgres API used as the bounty target. In v2 the program owner publishes
+the code bundle `bundle.txt` (built from `src/server.ts` by `buildCodeBundle`, sha256 in
+`bundle.sha256`). The judge sees that bundle verbatim, and the contract's `code_hash` binds it.
 
-- Demo repo URL: `https://github.com/sealedbounty/vuln-app`
+- Demo repo URL (onchain `repo_url`, a placeholder): `https://github.com/sealedbounty/sealedbounty/tree/main/fixtures/vuln-app`
 - Demo commit id (fixed, fake): `demo-commit-0001`
 
 ## Planted bugs (the "answer key")

@@ -2,7 +2,7 @@
 
 A read-only UI for the SealedBounty escrow contract. Vite + React + TypeScript. It has no backend and no wallet: all writes go through the CLI. The browser only does NEAR RPC `call_function` views, re-verifies signatures, and decrypts owner reports locally.
 
-Live mode against the v1 contract `escrow.baldingsucks7993.testnet` (program 0, claim 0 Paid and verified in the browser). The default is now the v2 contract `sealedbounty-v2.testnet`; until it has programs, auto mode shows the demo with a banner.
+Live mode against the v1 contract `escrow.baldingsucks7993.testnet` (program 0, claim 0 Paid and verified in the browser). The default is now the v2 contract `sealedbounty-v2.testnet` (program 0 with 3 claims: a front-run rejected for "hunter mismatch", a paid claim, and fabricated code rejected for "code mismatch"), and auto mode shows it live.
 
 ![live](./screenshot-live.png)
 
@@ -39,7 +39,7 @@ Auto mode uses live data when the contract has at least one program. If RPC fail
   - ◷ (checked offline): the Intel DCAP and NVIDIA NRAS verdicts from the `attest` tool, labelled with the attestation date. The certificate chains are not re-run in the browser.
   - – (not checkable client-side): the verdict↔body link in live mode (the contract keeps only `resp_hash`), and the report contents (encrypted to the owner).
   - A "tamper 1 byte of resp_hash" toggle (in dev or demo) shows the panel turning red.
-- **Owner inbox** (`#/inbox`): paste or upload `~/.sealedbounty/owner-<id>.json` (or a bare base64 secret). The page derives the public key, matches it to programs by `owner_enc_pubkey`, decrypts each claim's ciphertext with tweetnacl box, checks `sha256(plaintext) == req_hash`, then runs the shared `checkRequestAgainstProgram` (the v2 dispute rules) and shows each check green/red with its reason: prompt, model, code (sha256 of the CODE section vs `code_hash`), hunter (HUNTER line vs `claim.hunter`) and report. If a Pending claim fails, it says "Disputable: run `sb dispute --claim N`". v1 programs (no `code_hash`) get prompt + model only. The secret stays in React state and is never stored or sent anywhere.
+- **Owner inbox** (`#/inbox`): paste or upload `~/.sealedbounty/owner-<contract>-<id>.json` (or a bare base64 secret). The page derives the public key, matches it to programs by `owner_enc_pubkey`, decrypts each claim's ciphertext with tweetnacl box, checks `sha256(plaintext) == req_hash`, then runs the shared `checkRequestAgainstProgram` (the v2 dispute rules) and shows each check green/red with its reason: prompt, model, code (sha256 of the CODE section vs `code_hash`), hunter (HUNTER line vs `claim.hunter`) and report. If a Pending claim fails, it says "Disputable: run `sb dispute --claim N`". v1 programs (no `code_hash`) get prompt + model only. The secret stays in React state and is never stored or sent anywhere.
 - **How it works** (`#/how`): a diagram and the honest limits.
 
 ## Demo mode
@@ -63,7 +63,7 @@ The demo owner key in `src/fixtures/demo.json` is derived from a public seed, so
 - `src/lib/checks.ts`: builds the per-claim checklist.
 - `src/lib/requestChecks.ts`: owner-side v2 audit of a decrypted request (per-check breakdown; overall verdict from shared `checkRequestAgainstProgram`).
 - `src/lib/near.ts`: JSON-RPC views (`list_programs {from_index,limit}`, `get_program {id}`, `list_claims {program_id,from_index,limit}`, `get_claim {id}`, `get_signers`, `get_owner`), RPC fallback, runtime parsing of the contract JSON (`parseProgram`/`parseClaim`), and the nearblocks payout-tx lookup.
-- `src/fixtures/live-views.json`: a recorded copy of the real view outputs (public onchain data). `src/lib/live.test.ts` parses it and runs the Verified checks on claim 0. It also decrypts claim 0 with `~/.sealedbounty/owner-0.json` (or `$SB_OWNER_FILE`) if that file exists, and skips that test otherwise. The key is read at test time and never copied into the repo.
+- `src/fixtures/live-views.json`: a recorded copy of the real view outputs (public onchain data). `src/lib/live.test.ts` parses it and runs the Verified checks on claim 0. It also decrypts claim 0 with `~/.sealedbounty/owner-escrow.baldingsucks7993.testnet-0.json` (legacy `owner-0.json`, or `$SB_OWNER_FILE`) if that file exists, and skips that test otherwise. The key is read at test time and never copied into the repo.
 - `src/lib/demo.ts`: the demo dataset.
 - `scripts/sync-fixtures.mjs`: trims `../fixtures/attestation.*.json` (300 KB each) down to a summary plus the model quote, copies the v2 demo fixtures and the code bundle, and builds the demo owner key + ciphertexts.
 

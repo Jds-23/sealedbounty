@@ -64,7 +64,7 @@ The command also generates an x25519 keypair and registers `system_prompt_hash =
 sha256(shared/system-prompt.txt)`. It attaches `fund + 0.05 NEAR` (the storage allowance; the contract
 adds whatever is left of it to the pool). The secret key is written to
 `~/.sealedbounty/owner-pending-*.json` **before** the transaction is sent and renamed to
-`~/.sealedbounty/owner-<programId>.json` (chmod 600) after it succeeds. Back this file up: without it
+`~/.sealedbounty/owner-<contract>-<programId>.json` (chmod 600) after it succeeds. Back this file up: without it
 you cannot read the reports.
 
 ```sh

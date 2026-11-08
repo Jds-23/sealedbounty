@@ -172,7 +172,7 @@ export function Inbox() {
       </div>
       <div className="card">
         <label className="field">
-          <span>Owner secret: paste <code>~/.sealedbounty/owner-&lt;id&gt;.json</code> or the base64 box secret key</span>
+          <span>Owner secret: paste <code>~/.sealedbounty/owner-&lt;contract&gt;-&lt;id&gt;.json</code> or the base64 box secret key</span>
           <textarea
             rows={4}
             className="mono"

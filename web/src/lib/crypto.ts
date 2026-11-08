@@ -30,7 +30,7 @@ function tryKey(v: unknown): Uint8Array | null {
 }
 
 /**
- * Accepts the owner secret file JSON (~/.sealedbounty/owner-<id>.json) or a bare base64 key.
+ * Accepts the owner secret file JSON (~/.sealedbounty/owner-<contract>-<id>.json) or a bare base64 key.
  * The exact field name is not fixed by the spec, so known names are tried first, then any
  * string field that decodes to 32 bytes and is not the public key.
  */

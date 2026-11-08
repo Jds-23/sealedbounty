@@ -97,7 +97,10 @@ describe('verified panel on live claim 0', () => {
 });
 
 // Reads the real owner key at test time only (never copied into the repo). Skipped where it doesn't exist (CI).
-const OWNER_FILE = process.env.SB_OWNER_FILE || join(homedir(), '.sealedbounty', 'owner-0.json');
+const OWNER_FILE =
+  process.env.SB_OWNER_FILE ||
+  [join(homedir(), '.sealedbounty', 'owner-escrow.baldingsucks7993.testnet-0.json'), join(homedir(), '.sealedbounty', 'owner-0.json')].find((p) => existsSync(p)) ||
+  join(homedir(), '.sealedbounty', 'owner-escrow.baldingsucks7993.testnet-0.json');
 describe.skipIf(!existsSync(OWNER_FILE))('owner inbox with the real program-0 key', () => {
   it('decrypts claim 0: sha256 == req_hash, system prompt and model match', () => {
     const { secretKey, publicKeyB64 } = parseOwnerSecret(readFileSync(OWNER_FILE, 'utf8'));

@@ -79,7 +79,7 @@ Methods:
   - `eth:0x835ab53d20294ef795906dff21ae4c045336aa26`
 
 ---
-# v2 (10 Nov 2026): binds the judged CODE and the HUNTER (supersedes v1 where they conflict)
+# v2 (9 Nov 2026): binds the judged CODE and the HUNTER (supersedes v1 where they conflict)
 
 Fresh-clone judge finding: in v1 the hunter supplied the code excerpt, so they could invent vulnerable code and get paid. v1 also allowed front-running (anyone could copy pending submit_claim args).
 
