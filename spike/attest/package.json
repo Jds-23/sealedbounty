@@ -1,0 +1,16 @@
+{
+  "name": "sealedbounty-spike-attest",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=23"
+  },
+  "scripts": {
+    "attest": "node --experimental-strip-types --no-warnings src/attest.ts"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.4.0",
+    "@phala/dcap-qvl-node": "^0.3.3",
+    "jose": "^6.2.16"
+  }
+}

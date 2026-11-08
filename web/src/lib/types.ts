@@ -1,0 +1,68 @@
+// Mirrors docs/INTERFACE.md. Amounts are yoctoNEAR decimal strings; timestamps are ns strings.
+export type Severity = 'none' | 'low' | 'medium' | 'high' | 'critical';
+export type SigKind = 'provider_tee' | 'gateway';
+/** "ed25519:<64 hex>" | "eth:0x<40 hex>" */
+export type Signer = string;
+
+export interface Verdict {
+  valid: boolean;
+  severity: Severity;
+  cwe: string | null;
+  confidence: number;
+}
+
+export interface Payouts {
+  low: string;
+  medium: string;
+  high: string;
+  critical: string;
+}
+
+export interface Program {
+  id: number;
+  owner: string;
+  name: string;
+  repo_url: string;
+  commit: string;
+  model_id: string;
+  system_prompt_hash: string;
+  payouts: Payouts;
+  owner_enc_pubkey: string;
+  dispute_secs: number;
+  min_confidence: number;
+  balance: string;
+  reserved: string;
+  open: boolean;
+  created_at: string;
+}
+
+export type ClaimStatus = 'Pending' | 'Rejected' | 'Paid';
+
+export interface Claim {
+  id: number;
+  program_id: number;
+  hunter: string;
+  req_hash: string;
+  resp_hash: string;
+  verdict: Verdict;
+  signer: Signer;
+  kind: SigKind;
+  signature: string;
+  model: string;
+  ciphertext: string;
+  status: ClaimStatus;
+  payout: string;
+  submitted_at: string;
+  finalize_after: string;
+  reject_reason: string | null;
+}
+
+export interface SignerMeta {
+  kind: SigKind;
+  model?: string | null;
+}
+
+export interface SignerEntry {
+  signer: Signer;
+  meta: SignerMeta;
+}

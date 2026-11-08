@@ -1,0 +1,9 @@
+.env
+.env.local
+.env.*.local
+target/
+node_modules/
+dist/
+.playwright-mcp/
+.DS_Store
+*.log

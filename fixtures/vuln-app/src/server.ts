@@ -1,0 +1,44 @@
+import express, { Request, Response, NextFunction } from 'express';
+import { Pool } from 'pg';
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const app = express();
+app.use(express.json());
+
+// Resolve the caller from a bearer session token.
+async function requireUser(req: Request, res: Response, next: NextFunction) {
+  const token = (req.header('authorization') ?? '').replace(/^Bearer /, '');
+  const { rows } = await pool.query('SELECT user_id FROM sessions WHERE token = $1', [token]);
+  if (rows.length === 0) return res.status(401).json({ error: 'unauthorized' });
+  res.locals.userId = rows[0].user_id;
+  next();
+}
+
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, uptime: process.uptime() });
+});
+
+// Public profile lookup.
+app.get('/users', async (req, res) => {
+  const id = String(req.query.id ?? '');
+  const { rows } = await pool.query("SELECT id, name, email FROM users WHERE id = '" + id + "'");
+  res.json(rows);
+});
+
+// List the caller's own invoices.
+app.get('/invoices', requireUser, async (_req, res) => {
+  const { rows } = await pool.query(
+    'SELECT id, amount_cents, status FROM invoices WHERE owner_id = $1',
+    [res.locals.userId],
+  );
+  res.json(rows);
+});
+
+// Fetch a single invoice.
+app.get('/invoices/:id', requireUser, async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM invoices WHERE id = $1', [req.params.id]);
+  if (rows.length === 0) return res.status(404).json({ error: 'not found' });
+  res.json(rows[0]);
+});
+
+app.listen(Number(process.env.PORT ?? 3000));

@@ -1,0 +1,39 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      '@noble/hashes':
+        specifier: ^2.4.0
+        version: 2.4.0
+      '@phala/dcap-qvl-node':
+        specifier: ^0.3.3
+        version: 0.3.3
+      jose:
+        specifier: ^6.2.16
+        version: 6.2.16
+
+packages:
+
+  '@noble/hashes@2.4.0':
+    resolution: {integrity: sha512-X5XaVWZIBCT7HHZGm5I7ZQXDwLG+bGXuSrMQAW+7Zvl87h1kmc1ZB1VSRJcpUfoUrGQp4Fkoxm5kZ+Ms+aW+eA==}
+    engines: {node: '>= 20.19.0'}
+
+  '@phala/dcap-qvl-node@0.3.3':
+    resolution: {integrity: sha512-Iakz7N6VfWXWfgDkgJ5PFr414UV8BD3mk9ssEd0sFFiGNgiAwzD/wE2zwsGRya7qYYC+R8rvg4uEHXQfu1ArAQ==}
+
+  jose@6.2.16:
+    resolution: {integrity: sha512-4LSJpbuBuPdGrONCdZUy0xnxtLf8eEz+EY0SMXdHQEBU7bgUHDVblU/JAjryv3wID9/LK7/YuwFwq+AQNfMscQ==}
+
+snapshots:
+
+  '@noble/hashes@2.4.0': {}
+
+  '@phala/dcap-qvl-node@0.3.3': {}
+
+  jose@6.2.16: {}

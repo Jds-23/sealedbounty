@@ -1,0 +1,16 @@
+{
+  "model": "Qwen/Qwen3.8-27B",
+  "request_body": "{\"model\":\"Qwen/Qwen3.8-27B\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a security triage judge. Given a target code excerpt and a vulnerability report, decide if the report describes a real, exploitable vulnerability in that code. Respond ONLY with JSON matching the schema. Do not repeat exploit details.\"},{\"role\":\"user\",\"content\":\"## Target code (TypeScript, Express)\\n```ts\\nimport express from 'express';\\nimport { pool } from './db';\\nconst app = express();\\napp.get('/users', async (req, res) => {\\n  const id = req.query.id;\\n  const rows = await pool.query(\\\"SELECT id, email FROM users WHERE id = '\\\" + id + \\\"'\\\");\\n  res.json(rows.rows);\\n});\\n```\\n\\n## Vulnerability report\\nTitle: SQL injection in GET /users\\nThe `id` query parameter is concatenated directly into the SQL string without parameterization or validation. An attacker can supply a crafted `id` value that breaks out of the string literal and alters the query, e.g. returning all rows of the users table. Impact: unauthenticated read of all user emails.\"}],\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"verdict\",\"strict\":true,\"schema\":{\"type\":\"object\",\"properties\":{\"valid\":{\"type\":\"boolean\"},\"severity\":{\"type\":\"string\",\"enum\":[\"none\",\"low\",\"medium\",\"high\",\"critical\"]},\"cwe\":{\"type\":\"string\"},\"confidence\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":100}},\"required\":[\"valid\",\"severity\",\"cwe\",\"confidence\"],\"additionalProperties\":false}}},\"chat_template_kwargs\":{\"enable_thinking\":false},\"max_tokens\":400,\"temperature\":0,\"stream\":false}",
+  "response_body_b64": "eyJpZCI6Ijc4NjNiYTc2NDE5OTQzZDg4OWViNmFmOWI0MDc2MDc4Iiwib2JqZWN0IjoiY2hhdC5jb21wbGV0aW9uIiwiY2hvaWNlcyI6W3siaW5kZXgiOjAsIm1lc3NhZ2UiOnsicm9sZSI6ImFzc2lzdGFudCIsImNvbnRlbnQiOiJ7XG4gIFwidmFsaWRcIjogdHJ1ZSxcbiAgXCJzZXZlcml0eVwiOiBcImhpZ2hcIixcbiAgXCJjd2VcIjogXCJDV0UtODlcIixcbiAgXCJjb25maWRlbmNlXCI6IDBcbn0ifSwiZmluaXNoX3JlYXNvbiI6InN0b3AiLCJsb2dwcm9icyI6bnVsbCwibWF0Y2hlZF9zdG9wIjoyNDgwNDZ9XSwibW9kZWwiOiJRd2VuL1F3ZW4zLjgtMjdCIiwiY3JlYXRlZCI6MTc5NDE2NTcyMSwidXNhZ2UiOnsicHJvbXB0X3Rva2VucyI6MjMzLCJ0b3RhbF90b2tlbnMiOjI3NCwiY29tcGxldGlvbl90b2tlbnMiOjQxLCJwcm9tcHRfdG9rZW5zX2RldGFpbHMiOm51bGwsInJlYXNvbmluZ190b2tlbnMiOjAsImNvbXBsZXRpb25fdG9rZW5zX2RldGFpbHMiOnsicmVhc29uaW5nX3Rva2VucyI6MH19fQ==",
+  "req_hash": "533e6d1fd59e76068fef8019c2986bbe9a27304b4472623834f9b8350f3cd577",
+  "resp_hash": "40c2982e23abba48d5e769e62a1afd77c890354f8b7c5371ea21a1de22c6fea1",
+  "chat_id": "7863ba76419943d889eb6af9b4076078",
+  "signature": "0x0e1d17f14271a5ffb8409bbb3ef075bc905b378dabeecf251e64081c893d68a86ccb3e3fb4eb8ebd30ffe52d63bd54af90b2a890bc75826bf3e64dbe52b3be321c",
+  "signing_address": "0x835ab53d20294ef795906dff21ae4c045336aa26",
+  "signing_algo": "ecdsa",
+  "signature_kind": "provider_tee",
+  "text": "Qwen/Qwen3.8-27B:533e6d1fd59e76068fef8019c2986bbe9a27304b4472623834f9b8350f3cd577:40c2982e23abba48d5e769e62a1afd77c890354f8b7c5371ea21a1de22c6fea1",
+  "attestation_nonce": "c7c3e49da6ed831ea833de889239c24cda7c81099632e2c7b3c4ffd4873bc51b",
+  "signer_in_attestation": true,
+  "recorded_at": "2026-11-08T19:22:14.980Z"
+}

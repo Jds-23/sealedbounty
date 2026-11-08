@@ -1,0 +1,14 @@
+{
+  "name": "spike-sign",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "record": "node record.mjs",
+    "verify": "node verify.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.9",
+    "ethers": "^6.17.0",
+    "tweetnacl": "^1.0.3"
+  }
+}

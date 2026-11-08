@@ -1,0 +1,10 @@
+{
+  "model": "deepseek-ai/DeepSeek-V3.1",
+  "request_body": "{\"model\":\"deepseek-ai/DeepSeek-V3.1\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a security triage judge. Reply ONLY with JSON: {\\\"valid\\\": bool, \\\"severity\\\": \\\"none|low|medium|high|critical\\\", \\\"cwe\\\": string|null, \\\"confidence\\\": 0-100}\"},{\"role\":\"user\",\"content\":\"Bounty: reentrancy in withdraw(). Report: withdraw() sends ETH via call before zeroing balance; PoC attached.\"}],\"temperature\":0,\"stream\":false}",
+  "response_body_b64": "eyJpZCI6ImNoYXRjbXBsLWUyOWNlYTk5ZDViNjk3ZDFlNGNiNzhiMSIsIm9iamVjdCI6ImNoYXQuY29tcGxldGlvbiIsImNyZWF0ZWQiOjE3OTQxNjU3NTgsIm1vZGVsIjoiZGVlcHNlZWstYWkvRGVlcFNlZWstVjMuMSIsImNob2ljZXMiOlt7ImluZGV4IjowLCJtZXNzYWdlIjp7InJvbGUiOiJhc3Npc3RhbnQiLCJjb250ZW50IjoiYGBganNvblxue1xuICBcInZhbGlkXCI6IHRydWUsXG4gIFwic2V2ZXJpdHlcIjogXCJoaWdoXCIsXG4gIFwiY3dlXCI6IFwiQ1dFLTg0MVwiLFxuICBcImNvbmZpZGVuY2VcIjogOTJcbn1cbmBgYCIsInRvb2xfY2FsbHMiOltdfSwibG9ncHJvYnMiOm51bGwsImZpbmlzaF9yZWFzb24iOiJzdG9wIn1dLCJ1c2FnZSI6eyJwcm9tcHRfdG9rZW5zIjoxMTIsImNvbXBsZXRpb25fdG9rZW5zIjo0MSwidG90YWxfdG9rZW5zIjoxNTN9fQ==",
+  "req_hash": "e13b15eac94ac8bc353376a650daa13a8425da1591e240ebb9c03f0f06f338e3",
+  "signature": "0x0c94fb08514809c5e5e8d32120dbdac1c932f33a78a0fd3a4f0256065ed99bd607147efee3d6972355027b7efda9047157a0a8cae6c9e3fc563b6ee4fbf84ef21c",
+  "signing_address": "0x14cb9F5e2E08e088612a62F51800D2C295B40949",
+  "signing_algo": "ecdsa",
+  "signature_kind": "provider_tee"
+}

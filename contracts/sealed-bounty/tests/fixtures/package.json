@@ -1,0 +1,12 @@
+{
+  "name": "sealed-bounty-fixtures",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "gen": "node gen.mjs"
+  },
+  "dependencies": {
+    "ethers": "^6.17.0",
+    "tweetnacl": "^1.0.3"
+  }
+}

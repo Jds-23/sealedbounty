@@ -1,0 +1,79 @@
+# SealedBounty — shared interface (source of truth for contract, CLI, web)
+
+## Phase 0 proven facts
+- Model: `Qwen/Qwen3.8-27B` (NEAR AI Cloud, provider_tee). Non-streaming. Headers: `x-no-aliasing: true`, `Accept-Encoding: identity`.
+- Every judge request MUST include `chat_template_kwargs: {"enable_thinking": false}`. Otherwise thinking eats all the tokens and content is null.
+- Signed text (provider_tee) = `{model}:{sha256hex(request_body)}:{sha256hex(response_body)}`.
+- Signers rotate on NEAR AI redeploy → signers are allowlisted by the contract admin after `attest` and are never hardcoded.
+- Reusable code:
+  - `contracts/sealed-bounty/src/tee.rs`: `verify_tee_signature`, `parse_verdict`, `Signer`, `SigKind`, `Severity`, `Verdict`
+  - `spike/sign/lib.mjs`: record + verify
+  - `spike/attest/src/attest.ts`: full attestation
+
+## Encodings
+- `Signer` JSON = `"ed25519:<64 hex>"` | `"eth:0x<40 hex>"`.
+- `SigKind` = `"provider_tee"` | `"gateway"`.
+- `Severity` = `"none"|"low"|"medium"|"high"|"critical"`.
+- `Verdict` = `{valid: bool, severity: Severity, cwe: string|null, confidence: u8}`.
+  - `confidence` = the probability that the VERDICT is correct (×100), so `valid:false, confidence:100` means "surely bogus".
+  - `min_confidence` gates payable verdicts only.
+  - JSON schema `cwe` = `{"type":["string","null"]}`.
+- System prompt: `shared/system-prompt.txt` (no trailing newline), sha256 `4fdd9ec80e291d38021d5f4545f6575b6057c4033f8ffa93b24a17cb73e930db`. Helpers live in `shared/judge.mjs` (browser-safe).
+- Demo target: `https://github.com/sealedbounty/vuln-app` @ `demo-commit-0001`. Fixtures: `fixtures/demo.{sqli,sqli.ecdsa,idor,bogus,injection}.json`.
+- Amounts: `U128` yoctoNEAR as a decimal string. Timestamps: nanoseconds as `U64` strings.
+- Owner encryption key: tweetnacl `box` keypair (x25519). The public key is base64 and goes onchain. The secret key stays local at `~/.sealedbounty/owner-<program_id>.json`, never committed.
+- Report ciphertext (base64) = `ephemeralPub(32) || nonce(24) || nacl.box(utf8(request_body), nonce, ownerPub, ephemeralSecret)`.
+
+## Canonical judge request body (built ONCE with JSON.stringify, hashed exactly as sent)
+```json
+{"model":"<program.model_id>",
+ "messages":[{"role":"system","content":"<exact contents of shared/system-prompt.txt>"},
+             {"role":"user","content":"TARGET <repo_url>@<commit>\n\n<code excerpt>\n\nREPORT\n<exploit report>"}],
+ "response_format":{"type":"json_schema","json_schema":{"name":"verdict","strict":true,"schema":{...verdict schema...}}},
+ "chat_template_kwargs":{"enable_thinking":false},
+ "temperature":0,"max_tokens":400}
+```
+`program.system_prompt_hash` = sha256hex(utf8 of the exact system prompt string) = sha256hex of `messages[0].content`.
+
+## Contract `sealed-bounty` (near-sdk 5.30, `unstable` feature)
+State: `owner` (admin), `signers: IterableMap<Signer, SignerMeta{kind, model?}>`, `programs: IterableMap<u64, Program>`, `claims: IterableMap<u64, Claim>`, `used_req_hashes: LookupSet<String>`, `next_program_id`, `next_claim_id`.
+
+```
+Program { id: u64, owner: AccountId, name: String, repo_url: String, commit: String,
+  model_id: String, system_prompt_hash: String, payouts: Payouts{low,medium,high,critical: U128},
+  owner_enc_pubkey: String, dispute_secs: u64, min_confidence: u8,
+  balance: U128 /*unreserved*/, reserved: U128, open: bool, created_at: U64 }
+
+Claim { id: u64, program_id: u64, hunter: AccountId, req_hash: String, resp_hash: String,
+  verdict: Verdict, signer: Signer, kind: SigKind, signature: String, model: String,
+  ciphertext: String, status: "Pending"|"Rejected"|"Paid", payout: U128,
+  submitted_at: U64, finalize_after: U64, reject_reason: Option<String> }
+```
+
+Methods:
+- `new(owner: Option<AccountId>)` (init)
+- `add_signer(signer, meta)` / `remove_signer(signer)`: admin only. `get_signers()`.
+- `create_program(name, repo_url, commit, model_id, system_prompt_hash, payouts, owner_enc_pubkey, dispute_secs, min_confidence) -> u64`: **payable**. The attached deposit minus the storage cost becomes `balance`.
+- `fund_program(program_id)`: payable, adds to balance.
+- `close_program(program_id)`: program owner only. Sets open=false and refunds `balance` (`reserved` stays for pending claims).
+- `submit_claim(program_id, req_hash, resp_body: Base64VecU8, signature, signer, kind, ciphertext) -> u64`: payable for storage. Checks, in order:
+  - the program is open
+  - the signer is allowlisted with a matching kind
+  - `verify_tee_signature` with `model = program.model_id`
+  - `parse_verdict`
+  - `verdict.valid && severity != none && confidence >= min_confidence`, else panic `"verdict not payable"`
+  - `req_hash` not used, else `"already claimed"`
+  - `payout = payouts[severity] <= balance`, else `"insufficient pool"`
+  - Then: move payout from balance → reserved, store resp_hash = sha256hex(resp_body) (NOT the body), set `finalize_after = now + dispute_secs`, and refund unused storage deposit.
+- `dispute(claim_id, request_body: String)`: program owner only, Pending, `now < finalize_after`. It requires `sha256hex(request_body) == req_hash` (else `"body mismatch"`), then parses JSON:
+  - if `messages[0].role != "system"`, or `sha256hex(messages[0].content) != system_prompt_hash`, or `model != program.model_id` → status Rejected (reason `"system prompt tampered"` / `"model mismatch"`), and reserved goes back to balance
+  - otherwise panic `"dispute invalid: prompt matches"`.
+- `finalize(claim_id)`: anyone, Pending, `now >= finalize_after` → Paid, reserved -= payout, `Promise::transfer(hunter, payout)`.
+- Views: `get_program(id)`, `list_programs(from_index: Option<u64>, limit: Option<u64>)`, `get_claim(id)`, `list_claims(program_id, from_index, limit)`, `get_owner()`.
+- Events: `env::log_str` in NEP-297 JSON (`EVENT_JSON:{"standard":"sealedbounty","version":"1.0.0","event":"claim_submitted",...}`).
+
+## Testnet
+- Admin/owner account `baldingsucks7993.testnet`. Escrow contract: `escrow.baldingsucks7993.testnet` (fresh state). The `sealedbounty.*` account keeps the Phase 0 spike.
+- Allowlisted signers (attested 9 Nov):
+  - `ed25519:89154a43a47684742c3d1753252bb6f49f61da9d8c84fc9b1def2df130cb2d93`
+  - `eth:0x835ab53d20294ef795906dff21ae4c045336aa26`

@@ -1,0 +1,9 @@
+{
+  "name": "sealedbounty-vuln-app",
+  "private": true,
+  "description": "INTENTIONALLY VULNERABLE demo app for SealedBounty. Never deploy.",
+  "type": "module",
+  "scripts": { "start": "tsx src/server.ts" },
+  "dependencies": { "express": "^4.21.2", "pg": "^8.13.1" },
+  "devDependencies": { "@types/express": "^5.0.0", "@types/pg": "^8.11.10", "tsx": "^4.19.2", "typescript": "^5.7.2" }
+}

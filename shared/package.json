@@ -1,0 +1,23 @@
+{
+  "name": "@sealedbounty/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "judge.mjs",
+  "exports": {
+    ".": "./judge.mjs",
+    "./judge.mjs": "./judge.mjs",
+    "./system-prompt.mjs": "./system-prompt.mjs",
+    "./system-prompt.txt": "./system-prompt.txt"
+  },
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "gen:prompt": "node gen-prompt.mjs",
+    "record:demo": "node record-demo.mjs",
+    "demo:offline": "node demo-offline.mjs"
+  },
+  "dependencies": {
+    "ethers": "^6.17.0",
+    "tweetnacl": "^1.0.3"
+  }
+}
