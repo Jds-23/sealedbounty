@@ -10,6 +10,8 @@ interface DataState {
   setMode: (m: Mode) => void;
   isDemo: boolean;
   demoReason: string | null;
+  /** Live data was requested (auto) but RPC failed: the UI must say so loudly. */
+  rpcError: string | null;
   loading: boolean;
   programs: Program[];
   claims: Claim[];
@@ -77,7 +79,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
   let demoReason: string | null = null;
   if (mode === 'demo') demoReason = 'Demo mode on';
   else if (mode === 'auto' && !loading) {
-    if (live.error) demoReason = /CodeDoesNotExist/.test(live.error) ? 'Contract not deployed yet' : `RPC failed (${live.error.slice(0, 80)})`;
+    if (live.error) demoReason = /CodeDoesNotExist/.test(live.error) ? 'Contract not deployed yet' : 'Live RPC unreachable → showing demo data';
     else if (live.programs.length === 0) demoReason = 'Contract has no programs yet';
   }
   const isDemo = demoReason !== null;
@@ -87,6 +89,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
     setMode,
     isDemo,
     demoReason,
+    rpcError: mode !== 'demo' && !loading ? live.error : null,
     loading: loading && mode !== 'demo',
     programs: isDemo ? demo.programs : live.programs,
     claims: isDemo ? demo.claims : live.claims,

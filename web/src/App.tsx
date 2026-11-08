@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { HashRouter, NavLink, Route, Routes } from 'react-router-dom';
 import { DataProvider, useData, type Mode } from './data';
-import { CONTRACT_ID } from './lib/near';
+import { CONTRACT_ID, explorerAccount } from './lib/near';
 import { Programs } from './pages/Programs';
 import { ProgramDetail } from './pages/ProgramDetail';
 import { Inbox } from './pages/Inbox';
@@ -36,38 +36,52 @@ function ThemeToggle() {
 }
 
 function ModeBar() {
-  const { mode, setMode, isDemo, demoReason, reload, loading } = useData();
+  const { mode, setMode, isDemo, demoReason, reload, loading, rpcError } = useData();
   return (
-    <div className={`modebar ${isDemo ? 'modebar-demo' : ''}`}>
-      <span>
-        {isDemo ? (
-          <>
-            <strong>DEMO</strong> · {demoReason}. Program and claims are mock data. Signatures and attestation are the <strong>real</strong> recorded
-            TEE outputs from <code>fixtures/demo.*.json</code>.
-          </>
-        ) : loading ? (
-          <>
-            Connecting to <code>{CONTRACT_ID}</code>…
-          </>
-        ) : (
-          <>
-            Live · <code>{CONTRACT_ID}</code> on testnet
-          </>
-        )}
-      </span>
-      <span className="row gap">
-        <select value={mode} onChange={(e) => setMode(e.target.value as Mode)} aria-label="Data source">
-          <option value="auto">auto</option>
-          <option value="live">live</option>
-          <option value="demo">demo</option>
-        </select>
-        {!isDemo && (
+    <>
+      {rpcError && !/CodeDoesNotExist/.test(rpcError) && (
+        <div className="rpc-alert" role="alert">
+          <strong>Live RPC unreachable</strong>
+          {mode === 'auto' ? ' → showing demo data.' : '. No live data loaded.'} <span className="mono small">{rpcError.slice(0, 120)}</span>{' '}
           <button className="ghost" onClick={reload}>
-            reload
+            retry
           </button>
-        )}
-      </span>
-    </div>
+        </div>
+      )}
+      <div className={`modebar ${isDemo ? 'modebar-demo' : ''}`}>
+        <span>
+          {isDemo ? (
+            <>
+              <strong>DEMO</strong> · {demoReason}. Program and claims are mock data. Signatures and attestation are the <strong>real</strong>{' '}
+              recorded TEE outputs from <code>fixtures/demo.*.json</code>.
+            </>
+          ) : loading ? (
+            <>
+              Connecting to <code>{CONTRACT_ID}</code>…
+            </>
+          ) : (
+            <>
+              Live · <code>{CONTRACT_ID}</code> on testnet ·{' '}
+              <a href={explorerAccount(CONTRACT_ID)} target="_blank" rel="noreferrer noopener">
+                nearblocks ↗
+              </a>
+            </>
+          )}
+        </span>
+        <span className="row gap">
+          <select value={mode} onChange={(e) => setMode(e.target.value as Mode)} aria-label="Data source">
+            <option value="auto">auto</option>
+            <option value="live">live</option>
+            <option value="demo">demo</option>
+          </select>
+          {!isDemo && (
+            <button className="ghost" onClick={reload}>
+              reload
+            </button>
+          )}
+        </span>
+      </div>
+    </>
   );
 }
 

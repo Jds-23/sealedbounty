@@ -2,6 +2,12 @@
 
 A read-only UI for the SealedBounty escrow contract. Vite + React + TypeScript. It has no backend and no wallet: all writes go through the CLI. The browser only does NEAR RPC `call_function` views, re-verifies signatures, and decrypts owner reports locally.
 
+Live mode against `escrow.baldingsucks7993.testnet` (program 0, claim 0 Paid and verified in the browser):
+
+![live](./screenshot-live.png)
+
+Demo mode:
+
 ![screenshot](./screenshot.png)
 
 ## Run
@@ -9,7 +15,7 @@ A read-only UI for the SealedBounty escrow contract. Vite + React + TypeScript. 
 ```bash
 pnpm install
 pnpm dev            # http://localhost:5173
-pnpm test           # vitest: signature verify + decrypt helpers
+pnpm test           # vitest: signature verify, decrypt helpers, recorded live view shapes
 pnpm build          # tsc + vite build -> dist/ (static, base './', hash routing)
 pnpm sync-fixtures  # re-copy ../fixtures into src/fixtures (run after fixtures change)
 ```
@@ -19,9 +25,11 @@ Config (`.env.local`, optional):
 | var | default |
 |---|---|
 | `VITE_ESCROW_CONTRACT_ID` | `escrow.baldingsucks7993.testnet` |
-| `VITE_NEAR_RPC` | `https://rpc.testnet.near.org` |
+| `VITE_NEAR_RPC` | `https://test.rpc.fastnear.com` (falls back to `rpc.testnet.near.org`, which now answers 429) |
 
-The web app never reads `NEARAI_API_KEY`, and it never calls NEAR AI.
+The web app never reads `NEARAI_API_KEY`, and it never calls NEAR AI. Network calls: NEAR RPC views, plus one best-effort read of the public nearblocks API (`api-testnet.nearblocks.io/v3`) to find the `finalize` tx that paid each claim. If that API fails, the claim links to the contract page instead.
+
+Auto mode uses live data when the contract has at least one program. If RPC fails, a red banner says "Live RPC unreachable → showing demo data". The UI does not switch to demo silently.
 
 ## Pages
 
@@ -54,6 +62,23 @@ The demo owner key in `src/fixtures/demo.json` is derived from a public seed, so
 - `src/lib/verify.ts`: Signer parsing, signature verification, the quote `report_data` binding check. It wraps `@sealedbounty/shared` (`../shared/judge.mjs`: `verifySig`, `sha256hex`, `parseVerdict`, `signerId`).
 - `src/lib/crypto.ts`: owner decryption (shared `decryptAsOwner`) and owner-file parsing.
 - `src/lib/checks.ts`: builds the per-claim checklist.
-- `src/lib/near.ts`: JSON-RPC views (`list_programs`, `list_claims`, `get_signers`).
+- `src/lib/near.ts`: JSON-RPC views (`list_programs {from_index,limit}`, `get_program {id}`, `list_claims {program_id,from_index,limit}`, `get_claim {id}`, `get_signers`, `get_owner`), RPC fallback, runtime parsing of the contract JSON (`parseProgram`/`parseClaim`), and the nearblocks payout-tx lookup.
+- `src/fixtures/live-views.json`: a recorded copy of the real view outputs (public onchain data). `src/lib/live.test.ts` parses it and runs the Verified checks on claim 0. It also decrypts claim 0 with `~/.sealedbounty/owner-0.json` (or `$SB_OWNER_FILE`) if that file exists, and skips that test otherwise. The key is read at test time and never copied into the repo.
 - `src/lib/demo.ts`: the demo dataset.
 - `scripts/sync-fixtures.mjs`: trims `../fixtures/attestation.*.json` (300 KB each) down to a summary plus the model quote, and builds the demo ciphertexts.
+
+## Deploy
+
+The build is a static site: `pnpm build` writes `dist/` with relative asset paths (`base: './'`) and hash routing, so it runs on any static host from any subpath, with no rewrites and no server.
+
+```bash
+pnpm install && pnpm build          # -> dist/
+pnpm preview                        # check the build locally
+
+# pick one:
+npx vercel deploy dist --prod                       # Vercel
+npx netlify deploy --dir=dist --prod                # Netlify
+npx gh-pages -d dist                                # GitHub Pages (gh-pages branch)
+```
+
+Set `VITE_ESCROW_CONTRACT_ID` / `VITE_NEAR_RPC` at build time if you are not using the defaults. They are baked into the bundle. There are no runtime secrets.

@@ -154,8 +154,16 @@ details summary { cursor: pointer; }
 .diagram .edge-t { fill: var(--muted); font: 11px var(--mono); }
 .diagram .arrowhead { fill: var(--accent); }
 
+.rpc-alert { padding: 10px 24px; background: var(--bad, #b42318); color: #fff; font-size: 0.95rem; overflow-wrap: anywhere; }
+.rpc-alert .mono { opacity: 0.85; }
+.rpc-alert button { color: #fff; border-color: rgba(255,255,255,0.6); margin-left: 4px; }
+
 @media (max-width: 600px) {
+  .rpc-alert { padding-left: 16px; padding-right: 16px; }
   .top, .modebar { padding-left: 16px; padding-right: 16px; }
   main { padding: 16px; }
   .grid { grid-template-columns: 1fr; }
+  .top { gap: 0.5rem 1rem; }
+  .top nav { order: 3; flex-basis: 100%; gap: 1.25rem; }
+  .top .brand { flex: 1; }
 }

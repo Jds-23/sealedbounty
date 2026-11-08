@@ -19,3 +19,11 @@ export function countdown(msLeft: number): string {
   const m = Math.floor((s % 3600) / 60);
   return `${h}h ${String(m).padStart(2, '0')}m ${String(s % 60).padStart(2, '0')}s left to dispute`;
 }
+
+/** Human duration for contract `*_secs` fields (live program uses 90 s; demo uses 24 h). */
+export function fmtSecs(secs: number): string {
+  if (secs < 120) return `${secs}s`;
+  if (secs < 7200) return `${Math.round(secs / 60)}m`;
+  if (secs < 172800) return `${+(secs / 3600).toFixed(1)}h`;
+  return `${+(secs / 86400).toFixed(1)}d`;
+}
