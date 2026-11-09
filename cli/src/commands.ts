@@ -1,32 +1,53 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+  DEFAULT_BOND_NEAR,
+  DEFAULT_CHALLENGE_SECS,
   GAS,
   addSignerArgs,
+  attestRotationHint,
+  claimStatusLabel,
   createProgramArgs,
   DISPUTE_INVALID_PANIC,
   codeHashRow,
   disputeArgs,
   disputeOutcome,
-  estimateClaimStorageDeposit,
   finalizeArgs,
+  finalizeOutcome,
+  flagUndecryptableArgs,
+  parseSigners,
   payabilityChecks,
+  proveCiphertextArgs,
+  revokeSignerArgs,
+  setProgramSignersArgs,
   splitRequest,
   submitClaimArgs,
+  submitDeposit,
   submitPrecheck,
 } from './args.js';
 import { buildBundleFromFiles, readBundle } from './bundle.js';
 import { REPO_ROOT, config, nearaiApiKey } from './config.js';
-import { finalizeOwnerKey, loadOwnerKey, ownerKeyPath, savePendingOwnerKey, tryLoadOwnerKey } from './crypto.js';
-import { shared as api, demo, verifySignerSig, type ProgramBinding } from './shared.js';
-import { callContract, getSigners, listClaims, listPrograms, loadAccount, mustGetClaim, mustGetProgram } from './near.js';
+import {
+  finalizeHunterSecret,
+  finalizeOwnerKey,
+  loadHunterSecret,
+  loadOwnerKey,
+  openWithEphemeral,
+  ownerKeyPath,
+  savePendingHunterSecret,
+  savePendingOwnerKey,
+  tryLoadOwnerKey,
+} from './crypto.js';
+import { shared as api, demo, verifySignerSig, type ProgramBinding, type RequestCheck } from './shared.js';
+import { callContract, getSigners, isSignerRevoked, listClaims, listPrograms, loadAccount, mustGetClaim, mustGetProgram } from './near.js';
 import type { CheckRow, Claim, JudgeRecord, Program } from './types.js';
-import { formatNear, nsToIso, printChecks, printKv, printTable, short } from './util.js';
+import { formatNear, nearToYocto, nsToIso, printChecks, printKv, printTable, short } from './util.js';
 
 const int = (name: string, v: string) => {
   if (!/^\d+$/.test(String(v))) throw new Error(`${name} must be a non-negative integer, got ${v}`);
   return Number(v);
 };
+const nowNs = () => BigInt(Date.now()) * 1_000_000n;
 
 /** Print args JSON with long strings elided (unless full). */
 function showArgs(method: string, args: Record<string, unknown>, full = false) {
@@ -39,6 +60,10 @@ function showArgs(method: string, args: Record<string, unknown>, full = false) {
 }
 
 // =============================================================== attest
+export function cmdAttestRegisterHint() {
+  console.log(`\n${attestRotationHint()}`);
+}
+
 export async function cmdAttest(o: { algo: string; model?: string; outDir?: string; register?: boolean; account?: string }) {
   const { runAttestation, dcapStatus } = await import('./attest.js');
   const cfg = config();
@@ -84,6 +109,7 @@ export async function cmdAttest(o: { algo: string; model?: string; outDir?: stri
       const r = await callContract(account, 'add_signer', args, { gas: GAS.addSigner });
       if (!r.ok) process.exitCode = 1;
     }
+    cmdAttestRegisterHint();
   }
   if (!allOk) process.exitCode = 1;
 }
@@ -100,6 +126,9 @@ export async function cmdCreateProgram(o: {
   fund: string;
   disputeSecs: string;
   minConfidence: string;
+  bond?: string;
+  challengeSecs?: string;
+  signers?: string[];
   model?: string;
   code?: string;
   codeFiles?: string[];
@@ -119,6 +148,7 @@ export async function cmdCreateProgram(o: {
     console.log(`code bundle: ${b.paths.length} file(s) [${b.paths.join(', ')}] -> wrote ${b.outPath} (${Buffer.byteLength(bundle)} B)`);
     console.log('publish bundle.txt with the program: hunters must judge against it byte for byte.');
   }
+  const signers = o.signers ? parseSigners(o.signers) : [];
   const kp = api.generateOwnerKeypair();
   const { args, deposit } = createProgramArgs({
     name: o.name,
@@ -127,17 +157,27 @@ export async function cmdCreateProgram(o: {
     modelId: o.model ?? cfg.nearaiModel,
     systemPromptHash: api.systemPromptHash(),
     codeHash: api.codeHash(bundle),
+    paramsHash: api.paramsHash(),
     payoutsNear: { low: o.payoutLow, medium: o.payoutMedium, high: o.payoutHigh, critical: o.payoutCritical },
     ownerEncPubkey: kp.publicKey,
     disputeSecs: int('dispute-secs', o.disputeSecs),
     minConfidence: int('min-confidence', o.minConfidence),
     fundNear: o.fund,
+    bondNear: o.bond ?? DEFAULT_BOND_NEAR,
+    challengeSecs: int('challenge-secs', o.challengeSecs ?? String(DEFAULT_CHALLENGE_SECS)),
+    signers,
   });
   showArgs('create_program', args, true);
   console.log(`deposit: ${formatNear(deposit)} (fund ${o.fund} NEAR + storage allowance; the unused allowance stays in the pool)`);
+  console.log(`hunter bond: ${formatNear(args.bond)} per claim (returned on Paid, forfeited to the pool on Rejected)`);
+  console.log(
+    args.signers
+      ? `signers: ${args.signers.length} explicit (each must be allowlisted for ${args.model_id})`
+      : `signers: none given -> the contract snapshots every allowlisted signer for ${args.model_id}`,
+  );
   if (o.dryRun) {
     console.log('\n--dry-run: not sent; owner key NOT saved.');
-    return;
+    return { args, deposit };
   }
   const account = loadAccount(o.account);
   const pending = savePendingOwnerKey(kp, cfg.contractId, cfg.network);
@@ -151,6 +191,7 @@ export async function cmdCreateProgram(o: {
   const path = finalizeOwnerKey(pending, id);
   console.log(`\nprogram_id: ${id}`);
   console.log(`owner secret key saved to ${path} (chmod 600). Back it up: without it you cannot read reports.`);
+  return { args, deposit, id };
 }
 
 // =============================================================== views
@@ -159,7 +200,7 @@ export async function cmdPrograms(o: { from?: string; limit?: string }) {
   console.log(`contract: ${config().contractId}\n`);
   if (!ps.length) return console.log('no programs');
   printTable(
-    ['id', 'name', 'owner', 'open', 'balance', 'reserved', 'min_conf', 'dispute_s', 'payouts L/M/H/C (NEAR)'],
+    ['id', 'name', 'owner', 'open', 'balance', 'reserved', 'bond', 'min_conf', 'dispute_s', 'challenge_s', 'signers', 'payouts L/M/H/C (NEAR)'],
     ps.map((p) => [
       String(p.id),
       p.name,
@@ -167,14 +208,18 @@ export async function cmdPrograms(o: { from?: string; limit?: string }) {
       p.open ? 'yes' : 'no',
       formatNear(p.balance),
       formatNear(p.reserved),
+      p.bond != null ? formatNear(p.bond) : '-',
       String(p.min_confidence),
       String(p.dispute_secs),
+      p.challenge_secs != null ? String(p.challenge_secs) : '-',
+      p.signers ? String(p.signers.length) : '-',
       [p.payouts.low, p.payouts.medium, p.payouts.high, p.payouts.critical].map((x) => formatNear(x).replace(' NEAR', '')).join('/'),
     ]),
   );
 }
 
 export function printProgram(p: Program) {
+  const missing = '(missing: pre-v3 contract?)';
   printKv([
     ['id', p.id],
     ['name', p.name],
@@ -183,12 +228,16 @@ export function printProgram(p: Program) {
     ['model_id', p.model_id],
     ['system_prompt_hash', p.system_prompt_hash],
     ['code_hash', p.code_hash ?? '(missing: v1 contract?)'],
+    ['params_hash', p.params_hash ?? missing],
+    ['signers', p.signers ? (p.signers.length ? p.signers.join(', ') : '(none)') : missing],
     ['owner_enc_pubkey', p.owner_enc_pubkey],
     ['payouts', `low ${formatNear(p.payouts.low)} | medium ${formatNear(p.payouts.medium)} | high ${formatNear(p.payouts.high)} | critical ${formatNear(p.payouts.critical)}`],
+    ['bond', p.bond != null ? formatNear(p.bond) : missing],
     ['balance', formatNear(p.balance)],
     ['reserved', formatNear(p.reserved)],
     ['min_confidence', p.min_confidence],
     ['dispute_secs', p.dispute_secs],
+    ['challenge_secs', p.challenge_secs ?? missing],
     ['open', p.open],
     ['created_at', nsToIso(p.created_at)],
   ]);
@@ -199,24 +248,30 @@ export async function cmdProgram(id: string) {
   printProgram(p);
   const local = api.systemPromptHash();
   console.log(`\n  prompt hash ${p.system_prompt_hash === local ? 'matches' : 'DIFFERS FROM'} the local shared/system-prompt.txt (${short(local)})`);
-  if (!p.code_hash) console.log('  no code_hash: this looks like a v1 contract (set --contract / $ESCROW_CONTRACT_ID to the v2 escrow)');
+  if (p.params_hash) {
+    const lp = api.paramsHash();
+    console.log(`  params hash ${p.params_hash === lp ? 'matches' : 'DIFFERS FROM'} the local canonical judge params (${short(lp)})`);
+  }
+  if (!p.code_hash) console.log('  no code_hash: this looks like a v1 contract (set --contract / $ESCROW_CONTRACT_ID to the v3 escrow)');
+  else if (!p.params_hash) console.log('  no params_hash: this looks like a v2 contract (set --contract / $ESCROW_CONTRACT_ID to the v3 escrow)');
   console.log(`  owner key on this machine: ${tryLoadOwnerKey(p.id) ? 'yes' : 'no'}`);
 }
 
 export async function cmdClaims(programId: string, o: { from?: string; limit?: string }) {
   const cs = await listClaims(int('programId', programId), Number(o.from ?? 0), Number(o.limit ?? 50));
   if (!cs.length) return console.log('no claims');
-  const now = Date.now() * 1e6;
+  const now = nowNs();
   printTable(
-    ['id', 'hunter', 'status', 'severity', 'conf', 'cwe', 'payout', 'finalize_after', 'signer'],
+    ['id', 'hunter', 'status', 'severity', 'conf', 'cwe', 'payout', 'bond', 'finalize_after', 'signer'],
     cs.map((c) => [
       String(c.id),
       c.hunter,
-      c.status === 'Pending' && Number(c.finalize_after) <= now ? 'Pending (finalizable)' : c.status + (c.reject_reason ? ` (${c.reject_reason})` : ''),
+      claimStatusLabel(c, now),
       c.verdict.severity,
       String(c.verdict.confidence),
       c.verdict.cwe ?? '-',
       formatNear(c.payout),
+      c.bond != null ? formatNear(c.bond) : '-',
       nsToIso(c.finalize_after),
       short(c.signer, 14),
     ]),
@@ -229,8 +284,8 @@ export const DEMO_BUNDLE_PATH = join(REPO_ROOT, 'fixtures', 'vuln-app', 'bundle.
 
 /**
  * What an offline dry-run checks against when the program cannot be fetched: the demo program
- * (shared/demo-data.mjs target, local system prompt, $NEARAI_MODEL) with code_hash from --code or
- * fixtures/vuln-app/bundle.txt.
+ * (shared/demo-data.mjs target, local system prompt, canonical params, $NEARAI_MODEL) with code_hash
+ * from --code or fixtures/vuln-app/bundle.txt.
  */
 export function offlineProgramBinding(model: string, codeBundle?: string): ProgramBinding {
   return {
@@ -239,6 +294,7 @@ export function offlineProgramBinding(model: string, codeBundle?: string): Progr
     model_id: model,
     system_prompt_hash: api.systemPromptHash(),
     code_hash: api.codeHash(codeBundle ?? readBundle(DEMO_BUNDLE_PATH)),
+    params_hash: api.paramsHash(),
   };
 }
 
@@ -313,9 +369,9 @@ export async function cmdSubmit(o: {
   if (!v.verdict) throw new Error('verdict did not parse');
   console.log(`\nverdict: ${JSON.stringify(v.verdict)}`);
 
-  // 4. request vs program (exactly what the owner's dispute checks)
+  // 4. request vs program (exactly what the owner's dispute checks, incl. v3 params_hash)
   const pre = submitPrecheck(record.request_body, binding, hunter, !!o.fixture);
-  printChecks(`Request vs program (v2 dispute rules, hunter ${hunter})`, [
+  printChecks(`Request vs program (v3 dispute rules, hunter ${hunter})`, [
     ['checkRequestAgainstProgram', pre.check.ok, pre.check.ok ? 'ok: a dispute would fail' : pre.check.reason],
   ]);
   if (pre.warn) console.warn(`WARNING: ${pre.warn}`);
@@ -327,7 +383,17 @@ export async function cmdSubmit(o: {
     const signer = api.signerId(record);
     const allow = new Map(await getSigners());
     const meta = allow.get(signer);
-    payOk = printChecks('Signer allowlist', [['signer allowlisted with matching kind', meta?.kind === record.signature_kind, meta ? meta.kind : `${signer} not in get_signers`]]) && payOk;
+    const signerRows: CheckRow[] = [['signer allowlisted with matching kind', meta?.kind === record.signature_kind, meta ? meta.kind : `${signer} not in get_signers`]];
+    if (program.signers) {
+      signerRows.push(['signer in program.signers', program.signers.includes(signer), program.signers.includes(signer) ? short(signer) : `${short(signer)} not in the program's ${program.signers.length} signer(s)`]);
+    }
+    try {
+      const revoked = await isSignerRevoked(signer);
+      signerRows.push(['signer not revoked', !revoked, revoked ? 'revoked: finalize would reject "signer revoked"' : 'ok']);
+    } catch {
+      /* pre-v3 contract: no is_signer_revoked view */
+    }
+    payOk = printChecks('Signer', signerRows) && payOk;
   } else {
     console.log('\n(offline dry-run: payability and allowlist not checked)');
     printChecks('Offline hints', [
@@ -335,7 +401,7 @@ export async function cmdSubmit(o: {
     ]);
   }
 
-  // 5. encrypt the exact request body to the owner
+  // 5. encrypt the exact request body to the owner; keep the ephemeral secret for prove_ciphertext
   let ownerPub: string;
   let ownerPubSrc: string;
   if (program) {
@@ -352,31 +418,57 @@ export async function cmdSubmit(o: {
     ownerPub = api.generateOwnerKeypair().publicKey;
     ownerPubSrc = 'THROWAWAY key (offline dry-run; ciphertext size is exact, content unreadable)';
   }
-  const ciphertext = api.encryptForOwner(record.request_body, ownerPub);
+  const { ciphertext, ephemeralSecretHex } = api.encryptForOwnerWithSecret(record.request_body, ownerPub);
   const args = submitClaimArgs(programId, record, ciphertext);
-  const { bytes, deposit } = estimateClaimStorageDeposit(ciphertext);
+  const bond = program ? program.bond : nearToYocto(DEFAULT_BOND_NEAR).toString();
+  const dep = submitDeposit(ciphertext, bond);
   console.log(`\nencrypted request body (${Buffer.byteLength(record.request_body)} B) to ${ownerPubSrc}`);
   showArgs('submit_claim', args, o.full);
-  console.log(`storage deposit: ${formatNear(deposit)} (~${bytes} B x 1e19 yocto + 0.01 NEAR margin; unused part refunded)`);
+  console.log(`storage deposit: ${formatNear(dep.storage)} (~${dep.bytes} B x 1e19 yocto + 0.01 NEAR margin; unused part refunded)`);
+  console.log(`bond: ${formatNear(dep.bond)} (${program ? 'program.bond' : `offline: assumed default ${DEFAULT_BOND_NEAR} NEAR`}; returned on Paid, forfeited on Rejected)`);
+  console.log(`attached: ${formatNear(dep.deposit)} = storage + bond`);
   console.log(`gas: ${GAS.submitClaim / 10n ** 12n} Tgas`);
 
   if (o.dryRun) {
-    console.log(`\n--dry-run: not sent (would be signed by ${hunter}).`);
-    return { args, check: pre.check, hunter };
+    console.log(`\n--dry-run: not sent (would be signed by ${hunter}); ephemeral secret NOT saved.`);
+    return { args, check: pre.check, hunter, deposit: dep.deposit };
   }
   if ((!verOk || !payOk) && !o.force) throw new Error('pre-checks failed; not sending (use --force to send anyway)');
-  const r = await callContract(account!, 'submit_claim', args, { gas: GAS.submitClaim, deposit });
+  // Save the ephemeral secret BEFORE sending: without it the hunter cannot answer flag_undecryptable.
+  const pending = savePendingHunterSecret({ ephemeralSecretHex, req_hash: record.req_hash, contract: cfg.contractId, program_id: programId });
+  console.log(`ephemeral secret saved to ${pending} (chmod 600) before sending`);
+  const r = await callContract(account!, 'submit_claim', args, { gas: GAS.submitClaim, deposit: dep.deposit });
   if (!r.ok) {
+    console.log(`ephemeral secret left at ${pending} (unused)`);
     process.exitCode = 1;
     return;
   }
-  console.log(`\nclaim_id: ${r.value}`);
+  const claimId = Number(r.value);
+  const path = finalizeHunterSecret(pending, claimId);
+  console.log(`\nclaim_id: ${claimId}`);
+  console.log(`ephemeral secret saved to ${path} (chmod 600). Keep it until the claim is Paid: prove-ciphertext needs it.`);
+  return { args, check: pre.check, hunter, deposit: dep.deposit, claimId };
 }
 
 // =============================================================== inbox / dispute / finalize
 function decryptClaim(c: Claim, secret: string) {
   const body = api.decryptAsOwner(c.ciphertext, secret);
   return { body, hashOk: api.sha256hex(body) === c.req_hash };
+}
+
+export type InboxDecrypt = { ok: true; body: string; check: RequestCheck; error?: undefined; hint?: undefined } | { ok: false; error: string; hint: string };
+
+/** Owner-side decrypt of one claim. A ciphertext that fails to open, or opens to a body whose hash != req_hash, is UNDECRYPTABLE (v3 #2). */
+export function inboxDecrypt(c: Claim, program: ProgramBinding, ownerSecret: string): InboxDecrypt {
+  const hint = `UNDECRYPTABLE → run \`sb flag-undecryptable --claim ${c.id}\``;
+  let d: { body: string; hashOk: boolean };
+  try {
+    d = decryptClaim(c, ownerSecret);
+  } catch (e) {
+    return { ok: false, error: `decrypt failed: ${(e as Error).message}`, hint };
+  }
+  if (!d.hashOk) return { ok: false, error: 'decrypts, but sha256(body) != req_hash', hint };
+  return { ok: true, body: d.body, check: api.checkRequestAgainstProgram(d.body, program, c.hunter) };
 }
 
 export async function cmdInbox(o: { program: string; status?: string }) {
@@ -387,21 +479,24 @@ export async function cmdInbox(o: { program: string; status?: string }) {
   let claims = await listClaims(programId, 0, 1000);
   if (o.status) claims = claims.filter((c) => c.status.toLowerCase() === o.status!.toLowerCase());
   if (!claims.length) return console.log('inbox empty');
+  const now = nowNs();
   for (const c of claims) {
-    console.log(`\n${'='.repeat(78)}\nclaim ${c.id}  ${c.status}${c.reject_reason ? ` (${c.reject_reason})` : ''}  hunter ${c.hunter}`);
-    console.log(`verdict ${c.verdict.severity} conf=${c.verdict.confidence} cwe=${c.verdict.cwe ?? '-'}  payout ${formatNear(c.payout)}  finalize_after ${nsToIso(c.finalize_after)}`);
-    let body: string;
-    try {
-      const d = decryptClaim(c, key.secretKey);
-      body = d.body;
-      console.log(`sha256(request_body) == req_hash: ${d.hashOk ? 'PASS' : 'FAIL'}`);
-    } catch (e) {
-      console.log(`decrypt FAILED: ${(e as Error).message}`);
+    console.log(`\n${'='.repeat(78)}\nclaim ${c.id}  ${claimStatusLabel(c, now)}  hunter ${c.hunter}`);
+    console.log(
+      `verdict ${c.verdict.severity} conf=${c.verdict.confidence} cwe=${c.verdict.cwe ?? '-'}  payout ${formatNear(c.payout)}  bond ${c.bond != null ? formatNear(c.bond) : '-'}  finalize_after ${nsToIso(c.finalize_after)}`,
+    );
+    const d = inboxDecrypt(c, program, key.secretKey);
+    if (!d.ok) {
+      console.log(d.error);
+      if (c.status === 'Pending') console.log(d.hint);
+      else if (c.status === 'Challenged') console.log('(already challenged: the hunter must prove_ciphertext before the deadline, else finalize rejects it)');
+      else console.log(`UNDECRYPTABLE (claim is ${c.status}; only Pending claims can be flagged)`);
       continue;
     }
-    const check = api.checkRequestAgainstProgram(body, program, c.hunter);
+    console.log('sha256(request_body) == req_hash: PASS');
+    const { body, check } = d;
     if (check.ok) {
-      console.log('request vs program: OK (prompt, model, code bundle, hunter, report all match; a dispute would fail)');
+      console.log('request vs program: OK (prompt, model, params, code bundle, hunter, report all match; a dispute would fail)');
     } else {
       console.log(`request vs program: MISMATCH -> ${check.reason}`);
       console.log(
@@ -429,9 +524,9 @@ export async function cmdDispute(o: { claim: string; account?: string; dryRun?: 
   const key = loadOwnerKey(c.program_id);
   const { body, hashOk } = decryptClaim(c, key.secretKey);
   const rows: CheckRow[] = [
-    ['claim is Pending', c.status === 'Pending', c.status],
+    ['claim is Pending', c.status === 'Pending', c.status === 'Challenged' ? 'Challenged: contract panics "claim not pending"' : c.status],
     ['dispute window open', Date.now() * 1e6 < Number(c.finalize_after), `until ${nsToIso(c.finalize_after)}`],
-    ['sha256(decrypted body) == req_hash', hashOk, short(c.req_hash)],
+    ['sha256(decrypted body) == req_hash', hashOk, hashOk ? short(c.req_hash) : `${short(c.req_hash)} (use flag-undecryptable instead)`],
   ];
   printChecks('Dispute preconditions', rows);
   const check = api.checkRequestAgainstProgram(body, program, c.hunter);
@@ -453,15 +548,186 @@ export async function cmdDispute(o: { claim: string; account?: string; dryRun?: 
   console.log(`\nclaim ${c.id}: ${after.status}${after.reject_reason ? ` (reason "${after.reject_reason}")` : ''}${check.ok ? '' : `; expected "${check.reason}"`}`);
 }
 
-export async function cmdFinalize(o: { claim: string; account?: string; dryRun?: boolean }) {
+export async function cmdFinalize(o: { claim: string; account?: string; dryRun?: boolean; force?: boolean }) {
   const c = await mustGetClaim(int('claim', o.claim));
-  const ready = c.status === 'Pending' && Date.now() * 1e6 >= Number(c.finalize_after);
-  console.log(`claim ${c.id}: ${c.status}, payout ${formatNear(c.payout)} to ${c.hunter}, finalize_after ${nsToIso(c.finalize_after)}${ready ? ' (ready)' : ' (NOT ready)'}`);
+  const now = nowNs();
+  let expect: string;
+  let ready: boolean;
+  if (c.status === 'Challenged') {
+    ready = !!c.challenge_deadline && now >= BigInt(c.challenge_deadline);
+    expect = ready
+      ? 'challenge deadline passed: finalize rejects the claim "undecryptable report" (bond to the pool)'
+      : `challenge open until ${c.challenge_deadline ? nsToIso(c.challenge_deadline) : '?'}: contract would panic "challenge open"`;
+  } else {
+    ready = c.status === 'Pending' && now >= BigInt(c.finalize_after);
+    expect = ready ? `pays ${formatNear(c.payout)} + bond ${formatNear(c.bond ?? '0')} to ${c.hunter}` : `NOT ready (${claimStatusLabel(c, now)})`;
+    if (ready) {
+      try {
+        if (await isSignerRevoked(c.signer)) expect = 'signer revoked: finalize rejects the claim "signer revoked"';
+      } catch {
+        /* pre-v3 contract */
+      }
+    }
+  }
+  console.log(`claim ${c.id}: ${claimStatusLabel(c, now)}, payout ${formatNear(c.payout)}, finalize_after ${nsToIso(c.finalize_after)}`);
+  console.log(`expected: ${expect}`);
   const args = finalizeArgs(c.id);
   showArgs('finalize', args);
   if (o.dryRun) return console.log('\n--dry-run: not sent.');
+  if (!ready && !o.force) throw new Error('claim is not finalizable yet; not sending (use --force)');
   const r = await callContract(loadAccount(o.account), 'finalize', args, { gas: GAS.finalize });
+  if (!r.ok) {
+    process.exitCode = 1;
+    return;
+  }
+  let after: Claim | null = null;
+  try {
+    after = await mustGetClaim(c.id);
+  } catch {
+    /* outcome from logs only */
+  }
+  const out = finalizeOutcome(r.logs, after);
+  console.log(`\noutcome: ${out.text}`);
+  if (out.status === 'PayoutFailed') process.exitCode = 1;
+}
+
+// =============================================================== v3 #2: decryption challenge
+export async function cmdFlagUndecryptable(o: { claim: string; account?: string; dryRun?: boolean; force?: boolean }) {
+  const cfg = config();
+  const c = await mustGetClaim(int('claim', o.claim));
+  const program = await mustGetProgram(c.program_id);
+  const caller = o.account ?? cfg.accountId;
+  const rows: CheckRow[] = [
+    ['claim is Pending', c.status === 'Pending', c.status],
+    ['dispute window open', nowNs() < BigInt(c.finalize_after), `until ${nsToIso(c.finalize_after)}`],
+  ];
+  if (caller) rows.push(['caller is the program owner', caller === program.owner, `${caller} (owner ${program.owner})`]);
+  const key = tryLoadOwnerKey(c.program_id);
+  if (key) {
+    const d = inboxDecrypt(c, program, key.secretKey);
+    rows.push(['[owner] ciphertext really is undecryptable', !d.ok, d.ok ? 'it decrypts and hashes to req_hash: use dispute instead' : d.error]);
+  } else {
+    console.log(`(no local owner key for program ${c.program_id}: cannot confirm the ciphertext is undecryptable)`);
+  }
+  const ok = printChecks('flag-undecryptable preconditions', rows);
+  console.log(
+    `\nexpected: claim -> Challenged; ${c.hunter} then has ${program.challenge_secs ?? '?'} s to prove_ciphertext, else finalize rejects it "undecryptable report"`,
+  );
+  const args = flagUndecryptableArgs(c.id);
+  showArgs('flag_undecryptable', args);
+  if (o.dryRun) return console.log('\n--dry-run: not sent.');
+  if (!ok && !o.force) throw new Error('preconditions failed; not sending (use --force)');
+  const r = await callContract(loadAccount(o.account), 'flag_undecryptable', args, { gas: GAS.flagUndecryptable });
+  if (!r.ok) {
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    const after = await mustGetClaim(c.id);
+    console.log(`\nclaim ${c.id}: ${claimStatusLabel(after)}`);
+  } catch {
+    /* view failed; tx already printed */
+  }
+}
+
+/** Local mirror of prove_ciphertext: open with the ephemeral secret, hash == req_hash, then the full dispute checks. */
+export function proveCheck(c: Claim, program: ProgramBinding & { owner_enc_pubkey: string }, ephemeralSecretHex: string) {
+  const rows: CheckRow[] = [];
+  let reason: string | null = null;
+  let body: string | undefined;
+  try {
+    body = openWithEphemeral(c.ciphertext, program.owner_enc_pubkey, ephemeralSecretHex);
+    rows.push(['box opens with the saved ephemeral secret', true, `${Buffer.byteLength(body)} B plaintext`]);
+  } catch (e) {
+    rows.push(['box opens with the saved ephemeral secret', false, (e as Error).message]);
+    reason = 'undecryptable report';
+  }
+  if (body !== undefined) {
+    const h = api.sha256hex(body);
+    rows.push(['sha256(plaintext) == req_hash', h === c.req_hash, short(h)]);
+    if (h !== c.req_hash) reason = 'undecryptable report';
+    else {
+      const check = api.checkRequestAgainstProgram(body, program, c.hunter);
+      rows.push(['request matches program (dispute rules)', check.ok, check.ok ? 'ok' : check.reason]);
+      if (!check.ok) reason = check.reason;
+    }
+  }
+  const outcome =
+    reason === null
+      ? `claim -> back to Pending with finalize_after = now (finalizable: sealedbounty finalize --claim ${c.id})`
+      : `claim -> Rejected, reason "${reason}"; bond forfeited to the pool`;
+  return { rows, reason, outcome };
+}
+
+export async function cmdProveCiphertext(o: { claim: string; account?: string; dryRun?: boolean; force?: boolean }) {
+  const cfg = config();
+  const c = await mustGetClaim(int('claim', o.claim));
+  const program = await mustGetProgram(c.program_id);
+  const secret = loadHunterSecret(c.id, undefined, cfg.contractId);
+  const now = nowNs();
+  const pre: CheckRow[] = [
+    ['claim is Challenged', c.status === 'Challenged', claimStatusLabel(c, now)],
+    ['challenge window open', !!c.challenge_deadline && now < BigInt(c.challenge_deadline), c.challenge_deadline ? `until ${nsToIso(c.challenge_deadline)}` : 'no deadline'],
+    ['saved secret is for this claim (req_hash)', secret.req_hash === c.req_hash, short(secret.req_hash)],
+  ];
+  const caller = o.account ?? cfg.accountId;
+  if (caller) pre.push(['caller is the claim hunter', caller === c.hunter, `${caller} (hunter ${c.hunter})`]);
+  const preOk = printChecks('prove-ciphertext preconditions', pre);
+  const pc = proveCheck(c, program, secret.ephemeralSecretHex);
+  printChecks('Local decryption check (mirrors prove_ciphertext)', pc.rows);
+  console.log(`\nexpected: ${pc.outcome}`);
+  const args = proveCiphertextArgs(c.id, secret.ephemeralSecretHex);
+  showArgs('prove_ciphertext', { ...args, ephemeral_secret: `${args.ephemeral_secret.slice(0, 8)}… (from ${secret.contract} claim ${secret.claim_id})` });
+  if (o.dryRun) return console.log('\n--dry-run: not sent.');
+  if (!preOk && !o.force) throw new Error('preconditions failed; not sending (use --force)');
+  if (pc.reason && !o.force) throw new Error(`the contract would reject the claim "${pc.reason}"; not sending (use --force)`);
+  const r = await callContract(loadAccount(o.account), 'prove_ciphertext', args, { gas: GAS.proveCiphertext });
+  if (!r.ok) {
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    const after = await mustGetClaim(c.id);
+    console.log(`\nclaim ${c.id}: ${claimStatusLabel(after)}${after.reject_reason ? ` (reason "${after.reject_reason}")` : ''}`);
+  } catch {
+    /* view failed */
+  }
+}
+
+// =============================================================== v3 #3 / #6: signers
+export async function cmdSetProgramSigners(o: { program: string; signers: string[]; account?: string; dryRun?: boolean; force?: boolean }) {
+  const programId = int('program', o.program);
+  const program = await mustGetProgram(programId);
+  const signers = parseSigners(o.signers);
+  const allow = new Map(await getSigners());
+  const rows: CheckRow[] = signers.map((s) => {
+    const m = allow.get(s);
+    return [`${short(s)} allowlisted for ${program.model_id}`, m?.model === program.model_id, m ? `model ${m.model ?? 'null'}` : 'not in get_signers'];
+  });
+  const ok = printChecks('Signers (contract: each must be allowlisted with model == program.model_id)', rows);
+  console.log(`\ncurrent: ${program.signers?.join(', ') || '(none)'}\nnew:     ${signers.join(', ')}`);
+  console.log('applies to future submit_claim calls only; existing claims keep their signer.');
+  const args = setProgramSignersArgs(programId, signers);
+  showArgs('set_program_signers', args);
+  if (o.dryRun) return console.log('\n--dry-run: not sent.');
+  if (!ok && !o.force) throw new Error('a signer is not allowlisted for this model: the contract would panic "signer not allowlisted" (use --force)');
+  // Payable for storage growth; the contract refunds the unused part.
+  const r = await callContract(loadAccount(o.account), 'set_program_signers', args, { gas: GAS.setProgramSigners, deposit: nearToYocto('0.01') });
   if (!r.ok) process.exitCode = 1;
+}
+
+export async function cmdRevokeSigner(signer: string, o: { account?: string; dryRun?: boolean }) {
+  const args = revokeSignerArgs(signer);
+  console.log(`revoke_signer ${args.signer}: removes it from the allowlist and marks it revoked.`);
+  console.log('Pending claims signed by it are Rejected at finalize ("signer revoked"); new submissions with it fail.');
+  showArgs('revoke_signer', args);
+  if (o.dryRun) return console.log('\n--dry-run: not sent.');
+  const r = await callContract(loadAccount(o.account), 'revoke_signer', args, { gas: GAS.revokeSigner });
+  if (!r.ok) {
+    process.exitCode = 1;
+    return;
+  }
+  console.log(r.value === false ? `\n${args.signer} was already revoked` : `\n${args.signer} revoked`);
 }
 
 // =============================================================== verify-claim
@@ -476,7 +742,7 @@ export async function verifyClaimChecks(c: Claim, program: Program, allowlist: M
     sigDetail = (e as Error).message;
   }
   const meta = allowlist.get(c.signer);
-  return [
+  const rows: CheckRow[] = [
     ['req_hash is 64 hex', hex64.test(c.req_hash), short(c.req_hash)],
     ['resp_hash is 64 hex', hex64.test(c.resp_hash), short(c.resp_hash)],
     ['kind is provider_tee', c.kind === 'provider_tee', c.kind],
@@ -484,23 +750,24 @@ export async function verifyClaimChecks(c: Claim, program: Program, allowlist: M
     [`signature over "${c.kind === 'provider_tee' ? 'model:req_hash:resp_hash' : 'req_hash:resp_hash'}"`, sigOk, sigDetail],
     ['signer currently allowlisted (same kind)', meta?.kind === c.kind, meta ? meta.kind : 'not in get_signers'],
   ];
+  if (program.signers) rows.push(['signer in program.signers (now)', program.signers.includes(c.signer), short(c.signer)]);
+  return rows;
 }
 
 export async function cmdVerifyClaim(o: { claim: string }) {
   const c = await mustGetClaim(int('claim', o.claim));
   const program = await mustGetProgram(c.program_id);
   const allow = new Map(await getSigners());
-  console.log(`claim ${c.id} (program ${c.program_id}, ${c.status}) verdict ${JSON.stringify(c.verdict)}`);
+  console.log(`claim ${c.id} (program ${c.program_id}, ${claimStatusLabel(c)}) verdict ${JSON.stringify(c.verdict)}`);
   const rows = await verifyClaimChecks(c, program, allow);
   const key = tryLoadOwnerKey(c.program_id);
   if (key) {
-    try {
-      const { body, hashOk } = decryptClaim(c, key.secretKey);
-      rows.push(['[owner] sha256(decrypted body) == req_hash', hashOk, '']);
-      const check = api.checkRequestAgainstProgram(body, program, c.hunter);
-      rows.push(['[owner] request matches program (v2 dispute rules)', check.ok, check.ok ? 'ok' : `${check.reason}: dispute it`]);
-    } catch (e) {
-      rows.push(['[owner] decrypt ciphertext', false, (e as Error).message]);
+    const d = inboxDecrypt(c, program, key.secretKey);
+    if (d.ok) {
+      rows.push(['[owner] sha256(decrypted body) == req_hash', true, '']);
+      rows.push(['[owner] request matches program (v3 dispute rules)', d.check.ok, d.check.ok ? 'ok' : `${d.check.reason}: dispute it`]);
+    } else {
+      rows.push(['[owner] decrypt ciphertext', false, `${d.error}; ${d.hint}`]);
     }
   }
   const ok = printChecks(`verify-claim ${c.id} (offline signature check from on-chain fields)`, rows);

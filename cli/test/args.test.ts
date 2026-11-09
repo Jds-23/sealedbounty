@@ -80,6 +80,7 @@ describe('create_program args', () => {
     modelId: 'Qwen/Qwen3.8-27B',
     systemPromptHash: shared.systemPromptHash(),
     codeHash: DEMO_CODE_HASH,
+    paramsHash: shared.paramsHash(),
     payoutsNear: { low: '0.1', medium: '0.5', high: '1', critical: '2.5' },
     ownerEncPubkey: shared.generateOwnerKeypair().publicKey,
     disputeSecs: 300,
@@ -89,7 +90,8 @@ describe('create_program args', () => {
   it('maps to contract field names with yocto U128 strings', () => {
     const { args, deposit } = createProgramArgs(base);
     expect(Object.keys(args)).toEqual([
-      'name', 'repo_url', 'commit', 'model_id', 'system_prompt_hash', 'code_hash', 'payouts', 'owner_enc_pubkey', 'dispute_secs', 'min_confidence',
+      'name', 'repo_url', 'commit', 'model_id', 'system_prompt_hash', 'code_hash', 'params_hash', 'payouts', 'owner_enc_pubkey',
+      'dispute_secs', 'min_confidence', 'bond', 'challenge_secs', 'signers',
     ]);
     expect(args.code_hash).toBe(DEMO_CODE_HASH);
     expect(args.payouts).toEqual({
