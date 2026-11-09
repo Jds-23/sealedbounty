@@ -1311,6 +1311,7 @@ fn list_claims_does_not_scan_other_programs() {
     let (small, empty) = measure(2, 0, None, None);
     let (big, empty2) = measure(30, 0, None, None);
     assert!(empty.is_empty() && empty2.is_empty());
+    println!("list_claims(0) gas: 2 other claims {small}, 30 other claims {big}");
     assert_eq!(
         small, big,
         "list_claims(0) gas must not grow with program 1's claims: 2 claims -> {small}, 30 -> {big}"
@@ -1322,6 +1323,7 @@ fn list_claims_late_page_costs_like_first_page() {
     let (first, a) = measure(30, 1, None, Some(1));
     let (late, b) = measure(30, 1, Some(29), Some(1));
     assert_eq!((a.len(), b.len()), (1, 1));
+    println!("list_claims(1, _, 1) gas: from 0 {first}, from 29 {late}");
     assert_eq!((a[0].id, b[0].id), (0, 29));
     assert_eq!(
         first, late,

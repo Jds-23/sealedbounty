@@ -6,7 +6,7 @@ pub mod tee;
 use near_sdk::json_types::{Base64VecU8, U64, U128};
 use near_sdk::serde::Deserialize;
 use near_sdk::serde_json::{self, json};
-use near_sdk::store::{IterableMap, LookupSet};
+use near_sdk::store::{IterableMap, LookupMap, LookupSet, Vector};
 use near_sdk::{
     AccountId, BorshStorageKey, NearToken, PanicOnDefault, Promise, env, near, require,
 };
@@ -110,6 +110,8 @@ enum StorageKey {
     Programs,
     Claims,
     UsedReqHashes,
+    ClaimsByProgram,
+    ProgramClaims { program_id: u64 },
 }
 
 #[near(contract_state)]
@@ -119,6 +121,8 @@ pub struct Contract {
     signers: IterableMap<Signer, SignerMeta>,
     programs: IterableMap<u64, Program>,
     claims: IterableMap<u64, Claim>,
+    /// Per-program claim ids in submission order, so `list_claims` never scans other programs (#7).
+    claims_by_program: LookupMap<u64, Vector<u64>>,
     /// Keys are `dedupe_key(program_id, req_hash)` = `"<program_id>:<req_hash>"`.
     used_req_hashes: LookupSet<String>,
     next_program_id: u64,
@@ -249,6 +253,7 @@ impl Contract {
             signers: IterableMap::new(StorageKey::Signers),
             programs: IterableMap::new(StorageKey::Programs),
             claims: IterableMap::new(StorageKey::Claims),
+            claims_by_program: LookupMap::new(StorageKey::ClaimsByProgram),
             used_req_hashes: LookupSet::new(StorageKey::UsedReqHashes),
             next_program_id: 0,
             next_claim_id: 0,
@@ -497,6 +502,13 @@ impl Contract {
                 bond: U128(bond),
             },
         );
+        let ids = self
+            .claims_by_program
+            .entry(program_id)
+            .or_insert_with(|| Vector::new(StorageKey::ProgramClaims { program_id }));
+        ids.push(id);
+        ids.flush();
+        self.claims_by_program.flush();
         self.programs.flush();
         self.claims.flush();
 
@@ -610,19 +622,23 @@ impl Contract {
         self.claims.get(&id).cloned()
     }
 
-    /// Claims of `program_id`, skipping the first `from_index` of them, up to `limit` (default 50).
+    /// Claims of `program_id` in submission order, skipping the first `from_index` of them, up to
+    /// `limit` (default 50). Paginates the per-program index: cost is O(page), not O(all claims).
     pub fn list_claims(
         &self,
         program_id: u64,
         from_index: Option<u64>,
         limit: Option<u64>,
     ) -> Vec<Claim> {
-        self.claims
-            .values()
-            .filter(|c| c.program_id == program_id)
-            .skip(from_index.unwrap_or(0) as usize)
-            .take(limit.unwrap_or(DEFAULT_LIMIT) as usize)
-            .cloned()
+        let Some(ids) = self.claims_by_program.get(&program_id) else {
+            return vec![];
+        };
+        let len = u64::from(ids.len());
+        let from = from_index.unwrap_or(0).min(len);
+        let end = from.saturating_add(limit.unwrap_or(DEFAULT_LIMIT)).min(len);
+        (from..end)
+            .filter_map(|i| ids.get(i as u32))
+            .filter_map(|id| self.claims.get(id).cloned())
             .collect()
     }
 
