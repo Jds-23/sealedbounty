@@ -1,5 +1,5 @@
 // Pure builders for contract call args (no network). Unit-tested in test/args.test.ts.
-import { shared, type ProgramBinding, type RequestCheck } from './shared.js';
+import { shared, type DisputeReason, type ProgramBinding, type RequestCheck } from './shared.js';
 import type { CheckRow, Claim, ClaimStatus, JudgeRecord, Payouts, Program, SigKind, Signer, Verdict } from './types.js';
 import { formatNear, nearToYocto, nsToIso } from './util.js';
 
@@ -256,13 +256,86 @@ export interface SubmitPrecheck {
   warn: string | null;
 }
 
+// ---------- dispute rules by program version (#14) ----------
+export type ProgramVersion = 1 | 2 | 3;
+/** v1: no code_hash. v2: code_hash, no params_hash. v3: both. (Older contracts' views omit the fields.) */
+export function programVersion(p: { code_hash?: unknown; params_hash?: unknown }): ProgramVersion {
+  if (p.code_hash == null) return 1;
+  return p.params_hash == null ? 2 : 3;
+}
+
+type Step = 'prompt' | 'model' | 'params' | 'code' | 'hunter' | 'report';
+const STEPS: { step: Step; name: string; reason: DisputeReason }[] = [
+  { step: 'prompt', name: 'system prompt', reason: 'system prompt tampered' },
+  { step: 'model', name: 'model', reason: 'model mismatch' },
+  { step: 'params', name: 'params', reason: 'params tampered' },
+  { step: 'code', name: 'code', reason: 'code mismatch' },
+  { step: 'hunter', name: 'hunter', reason: 'hunter mismatch' },
+  { step: 'report', name: 'report', reason: 'report missing' },
+];
+const STEPS_BY_VERSION: Record<ProgramVersion, Step[]> = {
+  1: ['prompt', 'model'],
+  2: ['prompt', 'model', 'code', 'hunter', 'report'],
+  3: ['prompt', 'model', 'params', 'code', 'hunter', 'report'],
+};
+
+/** e.g. "v1 dispute rules: prompt, model" */
+export function disputeRules(program: { code_hash?: unknown; params_hash?: unknown }): string {
+  const v = programVersion(program);
+  return `v${v} dispute rules: ${STEPS_BY_VERSION[v].join(', ')}`;
+}
+
+export interface VersionedCheck {
+  version: ProgramVersion;
+  /** e.g. "v1 dispute rules: prompt, model" */
+  rules: string;
+  check: RequestCheck;
+  /** One row per applicable step in contract order, up to and including the first failure. */
+  rows: CheckRow[];
+}
+
 /**
- * Hunter-side pre-check of the exact request body against the program (v2 dispute rules).
+ * v1 contract dispute: only the system prompt hash and the model are pinned (no code/hunter/params).
+ * Gated here rather than in shared/judge.mjs, whose checkRequestAgainstProgram assumes a code_hash.
+ */
+function checkV1(requestBody: string, program: Pick<ProgramBinding, 'system_prompt_hash' | 'model_id'>): RequestCheck {
+  const fail = (reason: DisputeReason): RequestCheck => ({ ok: false, reason });
+  let req: any;
+  try {
+    req = JSON.parse(requestBody);
+  } catch {
+    return fail('system prompt tampered');
+  }
+  const m0 = Array.isArray(req?.messages) ? req.messages[0] : undefined;
+  if (!m0 || m0.role !== 'system' || typeof m0.content !== 'string' || shared.sha256hex(m0.content) !== program.system_prompt_hash) {
+    return fail('system prompt tampered');
+  }
+  if (req.model !== program.model_id) return fail('model mismatch');
+  return { ok: true, reason: null };
+}
+
+/** The owner's dispute rules for this program's contract version (v1: prompt + model; v2: no params; v3: all six). */
+export function checkRequestForProgram(requestBody: string, program: ProgramBinding, hunter: string, rowPrefix = ''): VersionedCheck {
+  const version = programVersion(program);
+  const steps = STEPS.filter((s) => STEPS_BY_VERSION[version].includes(s.step));
+  const rules = disputeRules(program);
+  const check = version === 1 ? checkV1(requestBody, program) : shared.checkRequestAgainstProgram(requestBody, program, hunter);
+  const rows: CheckRow[] = [];
+  for (const s of steps) {
+    const failed = !check.ok && check.reason === s.reason;
+    rows.push([`${rowPrefix}${s.name}`, !failed, failed ? s.reason : 'ok']);
+    if (failed) break;
+  }
+  return { version, rules, check, rows };
+}
+
+/**
+ * Hunter-side pre-check of the exact request body against the program (dispute rules for its version).
  * A fresh judgement must pass outright. A pre-recorded fixture is bound to whoever recorded it, so
  * a "hunter mismatch" there is only a warning (the owner can dispute it; nothing else is wrong).
  */
 export function submitPrecheck(requestBody: string, program: ProgramBinding, hunter: string, fromFixture: boolean): SubmitPrecheck {
-  const check = shared.checkRequestAgainstProgram(requestBody, program, hunter);
+  const { check } = checkRequestForProgram(requestBody, program, hunter);
   if (check.ok) return { check, refuse: null, warn: null };
   if (check.reason === 'hunter mismatch' && fromFixture) {
     const bound = splitRequest(requestBody).hunter ?? '?';
