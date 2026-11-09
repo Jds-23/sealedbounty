@@ -50,7 +50,12 @@ async function viewAt<T>(url: string, method: string, args: Record<string, unkno
   });
   if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
   const j = await res.json();
-  if (j.error) throw new Error(j.error?.cause?.name || j.error?.data || j.error?.message || 'RPC error');
+  if (j.error) {
+    const data = typeof j.error?.data === 'string' ? j.error.data : '';
+    const vm = String(j.error?.cause?.info?.vm_error ?? '');
+    // Keep the panic text when there is one, so callers can show "bad signature" (see panicMessage).
+    throw new Error([vm, data].find((s) => /GuestPanic/.test(s)) || j.error?.cause?.name || data || j.error?.message || 'RPC error');
+  }
   if (j.result?.error) throw new Error(j.result.error);
   const bytes = new Uint8Array(j.result.result as number[]);
   return JSON.parse(new TextDecoder().decode(bytes)) as T;
@@ -209,6 +214,29 @@ export const getClaim = async (id: number, opts?: RpcOpts) => {
   return r == null ? null : parseClaim(r);
 };
 export const getOwner = () => view<string>('get_owner');
+
+/** verify_tee_response view args: the TEE fields of a submit_claim, plus the signed model. */
+export interface VerifyTeeArgs {
+  model: string;
+  req_hash: string;
+  /** base64 */
+  resp_body: string;
+  /** hex */
+  signature: string;
+  /** "ed25519:<hex>" */
+  signer: string;
+  kind: string;
+}
+
+/** The contract's panic text from an RPC error ("...GuestPanic { panic_msg: \"bad signature\" }" → "bad signature"), else null. */
+export function panicMessage(e: unknown): string | null {
+  const m = /GuestPanic\s*\{\s*panic_msg:\s*\\?"((?:[^"\\]|\\.)*?)\\?"\s*\}/.exec(String((e as Error)?.message ?? e));
+  return m ? m[1] : null;
+}
+
+/** Free RPC view: the contract re-runs its TEE signature check and returns the Verdict, or panics (thrown). */
+export const verifyTeeResponse = (args: VerifyTeeArgs, opts?: RpcOpts) =>
+  view<Claim['verdict']>('verify_tee_response', args as unknown as Record<string, unknown>, opts);
 /** v3 #6: is_signer_revoked for each signer. Returns null if the view is unavailable (pre-v3 contract, RPC down). */
 export async function getRevoked(signers: string[], opts?: RpcOpts & { strict?: boolean }): Promise<Set<string> | null> {
   try {

@@ -11,16 +11,19 @@ import {
   getRevoked,
   getSigners,
   listContractTxs,
+  panicMessage,
   parseClaim,
   parseProgram,
   RPC_URLS,
   rpcTx,
+  verifyTeeResponse,
   type DecodedTx,
   type NbTxRow,
   type RpcOpts,
+  type VerifyTeeArgs,
 } from '../lib/near';
 import { auditRequest, type RequestAudit } from '../lib/requestChecks';
-import type { Claim, Program, SignerEntry } from '../lib/types';
+import type { Claim, Program, SignerEntry, Verdict } from '../lib/types';
 import { normaliseSigners, sha256hex } from '../lib/verify';
 import { nsToMs } from '../lib/format';
 
@@ -296,4 +299,65 @@ export async function loadTxs(claims: Claim[]): Promise<LoadResult<DecodedTx[]>>
     .filter((t): t is DecodedTx => !!t && (t.claimIds.some((id) => ids.has(id)) || (t.method === 'submit_claim' && reqs.has(String(t.args?.req_hash ?? '').toLowerCase()))))
     .sort((a, b) => (BigInt(a.blockTimestamp ?? '0') < BigInt(b.blockTimestamp ?? '0') ? -1 : 1));
   return { data: txs, ...combine([rows, ...results]) };
+}
+
+// ---- step 5 'Ask the contract': a free RPC view of verify_tee_response ----
+
+/** verify_tee_response args from a claim's submit_claim tx (resp_body overridable: the flipped-byte variant). */
+export function askContractArgs(claim: Claim, submit: DecodedTx, respBodyB64?: string): VerifyTeeArgs {
+  const a = submit.args ?? {};
+  return {
+    model: claim.model,
+    req_hash: String(a.req_hash ?? claim.req_hash),
+    resp_body: respBodyB64 ?? String(a.resp_body ?? ''),
+    signature: String(a.signature ?? claim.signature),
+    signer: String(a.signer ?? claim.signer),
+    kind: String(a.kind ?? claim.kind),
+  };
+}
+
+type AskAnswer = { ok: true; verdict: Verdict } | { ok: false; error: string };
+export type AskResult = AskAnswer & {
+  /** 'snapshot': the RPC was unreachable and the answer is the recorded one (rpcError says why). */
+  source: Source;
+  rpcError: string | null;
+};
+
+const b64Bytes = (b: string): Uint8Array | null => {
+  try {
+    return Uint8Array.from(atob(b), (c) => c.charCodeAt(0));
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Snapshot answer: the contract accepted this exact (req_hash, resp_body, signature, signer) in a recorded
+ * submit_claim, so it returns that claim's stored verdict; any other body breaks the signature → "bad signature".
+ */
+function snapshotAnswer(args: VerifyTeeArgs): AskAnswer {
+  const body = b64Bytes(args.resp_body);
+  const h = body ? sha256hex(body) : null;
+  const c = snapshotData().claims.find(
+    (c) => c.req_hash === args.req_hash.toLowerCase() && c.resp_hash === h && c.signature === args.signature.toLowerCase() && c.signer === args.signer,
+  );
+  return c ? { ok: true, verdict: c.verdict } : { ok: false, error: 'bad signature' };
+}
+
+/** Asks the deployed contract (RPC call_function: no wallet, no gas). A panic is an answer; a transport failure → snapshot. */
+export async function askContract(args: VerifyTeeArgs, rpc: RpcOpts = TOUR_RPC): Promise<AskResult> {
+  const r = await withFallback<AskAnswer>(
+    async () => {
+      try {
+        return { ok: true, verdict: await verifyTeeResponse(args, rpc) };
+      } catch (e) {
+        const panic = panicMessage(e);
+        if (panic !== null) return { ok: false, error: panic };
+        throw e;
+      }
+    },
+    snapshotAnswer(args),
+    rpc.timeoutMs ?? TOUR_TIMEOUT_MS,
+  );
+  return { ...r.data, source: r.source, rpcError: r.error };
 }

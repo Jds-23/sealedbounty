@@ -7,6 +7,7 @@ export type ActionKey =
   | 'load-program'
   | 'encrypt'
   | 'verify-browser'
+  | 'ask-contract'
   | 'flip-on'
   | 'flip-off'
   | 'decrypt'
@@ -49,9 +50,11 @@ export const TIMELINE: TimelineStep[] = [
     step: 5,
     dwell: 18_000,
     actions: [
-      { at: 2_500, action: 'verify-browser' },
-      { at: 9_000, action: 'flip-on' },
-      { at: 14_500, action: 'flip-off' },
+      { at: 2_000, action: 'verify-browser' },
+      { at: 5_500, action: 'ask-contract' },
+      // flipping re-runs the browser check and re-asks the contract with the flipped body ("bad signature")
+      { at: 9_500, action: 'flip-on' },
+      { at: 15_000, action: 'flip-off' },
     ],
   },
   {

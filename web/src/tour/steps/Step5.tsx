@@ -1,24 +1,21 @@
 // Step 5 — Contract verifies. 'Verify in browser' runs verifyClaim (lib/checks.ts: signature, program signer set,
 // revocation, TDX quote binding, attestation summary) on claim #0 with the resp_body from its submit_claim args.
-// 'Flip 1 byte' flips one byte of resp_body (confidence 100 → 101) and re-runs: the contract would recompute
-// resp_hash from the body, so the signature no longer verifies.
-//
-// 'Ask the contract' (spec §5): verify_tee_response cannot run as an RPC view on the deployed wasm — it calls
-// env::used_gas(), which NEAR prohibits in views (RPC: ProhibitedInView { method_name: "used_gas" }). The pane says so
-// and points at the submit_claim receipt, where the contract ran the same signature check itself.
-import { useMemo, useState } from 'react';
+// 'Ask the contract' (spec §5) sends the same submit_claim args to the deployed contract as a free RPC view
+// (verify_tee_response): it returns its own Verdict, or panics "bad signature". 'Flip 1 byte' flips one byte of
+// resp_body (confidence 100 → 101) and re-runs both: the signature no longer verifies in the browser or onchain.
+import { useMemo, useRef, useState } from 'react';
 import { decodeBase64, encodeBase64 } from 'ethers';
 import { verifyClaim, type Check } from '../../lib/checks';
 import { CONTRACT_ID } from '../../lib/near';
 import { sha256hex } from '../../lib/verify';
 import { useRestore, useTour, useTourAction } from '../TourContext';
-import { claimTxs } from '../tourData';
+import { askContract, askContractArgs, claimTxs, type AskResult } from '../tourData';
 import { CheckList, Exhibit, HeroButton, TxLink, type CheckItem } from '../ui';
 
 export const step5 = {
   kicker: 'Contract verifies',
   headline: 'The contract checks the TEE itself.',
-  body: "No server decides. The contract checks the enclave's signature and that the signer belongs to this program. You can run the same check right here.",
+  body: "No server decides. The contract checks the enclave's signature and that the signer belongs to this program. Run the same check in your browser, then ask the contract.",
   why: 'Change one byte and the payout is refused.',
 };
 
@@ -41,6 +38,8 @@ const SHORT: Record<string, string> = {
   'Intel TDX DCAP + NVIDIA NRAS verdict': 'Attestation summary (DCAP + NRAS)',
 };
 
+type Ask = (AskResult & { flipped: boolean }) | null;
+
 export function Step5() {
   const { data, setResult } = useTour();
   const claim = data.claims.find((c) => c.id === 0)!;
@@ -48,6 +47,9 @@ export function Step5() {
   const respB64 = txs.submit?.args?.resp_body as string | undefined;
   const [runId, setRunId] = useState(0);
   const [flipped, setFlipped] = useState(false);
+  const [ask, setAsk] = useState<Ask>(null);
+  const [asking, setAsking] = useState(false);
+  const askSeq = useRef(0);
 
   const flip = useMemo(() => {
     if (!respB64) return null;
@@ -75,17 +77,36 @@ export function Step5() {
     const res = verifyClaim(claim, data.program, data.signers, { respBodyB64: respB64, signersSource: 'contract', revoked: data.revoked });
     setResult('verify-browser', !res.some((x) => x.status === 'fail'), 'TEE signature + signer set re-verified in your browser');
   };
+
+  /** RPC call_function verify_tee_response with claim #0's submit_claim args (flipped body when the switch is on). */
+  const askNow = async (withFlip: boolean) => {
+    if (!txs.submit) return;
+    const seq = ++askSeq.current;
+    setAsking(true);
+    const r = await askContract(askContractArgs(claim, txs.submit, withFlip && flip ? flip.b64 : undefined));
+    if (seq !== askSeq.current) return; // a newer ask (flip toggled) superseded this one
+    setAsk({ ...r, flipped: withFlip });
+    setAsking(false);
+    if (!withFlip) setResult('ask-contract', r.ok, r.ok ? `The contract itself returned claim #0's verdict (${r.verdict.severity}, free view)` : `The contract refused claim #0: ${r.error}`);
+    else if (!r.ok) setResult('flip-contract', true, `The contract refused the 1-byte edit: "${r.error}"`);
+  };
+  const askClick = () => askNow(flipped);
+
   const setFlip = (on: boolean) => {
     setFlipped(on);
     setRunId((n) => n + 1);
-    if (on) setResult('flip-byte', true, 'A 1-byte edit broke the signature (payout refused)');
+    if (on) setResult('flip-byte', true, 'A 1-byte edit broke the signature in your browser');
+    if (ask || asking) void askNow(on); // keep the contract's answer in step with the body it was asked about
   };
   useTourAction('verify-browser', verify);
+  useTourAction('ask-contract', askClick);
   useTourAction('flip-on', () => setFlip(true));
   useTourAction('flip-off', () => setFlip(false));
   useRestore('verify-browser', verify);
+  useRestore('ask-contract', askClick);
 
   const items: CheckItem[] = checks.map((x) => ({ label: SHORT[x.label] ?? x.label, status: x.status, detail: x.detail }));
+  const contractBad = ask ? !ask.ok : false;
 
   return (
     <div className="stack">
@@ -113,21 +134,65 @@ export function Step5() {
         {runId > 0 ? <CheckList items={items} runId={runId} /> : <p className="muted ghost-copy">Runs the same checks the contract runs, with tweetnacl and the bundled TDX quote. No server involved.</p>}
       </Exhibit>
 
-      <Exhibit label={`ask the contract · ${CONTRACT_ID}`}>
-        <p className="small">
-          <code>verify_tee_response</code> can't be called as a free view on the deployed contract: it reads <code>env::used_gas()</code>, which NEAR forbids in
-          views (the RPC answers <code>ProhibitedInView</code>). The contract already ran this exact signature check onchain when it accepted claim #0 and
-          stored it:
-        </p>
-        <div className="onchain-ok">
-          <span className="icon icon-pass">✓</span>
-          <span>
-            <code>submit_claim</code> verified the signature and returned claim id <code>0</code>
+      <Exhibit
+        label={`ask the contract · ${CONTRACT_ID}`}
+        tone={ask ? (contractBad ? 'bad' : 'ok') : undefined}
+        meta={ask ? <span className={contractBad ? 'bad mono' : 'okc mono'}>{contractBad ? 'REFUSED' : 'VALID'}</span> : null}
+      >
+        <div className="row-actions">
+          <HeroButton onClick={askClick} busy={asking} done={!!ask && !asking} disabled={!txs.submit}>
+            {ask ? 'Ask again' : 'Ask the contract'}
+          </HeroButton>
+          <span className="mono small muted">
+            free RPC view: <code>verify_tee_response</code>
+            {flipped ? ' · flipped resp_body' : ''}
           </span>
-          <TxLink hash={txs.submit?.hash} />
         </div>
-        {flipped && (
-          <p className="small bad mono">With the flipped byte, the same call would panic: “bad signature”. Nothing is reserved, and the deposit is refunded.</p>
+        <div className="askcmp">
+          <div className={`askcol ${runId ? (failed ? 'askcol-bad' : 'askcol-ok') : ''}`}>
+            <p className="cap">your browser</p>
+            {runId ? (
+              <span className={`vchip ${failed ? 'vchip-bad' : 'vchip-ok'}`}>{failed ? 'signature fails' : 'signature valid'}</span>
+            ) : (
+              <span className="muted small">not run yet</span>
+            )}
+          </div>
+          <div className={`askcol ${ask ? (contractBad ? 'askcol-bad' : 'askcol-ok') : ''}`} data-testid="contract-verdict">
+            <p className="cap">the contract</p>
+            {asking && !ask ? (
+              <span className="muted small">asking…</span>
+            ) : ask?.ok ? (
+              <span className="verdict">
+                <span className="vchip vchip-ok">valid</span>
+                <span className="mono small">
+                  {ask.verdict.severity} · {ask.verdict.cwe ?? 'no CWE'} · confidence {ask.verdict.confidence}
+                </span>
+              </span>
+            ) : ask ? (
+              <span className="verdict">
+                <span className="vchip vchip-bad">panic</span>
+                <span className="mono small bad">“{ask.error}”</span>
+              </span>
+            ) : (
+              <span className="muted small">not asked yet</span>
+            )}
+            {ask?.source === 'snapshot' && (
+              <p className="readout readout-snap" title={ask.rpcError ?? ''}>
+                SNAPSHOT · RPC unreachable, showing the recorded answer
+              </p>
+            )}
+          </div>
+        </div>
+        {ask && !ask.ok ? (
+          <p className="small muted">submit_claim runs this exact check first, so the same panic would refuse the claim: nothing is reserved and the deposit is refunded.</p>
+        ) : (
+          <div className="onchain-ok">
+            <span className="icon icon-pass">✓</span>
+            <span>
+              <code>submit_claim</code> ran the same check onchain and stored claim <code>0</code>
+            </span>
+            <TxLink hash={txs.submit?.hash} />
+          </div>
         )}
       </Exhibit>
     </div>

@@ -227,6 +227,13 @@
 .flip input:focus-visible + .flip-k { outline: 2px solid var(--accent); outline-offset: 2px; }
 .onchain-ok { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; font-size: 0.86rem; padding: 10px 12px; border-radius: 6px; background: var(--surface-2); border: 1px solid var(--line); }
 .onchain-ok .icon { margin: 0; }
+.askcmp { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.askcol { padding: 10px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--surface-2); min-width: 0; display: grid; gap: 6px; align-content: start; transition: border-color var(--t-fade) var(--ease-out); }
+.askcol .cap { margin: 0; }
+.askcol > .vchip { justify-self: start; }
+.askcol-ok { border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+.askcol-bad { border-color: color-mix(in srgb, var(--bad) 55%, var(--line)); }
+.askcol .readout { margin: 0; }
 
 /* ---- step 6 ---- */
 .reveal { display: grid; gap: 10px; animation: fadein 300ms var(--ease-out); }
