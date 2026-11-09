@@ -48,10 +48,17 @@ the shell win.
 | `NEAR_RPC_URL` | default `https://test.rpc.fastnear.com` |
 | `DEMO_HUNTER_ACCOUNT`, `DEMO_FRONTRUN_ACCOUNT`, `DEMO_HELPER_PORT` | optional overrides |
 
-**Secrets.** Every JSON response, SSE event and log line goes through a redactor that removes the NEAR AI key,
-every secret-looking `.env` value, NEAR private keys (`ed25519:<base58 secret>`), `Bearer …` tokens and
-`private_key` / `secret_key` / `ephemeral_secret` JSON fields. Child `sb` processes get `NEARAI_API_KEY=''`,
-because none of the commands the helper runs need it.
+**Secrets.** Free text is redacted: error responses, SSE `message` fields and log lines. The redactor removes the
+NEAR AI key, every secret-looking `.env` value, NEAR private keys (`ed25519:<base58 secret>`), `Bearer …` tokens
+and `private_key` / `secret_key` / `ephemeral_secret` JSON fields.
+
+Structured success data is never rewritten, because it is signed and hashed. This covers the judgement fields,
+tx hashes and the other SSE fields. The real vuln-app bundle contains "Bearer session token", and rewriting it
+would break `sha256(request_body) == req_hash`. That data is only scanned for the literal secrets (the API key
+and the secret `.env` values). If it contains one, the helper refuses with a 500, or with an SSE `error` event,
+and sends nothing.
+
+Child `sb` processes get `NEARAI_API_KEY=''`, because none of the commands the helper runs need it.
 
 ## API
 

@@ -40,3 +40,20 @@ export function redactDeep(value, redact) {
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redactDeep(v, redact)]));
   return value;
 }
+
+/**
+ * Success payloads carry signed data (request_body, response_body_b64, tx hashes) that must stay byte
+ * for byte, so they are never rewritten. They are only scanned for the literal secrets; the caller
+ * refuses to send a payload that contains one.
+ * @returns {(value: unknown) => boolean}
+ */
+export function makeSecretScanner(secrets = []) {
+  const lits = [...new Set(secrets.filter((s) => typeof s === 'string' && s.length >= 8))];
+  const scan = (v) => {
+    if (typeof v === 'string') return lits.some((l) => v.includes(l));
+    if (Array.isArray(v)) return v.some(scan);
+    if (v && typeof v === 'object') return Object.entries(v).some(([k, x]) => scan(k) || scan(x));
+    return false;
+  };
+  return scan;
+}

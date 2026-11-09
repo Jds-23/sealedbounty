@@ -1,5 +1,5 @@
 // The local-only demo helper (docs/demo-app-spec.md §8): plain node:http, CORS for the tour origin
-// only, one request at a time, every byte out redacted.
+// only, one request at a time, no secret ever sent (free text redacted, signed data scanned, never rewritten).
 //   GET  /health                -> {ok:true, programId, contractId} | {ok:false, reason}
 //   POST /judge {exploitMarkdown} -> judgement JSON (see validate.mjs)
 //   POST /loop {judgement}      -> SSE: submit_claim, flag_undecryptable, prove_ciphertext, wait, finalize, end
@@ -8,7 +8,7 @@ import { createServer } from 'node:http';
 import { PREFLIGHT_HEADERS, corsHeaders, originAllowed } from './cors.mjs';
 import { runFrontrun, runLoop } from './flows.mjs';
 import { createMutex } from './mutex.mjs';
-import { makeRedactor, redactDeep, secretsFromEnv } from './redact.mjs';
+import { makeRedactor, makeSecretScanner, secretsFromEnv } from './redact.mjs';
 import { openSse } from './sse.mjs';
 import { judgeResponse, toJudgeRecord, validateJudgeRequest, validateJudgement } from './validate.mjs';
 
@@ -50,7 +50,13 @@ function readBody(req) {
  *          deps: object, log?: (...a: unknown[]) => void}} o
  */
 export function createHelperServer({ config, deps, log = console.error }) {
-  const redact = makeRedactor([config.apiKey, ...secretsFromEnv(config.env ?? {})].filter(Boolean));
+  // Redaction policy: free text (error/message fields, logs) is pattern + literal redacted. Structured
+  // success data (judgements, tx hashes) is never rewritten, because it is signed and hashed; it is only
+  // scanned for the literal secrets, and a payload containing one is refused.
+  const secrets = [config.apiKey, ...secretsFromEnv(config.env ?? {})].filter(Boolean);
+  const redact = makeRedactor(secrets);
+  const hasSecret = makeSecretScanner(secrets);
+  const REFUSED = 'refused: payload contained a configured secret (not sent)';
   const say = (...a) => log(redact(a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ')));
   const mutex = createMutex();
   /** req_hashes this process judged (shared judge() checked the signer against a fresh attestation). */
@@ -61,7 +67,13 @@ export function createHelperServer({ config, deps, log = console.error }) {
   };
 
   function sendJson(res, status, body, headers) {
-    const text = JSON.stringify(redactDeep(body, redact));
+    if (status >= 400) body = { error: redact(body?.error ?? 'error') };
+    else if (hasSecret(body)) {
+      say(REFUSED);
+      status = 500;
+      body = { error: REFUSED };
+    }
+    const text = JSON.stringify(body);
     res.writeHead(status, { ...headers, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
     res.end(text);
   }
@@ -80,9 +92,19 @@ export function createHelperServer({ config, deps, log = console.error }) {
     return record;
   }
 
+  /** SSE: only `message` is free text; every other field passes through untouched, or the event is refused. */
+  function safeEvent(e) {
+    const { message, ...data } = e;
+    if (hasSecret(data)) {
+      say(REFUSED);
+      return { step: e.step, status: 'error', message: REFUSED };
+    }
+    return message === undefined ? data : { ...data, message: redact(message) };
+  }
+
   async function stream(res, cors, name, run) {
     const release = lock(name);
-    const sse = openSse(res, { headers: cors, transform: (e) => redactDeep(e, redact) });
+    const sse = openSse(res, { headers: cors, transform: safeEvent });
     const emit = (e) => {
       sse.send(e);
       if (e.status === 'error' || e.step === 'end') say(`[${name}]`, e);
