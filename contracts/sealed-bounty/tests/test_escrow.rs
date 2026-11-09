@@ -715,3 +715,146 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
     assert_eq!(u128_of(&p["balance"]), bal0 - 3 * NEAR);
     Ok(())
 }
+
+/// v3 #2 E2E: decryption challenge game with real crypto in the wasm, on REAL v2 fixtures.
+/// - honest sqli claim, griefing owner flags it -> hunter proves (gas measured) -> paid
+/// - fakecode claim with JUNK ciphertext -> owner flags -> no proof -> finalize rejects
+#[tokio::test]
+async fn escrow_end_to_end_decryption_challenge() -> testresult::TestResult<()> {
+    use sealed_bounty::report_box::{seal_with_ephemeral, x25519_base};
+    let sqli = Fx::load("demo.sqli.json");
+    let fake = Fx::load("demo.fakecode.json");
+    let inputs = &sqli.0["inputs"];
+    let e = start(inputs["hunter"].as_str().unwrap()).await?;
+    let c = e.deploy("esc-v3-2.sandbox").await;
+
+    let owner_sk = [0x11u8; 32];
+    let eph_sk = [0x22u8; 32];
+    let owner_pub = x25519_base(owner_sk);
+    let args = json!({
+        "name": "vuln-app", "repo_url": inputs["repoUrl"], "commit": inputs["commit"],
+        "model_id": sqli.s("model"), "system_prompt_hash": read_fixture_text("demo.system-prompt.sha256"),
+        "code_hash": read_fixture_text("demo.code.sha256"),
+        "payouts": { "low": (NEAR / 2).to_string(), "medium": NEAR.to_string(),
+                     "high": (2 * NEAR).to_string(), "critical": (3 * NEAR).to_string() },
+        "owner_enc_pubkey": b64(&owner_pub), "dispute_secs": DISPUTE_SECS, "min_confidence": 80,
+        "challenge_secs": CHALLENGE_SECS,
+    });
+    let pid: u64 = e
+        .ok(&c, &e.owner, "create_program", args, 10 * NEAR)
+        .await
+        .json()?;
+
+    // ---- honest claim: real ciphertext; the owner flags anyway; the hunter proves ----
+    let ct = seal_with_ephemeral(
+        sqli.s("request_body").as_bytes(),
+        owner_pub,
+        eph_sk,
+        [0x33; 24],
+    );
+    let mut ca = sqli.claim_args(pid);
+    ca["ciphertext"] = b64(&ct).into();
+    let cid: u64 = e
+        .ok(&c, &e.hunter, "submit_claim", ca, NEAR / 2)
+        .await
+        .json()?;
+    let r = e
+        .ok(
+            &c,
+            &e.owner,
+            "flag_undecryptable",
+            json!({ "claim_id": cid }),
+            0,
+        )
+        .await;
+    println!("  [GAS] flag_undecryptable: {}", tgas(r.total_gas_burnt));
+    let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
+    assert_eq!(claim["status"], "Challenged");
+    let secret = hex::encode(eph_sk);
+    e.fail(
+        &c,
+        &e.stranger,
+        "prove_ciphertext",
+        json!({ "claim_id": cid, "ephemeral_secret": secret }),
+        0,
+        "claim hunter only",
+    )
+    .await;
+    e.fail(
+        &c,
+        &e.owner,
+        "dispute",
+        json!({ "claim_id": cid, "request_body": sqli.s("request_body") }),
+        0,
+        "claim not pending",
+    )
+    .await;
+    let r = e
+        .ok(
+            &c,
+            &e.hunter,
+            "prove_ciphertext",
+            json!({ "claim_id": cid, "ephemeral_secret": secret }),
+            0,
+        )
+        .await;
+    println!(
+        "  [GAS] prove_ciphertext ({} byte body, full checks pass): {}",
+        sqli.s("request_body").len(),
+        tgas(r.total_gas_burnt)
+    );
+    assert!(r.total_gas_burnt.as_gas() < 100 * 10u64.pow(12));
+    let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
+    assert_eq!(claim["status"], "Pending");
+    let before = e.balance(&e.hunter).await;
+    e.ok(&c, &e.stranger, "finalize", json!({ "claim_id": cid }), 0)
+        .await;
+    assert_eq!(e.balance(&e.hunter).await - before, 3 * NEAR);
+
+    // ---- junk ciphertext: flag, the hunter stays silent, finalize rejects ----
+    let fid: u64 = e
+        .ok(
+            &c,
+            &e.hunter,
+            "submit_claim",
+            fake.claim_args(pid),
+            NEAR / 10,
+        )
+        .await
+        .json()?;
+    e.ok(
+        &c,
+        &e.owner,
+        "flag_undecryptable",
+        json!({ "claim_id": fid }),
+        0,
+    )
+    .await;
+    e.fail(
+        &c,
+        &e.stranger,
+        "finalize",
+        json!({ "claim_id": fid }),
+        0,
+        "challenge open",
+    )
+    .await;
+    let claim: Value = e.view(&c, "get_claim", json!({ "id": fid })).await;
+    e.advance_past(
+        claim["challenge_deadline"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()?,
+    )
+    .await;
+    let before = e.balance(&e.hunter).await;
+    e.ok(&c, &e.stranger, "finalize", json!({ "claim_id": fid }), 0)
+        .await;
+    assert!(e.balance(&e.hunter).await <= before, "no payout");
+    let claim: Value = e.view(&c, "get_claim", json!({ "id": fid })).await;
+    assert_eq!(claim["status"], "Rejected");
+    assert_eq!(claim["reject_reason"], "undecryptable report");
+    let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
+    assert_eq!(u128_of(&p["reserved"]), 0);
+    Ok(())
+}

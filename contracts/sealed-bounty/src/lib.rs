@@ -1,6 +1,7 @@
 //! SealedBounty escrow: bug-bounty programs paid out on NEAR AI Cloud TEE-signed judge verdicts.
 //! Spec: docs/INTERFACE.md (binding).
 
+pub mod report_box;
 pub mod tee;
 
 use near_sdk::json_types::{Base64VecU8, U64, U128};
@@ -8,7 +9,8 @@ use near_sdk::serde::Deserialize;
 use near_sdk::serde_json::{self, json};
 use near_sdk::store::{IterableMap, LookupSet};
 use near_sdk::{
-    AccountId, BorshStorageKey, NearToken, PanicOnDefault, Promise, env, near, require,
+    AccountId, BorshStorageKey, NearToken, PanicOnDefault, Promise, PromiseOrValue, env, near,
+    require,
 };
 
 use tee::Severity;
@@ -162,6 +164,7 @@ pub(crate) const MODEL_MISMATCH: &str = "model mismatch";
 pub(crate) const CODE_MISMATCH: &str = "code mismatch";
 pub(crate) const HUNTER_MISMATCH: &str = "hunter mismatch";
 pub(crate) const REPORT_MISSING: &str = "report missing";
+pub(crate) const UNDECRYPTABLE: &str = "undecryptable report";
 
 /// `None` if the revealed request matches the program and the claim's hunter, else the FIRST
 /// failing reject reason (INTERFACE.md v2 order):
@@ -540,14 +543,19 @@ impl Contract {
         let reason = tamper_reason(program, &claim.hunter, &request_body)
             .unwrap_or_else(|| env::panic_str("dispute invalid: request matches program"));
 
-        let (program_id, payout) = (claim.program_id, claim.payout.0);
-        if reason == HUNTER_MISMATCH {
-            let req_hash = claim.req_hash.clone();
-            self.used_req_hashes.remove(&req_hash);
-        }
-        let c = self.claims.get_mut(&claim_id).unwrap();
+        self.reject_claim(claim_id, reason);
+    }
+
+    /// Reject a Pending/Challenged claim: its payout goes back to the program balance. On
+    /// "hunter mismatch" (front-run) the req_hash is released so the real hunter can resubmit.
+    fn reject_claim(&mut self, claim_id: u64, reason: &str) {
+        let c = self.claims.get_mut(&claim_id).expect("claim exists");
         c.status = ClaimStatus::Rejected;
         c.reject_reason = Some(reason.to_string());
+        let (program_id, payout, req_hash) = (c.program_id, c.payout.0, c.req_hash.clone());
+        if reason == HUNTER_MISMATCH {
+            self.used_req_hashes.remove(&req_hash);
+        }
         let p = self.program_mut(program_id);
         p.reserved = U128(p.reserved.0 - payout);
         p.balance = U128(p.balance.0 + payout);
@@ -558,24 +566,118 @@ impl Contract {
     }
 
     /// Program owner only, while the claim is Pending and the dispute window is open: the
-    /// ciphertext does not decrypt to the judged request, so the owner cannot dispute.
+    /// ciphertext does not decrypt to the judged request, so the owner cannot dispute. The claim
+    /// becomes Challenged; the hunter has `challenge_secs` to `prove_ciphertext`, else
+    /// `finalize` rejects it ("undecryptable report").
     pub fn flag_undecryptable(&mut self, claim_id: u64) {
-        let _ = claim_id;
-        env::panic_str("unimplemented")
+        let claim = self
+            .claims
+            .get(&claim_id)
+            .unwrap_or_else(|| env::panic_str("claim not found"));
+        let program = self
+            .programs
+            .get(&claim.program_id)
+            .expect("program exists");
+        Self::assert_program_owner(program);
+        require!(claim.status == ClaimStatus::Pending, "claim not pending");
+        let now = env::block_timestamp();
+        require!(now < claim.finalize_after.0, "dispute window closed");
+        let deadline = now + program.challenge_secs * NANOS_PER_SEC;
+        let program_id = claim.program_id;
+        let c = self.claims.get_mut(&claim_id).unwrap();
+        c.status = ClaimStatus::Challenged;
+        c.challenge_deadline = Some(U64(deadline));
+        emit(
+            "claim_challenged",
+            json!({"claim_id": claim_id, "program_id": program_id, "challenge_deadline": U64(deadline)}),
+        );
     }
 
-    /// Claim hunter only, while Challenged: reveal the nacl-box ephemeral secret (64 hex).
+    /// Claim hunter only, while Challenged and before `challenge_deadline`. Reveals the nacl-box
+    /// ephemeral secret (64 hex) so anyone can decrypt the report. If the ciphertext does not
+    /// open to the body hashed as `req_hash` (wrong secret, junk, wrong owner key) → Rejected
+    /// "undecryptable report". Otherwise the now-public body goes through the full dispute
+    /// checks: a failing reason → Rejected with it; all pass → back to Pending, finalizable now.
     pub fn prove_ciphertext(&mut self, claim_id: u64, ephemeral_secret: String) {
-        let _ = (claim_id, ephemeral_secret);
-        env::panic_str("unimplemented")
+        let claim = self
+            .claims
+            .get(&claim_id)
+            .unwrap_or_else(|| env::panic_str("claim not found"));
+        require!(
+            env::predecessor_account_id() == claim.hunter,
+            "claim hunter only"
+        );
+        require!(
+            claim.status == ClaimStatus::Challenged,
+            "claim not challenged"
+        );
+        let now = env::block_timestamp();
+        require!(
+            claim.challenge_deadline.is_some_and(|d| now < d.0),
+            "challenge closed"
+        );
+        let secret: [u8; 32] = hex::decode(&ephemeral_secret)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .unwrap_or_else(|| env::panic_str("ephemeral_secret must be 64 hex chars"));
+        let program = self
+            .programs
+            .get(&claim.program_id)
+            .expect("program exists");
+
+        let reason = match Self::open_report(program, claim, secret) {
+            None => Some(UNDECRYPTABLE),
+            Some(body) => tamper_reason(program, &claim.hunter, &body),
+        };
+        match reason {
+            Some(r) => self.reject_claim(claim_id, r),
+            None => {
+                let program_id = claim.program_id;
+                let c = self.claims.get_mut(&claim_id).unwrap();
+                c.status = ClaimStatus::Pending;
+                c.finalize_after = U64(now);
+                emit(
+                    "claim_proven",
+                    json!({"claim_id": claim_id, "program_id": program_id, "finalize_after": U64(now)}),
+                );
+            }
+        }
     }
 
-    /// Anyone, once the dispute window has passed. Pays the hunter.
-    pub fn finalize(&mut self, claim_id: u64) -> Promise {
+    /// The request body, if `claim.ciphertext` opens with the ephemeral `secret` for the
+    /// program's owner key and hashes to `claim.req_hash`.
+    fn open_report(program: &Program, claim: &Claim, secret: [u8; 32]) -> Option<String> {
+        use near_sdk::base64::Engine as _;
+        let b64 = near_sdk::base64::engine::general_purpose::STANDARD;
+        let ct = b64.decode(&claim.ciphertext).ok()?;
+        let owner_pub: [u8; 32] = b64
+            .decode(&program.owner_enc_pubkey)
+            .ok()?
+            .try_into()
+            .ok()?;
+        let plain = report_box::open_with_ephemeral(&ct, owner_pub, secret).ok()?;
+        if tee::sha256_hex(&plain) != claim.req_hash {
+            return None;
+        }
+        String::from_utf8(plain).ok()
+    }
+
+    /// Anyone, once the dispute window has passed. Pays the hunter. On a Challenged claim whose
+    /// hunter did not prove the ciphertext by the deadline: Rejected "undecryptable report".
+    pub fn finalize(&mut self, claim_id: u64) -> PromiseOrValue<()> {
         let c = self
             .claims
             .get_mut(&claim_id)
             .unwrap_or_else(|| env::panic_str("claim not found"));
+        if c.status == ClaimStatus::Challenged {
+            require!(
+                c.challenge_deadline
+                    .is_some_and(|d| env::block_timestamp() >= d.0),
+                "challenge open"
+            );
+            self.reject_claim(claim_id, UNDECRYPTABLE);
+            return PromiseOrValue::Value(());
+        }
         require!(c.status == ClaimStatus::Pending, "claim not pending");
         require!(
             env::block_timestamp() >= c.finalize_after.0,
@@ -589,7 +691,7 @@ impl Contract {
             "claim_paid",
             json!({"claim_id": claim_id, "program_id": program_id, "hunter": hunter, "payout": U128(payout)}),
         );
-        Promise::new(hunter).transfer(NearToken::from_yoctonear(payout))
+        PromiseOrValue::Promise(Promise::new(hunter).transfer(NearToken::from_yoctonear(payout)))
     }
 
     // ---------------- views ----------------
