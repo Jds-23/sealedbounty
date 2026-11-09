@@ -227,6 +227,19 @@ impl Env {
         min_conf: u8,
         deposit: u128,
     ) -> u64 {
+        self.create_program_bonded(c, f, hash, min_conf, deposit, 0)
+            .await
+    }
+
+    async fn create_program_bonded(
+        &self,
+        c: &AccountId,
+        f: &Fx,
+        hash: String,
+        min_conf: u8,
+        deposit: u128,
+        bond: u128,
+    ) -> u64 {
         let args = json!({
             "name": "demo", "repo_url": "https://github.com/x/y", "commit": "abc123",
             "model_id": f.s("model"), "system_prompt_hash": hash,
@@ -234,7 +247,7 @@ impl Env {
             "payouts": { "low": (NEAR / 2).to_string(), "medium": NEAR.to_string(),
                          "high": (2 * NEAR).to_string(), "critical": (4 * NEAR).to_string() },
             "owner_enc_pubkey": "b3duZXJwdWI=", "dispute_secs": DISPUTE_SECS, "min_confidence": min_conf,
-            "bond": "0",
+            "bond": bond.to_string(),
         });
         let r = self
             .ok(c, &self.owner, "create_program", args, deposit)
@@ -719,5 +732,94 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
     let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
     assert_eq!(u128_of(&p["reserved"]), 0);
     assert_eq!(u128_of(&p["balance"]), bal0 + 2 * BOND - 3 * NEAR);
+    Ok(())
+}
+
+/// v3 #8: the hunter's account is deleted before finalize, so the payout transfer fails. The
+/// payout + bond must not be stranded on the contract account: the claim becomes "PayoutFailed"
+/// and the program balance is credited payout + bond.
+#[tokio::test]
+async fn finalize_to_deleted_hunter_credits_program() -> testresult::TestResult<()> {
+    let e = start("hunter.sandbox").await?;
+    let f = Fx::load("live.ed25519.json");
+    let c = e.deploy("esc-payout.sandbox").await;
+    let pid = e
+        .create_program_bonded(&c, &f, f.system_prompt_hash(), 0, 10 * NEAR, BOND)
+        .await;
+    let bal0 = u128_of(
+        &e.view::<Value>(&c, "get_program", json!({ "id": pid }))
+            .await["balance"],
+    );
+    let cid: u64 = e
+        .ok(
+            &c,
+            &e.hunter,
+            "submit_claim",
+            f.claim_args(pid),
+            NEAR / 10 + BOND,
+        )
+        .await
+        .json()?;
+    let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
+    assert_eq!(u128_of(&claim["payout"]), 2 * NEAR);
+
+    // The hunter deletes their account (beneficiary: stranger).
+    near_api::Account(e.hunter.clone())
+        .delete_account_with_beneficiary(e.stranger.clone())
+        .with_signer(e.key.clone())
+        .send_to(&e.net)
+        .await?
+        .assert_success();
+    let gone = near_api::Account(e.hunter.clone())
+        .view()
+        .fetch_from(&e.net)
+        .await;
+    assert!(gone.is_err(), "hunter account deleted");
+
+    e.advance_past(claim["finalize_after"].as_str().unwrap().parse::<u64>()?)
+        .await;
+    let contract_before = e.balance(&c).await;
+    let r = e
+        .call(&c, &e.stranger, "finalize", json!({ "claim_id": cid }), 0)
+        .await;
+    match &r {
+        Ok(s) => println!(
+            "  [GAS] finalize, failed payout + on_payout: {}",
+            tgas(s.total_gas_burnt)
+        ),
+        Err(err) => println!(
+            "  finalize outcome: failure, gas {}",
+            tgas(err.total_gas_burnt)
+        ),
+    }
+
+    let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
+    assert_eq!(claim["status"], "PayoutFailed");
+    let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
+    assert_eq!(u128_of(&p["reserved"]), 0);
+    assert_eq!(
+        u128_of(&p["balance"]),
+        bal0 + BOND,
+        "payout + bond credited back to the pool"
+    );
+    // The refunded transfer stays on the contract account, now accounted for.
+    let contract_after = e.balance(&c).await;
+    assert!(
+        contract_after + NEAR / 100 > contract_before,
+        "transfer refunded to the contract"
+    );
+    assert!(r.is_ok(), "on_payout handles the failure without panicking");
+
+    // The owner can now withdraw it.
+    let before = e.balance(&e.owner).await;
+    e.ok(
+        &c,
+        &e.owner,
+        "close_program",
+        json!({ "program_id": pid }),
+        0,
+    )
+    .await;
+    assert!(e.balance(&e.owner).await > before + bal0 + BOND - NEAR / 100);
     Ok(())
 }
