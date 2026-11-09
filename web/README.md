@@ -17,7 +17,7 @@ Demo mode (v3 cases program: params tampered, junk ciphertext challenged then re
 ```bash
 pnpm install
 pnpm dev            # http://localhost:5173
-pnpm test           # vitest (125 tests): signature verify, decrypt, v2/v3 request checks, v3 fields, recorded live view shapes
+pnpm test           # vitest (129 tests): signature verify, decrypt, v2/v3 request checks, v3 fields, recorded live view shapes, payout-tx links
 pnpm build          # tsc + vite build -> dist/ (static, base './', hash routing)
 pnpm sync-fixtures  # re-copy ../fixtures into src/fixtures and derive the v3 demo cases offline (no NEAR AI calls)
 ```

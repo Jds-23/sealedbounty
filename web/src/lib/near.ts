@@ -205,8 +205,58 @@ const NB_API = 'https://api-testnet.nearblocks.io/v3';
 let paidTxCache: Promise<Record<number, string>> | null = null;
 
 /**
- * Maps claim_id -> hash of the successful `finalize` tx that paid it. Best effort: returns {} on any error.
- * Lists the contract's txns, then reads args of each successful finalize (claim_id is only in the args).
+ * Claim ids a finalize tx actually paid, from its receipt logs: a `claim_paid` EVENT_JSON (standard sealedbounty)
+ * in a successful receipt, minus any `payout_failed` for the same id. A finalize that succeeds but emits
+ * `claim_rejected` (undecryptable report, revoked signer, ...) pays nothing (#13).
+ */
+export function paidClaimIds(txResult: unknown): number[] {
+  const paid = new Set<number>();
+  const failed = new Set<number>();
+  for (const r of ((txResult as any)?.receipts_outcome ?? []) as any[]) {
+    const st = r?.outcome?.status;
+    if (!st || typeof st !== 'object' || 'Failure' in st) continue;
+    for (const log of (r.outcome.logs ?? []) as unknown[]) {
+      if (typeof log !== 'string' || !log.startsWith('EVENT_JSON:')) continue;
+      let ev: any;
+      try {
+        ev = JSON.parse(log.slice('EVENT_JSON:'.length));
+      } catch {
+        continue;
+      }
+      if (ev?.standard !== 'sealedbounty') continue;
+      const into = ev.event === 'claim_paid' ? paid : ev.event === 'payout_failed' ? failed : null;
+      if (!into) continue;
+      for (const d of Array.isArray(ev.data) ? ev.data : [ev.data]) if (Number.isInteger(d?.claim_id)) into.add(d.claim_id);
+    }
+  }
+  return [...paid].filter((id) => !failed.has(id));
+}
+
+/** RPC `tx` (read-only status lookup) with the same fallback order as `view`. */
+async function rpcTx(hash: string, sender: string): Promise<unknown> {
+  let last: Error = new Error('no RPC configured');
+  for (const url of RPC_URLS) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        signal: AbortSignal.timeout(8000),
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 'sb', method: 'tx', params: { tx_hash: hash, sender_account_id: sender, wait_until: 'FINAL' } }),
+      });
+      if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
+      const j = await res.json();
+      if (j.error) throw new Error(j.error?.cause?.name || j.error?.message || 'RPC error');
+      return j.result;
+    } catch (e) {
+      last = e as Error;
+    }
+  }
+  throw last;
+}
+
+/**
+ * Maps claim_id -> hash of the `finalize` tx that paid it (emitted `claim_paid`). Best effort: returns {} on any error.
+ * Lists the contract's successful finalize txns on nearblocks, then reads each one's receipt logs over RPC.
  */
 export function findPaidTxs(): Promise<Record<number, string>> {
   paidTxCache ??= (async () => {
@@ -217,10 +267,11 @@ export function findPaidTxs(): Promise<Record<number, string>> {
         .filter((t) => t?.outcomes?.status === true && t?.actions?.some((a: any) => a?.method === 'finalize'))
         .slice(0, 10);
       for (const t of fin) {
-        const d = await fetch(`${NB_API}/txns/${t.transaction_hash}`, { signal: AbortSignal.timeout(8000) }).then((r) => r.json());
-        for (const a of d?.data?.actions ?? []) {
-          const id = a?.args?.args_json?.claim_id;
-          if (a?.method === 'finalize' && Number.isInteger(id)) out[id] = t.transaction_hash;
+        try {
+          const tx = await rpcTx(t.transaction_hash, t.signer_account_id);
+          for (const id of paidClaimIds(tx)) out[id] ??= t.transaction_hash;
+        } catch {
+          /* this tx unreadable: no link for it */
         }
       }
     } catch {

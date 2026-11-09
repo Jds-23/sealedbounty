@@ -41,3 +41,30 @@ describe('findPaidTxs (#13)', () => {
     expect(txs).toEqual({ 0: PAID });
   });
 });
+
+describe('paidClaimIds (#13)', () => {
+  it('reads claim_paid from the recorded claim 0 finalize', async () => {
+    const { paidClaimIds } = await import('./near');
+    expect(paidClaimIds(rec.rpc_tx[PAID].result)).toEqual([0]);
+  });
+
+  it('ignores the recorded claim_rejected finalize for claim 4', async () => {
+    const { paidClaimIds } = await import('./near');
+    expect(paidClaimIds(rec.rpc_tx[REJECTED].result)).toEqual([]);
+  });
+
+  it('drops a claim whose payout_failed in the same tx, logs of failed receipts, and foreign events', async () => {
+    const { paidClaimIds } = await import('./near');
+    const ev = (event: string, claim_id: number, standard = 'sealedbounty') =>
+      `EVENT_JSON:${JSON.stringify({ standard, version: '1.0.0', event, data: [{ claim_id }] })}`;
+    const tx = {
+      receipts_outcome: [
+        { outcome: { status: { SuccessReceiptId: 'x' }, logs: [ev('claim_paid', 7), ev('claim_paid', 8)] } },
+        { outcome: { status: { SuccessValue: '' }, logs: [ev('payout_failed', 8)] } },
+        { outcome: { status: { Failure: {} }, logs: [ev('claim_paid', 9)] } },
+        { outcome: { status: { SuccessValue: '' }, logs: ['EVENT_JSON:{bad', ev('claim_paid', 10, 'other')] } },
+      ],
+    };
+    expect(paidClaimIds(tx)).toEqual([7]);
+  });
+});
