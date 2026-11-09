@@ -19,9 +19,9 @@
   - `min_confidence` gates payable verdicts only.
   - JSON schema `cwe` = `{"type":["string","null"]}`.
 - System prompt: `shared/system-prompt.txt` (no trailing newline), sha256 `aede4ebac53d6bae5f3ceefc8d60175faff90276ac7751fb26aebff39e5172c2` (v2; v1 was 4fdd9ec8…). Helpers live in `shared/judge.mjs` (browser-safe).
-- Demo target: `https://github.com/sealedbounty/vuln-app` @ `demo-commit-0001`. Fixtures: `fixtures/demo.{sqli,sqli.ecdsa,idor,bogus,injection}.json`.
+- Demo target (v1): `https://github.com/sealedbounty/vuln-app` @ `demo-commit-0001`. Fixtures: `fixtures/demo.{sqli,sqli.ecdsa,idor,bogus,injection}.json`. (v2 changes the demo `repo_url`; see "v2".)
 - Amounts: `U128` yoctoNEAR as a decimal string. Timestamps: nanoseconds as `U64` strings.
-- Owner encryption key: tweetnacl `box` keypair (x25519). The public key is base64 and goes onchain. The secret key stays local at `~/.sealedbounty/owner-<program_id>.json`, never committed.
+- Owner encryption key: tweetnacl `box` keypair (x25519). The public key is base64 and goes onchain. The secret key stays local at `~/.sealedbounty/owner-<contract>-<program_id>.json` (v1 originally used `owner-<program_id>.json`), never committed.
 - Report ciphertext (base64) = `ephemeralPub(32) || nonce(24) || nacl.box(utf8(request_body), nonce, ownerPub, ephemeralSecret)`.
 
 ## Canonical judge request body (built ONCE with JSON.stringify, hashed exactly as sent)
@@ -73,7 +73,7 @@ Methods:
 - Events: `env::log_str` in NEP-297 JSON (`EVENT_JSON:{"standard":"sealedbounty","version":"1.0.0","event":"claim_submitted",...}`).
 
 ## Testnet
-- Admin/owner account `baldingsucks7993.testnet`. Escrow contract: `escrow.baldingsucks7993.testnet` (fresh state). The `sealedbounty.*` account keeps the Phase 0 spike.
+- Admin/owner account `baldingsucks7993.testnet`. v1 escrow contract: `escrow.baldingsucks7993.testnet` (history; the live contract is v3, see "v3 testnet" at the end). The `sealedbounty.*` account keeps the Phase 0 spike.
 - Allowlisted signers (attested 9 Nov):
   - `ed25519:89154a43a47684742c3d1753252bb6f49f61da9d8c84fc9b1def2df130cb2d93`
   - `eth:0x835ab53d20294ef795906dff21ae4c045336aa26`
@@ -87,7 +87,7 @@ Fresh-clone judge finding: in v1 the hunter supplied the code excerpt, so they c
 - `buildCodeBundle(files: {path, content}[])`: sort by path (byte order), each entry = `// file: <path>\n<content>`, ensure content ends with `\n` (append one if missing), concatenate with no separator.
 - `program.code_hash` = sha256hex(utf8(bundle)).
 - Demo bundle = `[{path:"src/server.ts", content: fixtures/vuln-app/src/server.ts}]`. Write it to `fixtures/vuln-app/bundle.txt`, with its hash in `fixtures/vuln-app/bundle.sha256` (no trailing newline).
-- Demo `repo_url` = `https://github.com/sealedbounty/sealedbounty/tree/main/fixtures/vuln-app` (placeholder org; the README says the code lives in fixtures/vuln-app). Commit stays `demo-commit-0001`.
+- Demo `repo_url` = `https://github.com/sealedbounty/sealedbounty/tree/main/fixtures/vuln-app` (placeholder org; the code lives in this repo, https://github.com/Jds-23/sealedbounty, under `fixtures/vuln-app`). It stays the placeholder because the recorded TEE fixtures' TARGET line is bound to it. Commit stays `demo-commit-0001`.
 
 ## Canonical judge request v2 (`buildRequestBody({model, repoUrl, commit, hunter, codeBundle, report})`)
 ```
@@ -147,3 +147,9 @@ Each issue is fixed with TDD on its own branch: a RED test commit (proves the bu
 - Dedupe key is per program: `format!("{program_id}:{req_hash}")`. Releasing the hash on `hunter mismatch` uses the same key.
 - `claims_by_program: LookupMap<u64, Vector<u64>>`. `list_claims` paginates over it (no full scan). The views stay the same shape.
 - `finalize` returns `PromiseOrValue<()>`: on Paid, `Promise::transfer(payout + bond).then(on_payout(claim_id))` (10 Tgas, `#[private]`); on a rejection (`"signer revoked"`, `"undecryptable report"`) `Value(())`, no transfer, payout + bond to `program.balance`. On failure → status `"PayoutFailed"`, and `payout + bond` is credited back to `program.balance`.
+
+## v3 testnet
+- Contract `sealedbounty-v3.testnet` (admin `baldingsucks7993.testnet`), deploy tx `3veF1zS6cuu1xAhoup8vtiq17FoXqqbNNGD891j8Vf2p`. Signers: the two attested keys above (`add_signer` txs `6dwB3y2X…`, `EjkNbYWL…`).
+- Live demo program: **1** "vuln-app demo (v3)" (`create_program` tx `BQ94ZkNELjxoae1wr7MvW7syyK8gWeX5Gryo7xT1ZXDD`; payouts 0.05/0.1/0.2/0.3, dispute 180 s, challenge 150 s, bond 0.05, min_confidence 80; params_hash `61b52e7b87e42a2bc4b6f417d21ba0e9d44f3e1f4ff49fa9d2f3334e5aa0eda7`). Program 0 was created with a wrong `repo_url`, then closed and refunded.
+- Claims on program 1: 0 Paid (after a challenge answered by `prove_ciphertext`), 1 Rejected `params tampered` (real TEE-signed attack, `fixtures/attack.params-tampered.json`), 2 `code mismatch`, 3 `hunter mismatch`, 4 `undecryptable report`. The README has the tx table.
+- History: v2 `sealedbounty-v2.testnet`, v1 `escrow.baldingsucks7993.testnet`.
