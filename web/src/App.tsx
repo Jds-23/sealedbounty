@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { HashRouter, NavLink, Route, Routes } from 'react-router-dom';
+import { HashRouter, Navigate, NavLink, Outlet, Route, Routes, useLocation } from 'react-router-dom';
+import { Tour } from './tour/Tour';
 import { DataProvider, useData, type Mode } from './data';
 import { CONTRACT_ID, explorerAccount } from './lib/near';
 import { Programs } from './pages/Programs';
@@ -85,34 +86,52 @@ function ModeBar() {
   );
 }
 
-export function App() {
+/** The explorer (programs, claims, inbox, how): its own data provider, so the tour never triggers its RPC loads. */
+function ExplorerLayout() {
   return (
     <DataProvider>
-      <HashRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
-        <header className="top">
-          <div className="brand">
-            <span className="lock">🔒</span> SealedBounty
-          </div>
-          <nav>
-            <NavLink to="/" end>
-              Programs
-            </NavLink>
-            <NavLink to="/inbox">Owner inbox</NavLink>
-            <NavLink to="/how">How it works</NavLink>
-          </nav>
-          <ThemeToggle />
-        </header>
-        <ModeBar />
-        <main>
-          <Routes>
-            <Route path="/" element={<Programs />} />
-            <Route path="/program/:id" element={<ProgramDetail />} />
-            <Route path="/inbox" element={<Inbox />} />
-            <Route path="/how" element={<HowItWorks />} />
-          </Routes>
-        </main>
-        <footer className="muted small">Read-only. No wallet, no backend. Writes happen through the SealedBounty CLI.</footer>
-      </HashRouter>
+      <header className="top">
+        <div className="brand">
+          <span className="lock">🔒</span> SealedBounty
+        </div>
+        <nav>
+          <NavLink to="/tour/1">Tour</NavLink>
+          <NavLink to="/programs">Programs</NavLink>
+          <NavLink to="/inbox">Owner inbox</NavLink>
+          <NavLink to="/how">How it works</NavLink>
+        </nav>
+        <ThemeToggle />
+      </header>
+      <ModeBar />
+      <main>
+        <Outlet />
+      </main>
+      <footer className="muted small">Read-only. No wallet, no backend. Writes happen through the SealedBounty CLI.</footer>
     </DataProvider>
+  );
+}
+
+/** `#/?autoplay=1` keeps its query on the way to `#/tour/1`. */
+function ToTour() {
+  const { search } = useLocation();
+  return <Navigate to={`/tour/1${search}`} replace />;
+}
+
+export function App() {
+  return (
+    <HashRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <Routes>
+        <Route path="/" element={<ToTour />} />
+        <Route path="/tour" element={<ToTour />} />
+        <Route path="/tour/:step" element={<Tour />} />
+        <Route element={<ExplorerLayout />}>
+          <Route path="/programs" element={<Programs />} />
+          <Route path="/program/:id" element={<ProgramDetail />} />
+          <Route path="/inbox" element={<Inbox />} />
+          <Route path="/how" element={<HowItWorks />} />
+        </Route>
+        <Route path="*" element={<ToTour />} />
+      </Routes>
+    </HashRouter>
   );
 }

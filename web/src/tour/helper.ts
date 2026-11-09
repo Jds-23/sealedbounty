@@ -9,8 +9,11 @@
 export const HELPER_URL: string = (import.meta.env.VITE_DEMO_HELPER as string | undefined) || 'http://localhost:8787';
 
 export interface HelperHealth {
-  ok: true;
+  /** false = the helper answers but is not configured (e.g. DEMO_LIVE_PROGRAM_ID unset): live lanes stay hidden. */
+  ok: boolean;
   programId: number | null;
+  contractId: string | null;
+  reason: string | null;
 }
 
 export interface Judgement {
@@ -33,24 +36,34 @@ export interface HelperEvent {
   claimId?: number;
   message?: string;
   outcome?: unknown;
+  /** wait step: seconds left until finalize */
+  remaining?: number;
   [k: string]: unknown;
 }
 
-/** GET /health within 1 s; null if the helper is absent, slow or answers anything but ok. */
+/**
+ * GET /health within 1 s. null = no helper (absent, slow, not JSON). {ok:false, reason} = present but not configured.
+ */
 export async function probeHelper(timeoutMs = 1000): Promise<HelperHealth | null> {
   try {
     const r = await fetch(`${HELPER_URL}/health`, { signal: AbortSignal.timeout(timeoutMs) });
-    if (!r.ok) return null;
-    const j = await r.json();
-    if (!j || j.ok !== true) return null;
+    const j = await r.json().catch(() => null);
+    if (!j || typeof j !== 'object') return null;
     const pid = Number(j.programId ?? j.program_id);
-    return { ok: true, programId: Number.isInteger(pid) ? pid : null };
+    const ok = j.ok === true && r.ok;
+    return {
+      ok,
+      programId: Number.isInteger(pid) && j.programId != null ? pid : null,
+      contractId: typeof j.contractId === 'string' ? j.contractId : null,
+      reason: ok ? null : String(j.reason ?? j.error ?? `HTTP ${r.status}`),
+    };
   } catch {
     return null;
   }
 }
 
 const errText = async (r: Response) => {
+  if (r.status === 409) return 'helper busy: another live write is running, try again when it ends';
   const t = await r.text().catch(() => '');
   try {
     const j = JSON.parse(t);
@@ -124,7 +137,7 @@ export function parseSSE(buf: string): { events: HelperEvent[]; rest: string } {
 }
 
 /** POST an SSE endpoint; calls onEvent for each event; resolves with the final {step:'end'} event. */
-export async function streamHelper(path: '/loop' | '/frontrun', body: unknown, onEvent: (e: HelperEvent) => void, signal?: AbortSignal): Promise<HelperEvent> {
+export async function streamHelper(path: '/loop' | '/frontrun' | '/frontrun?resubmit=1', body: unknown, onEvent: (e: HelperEvent) => void, signal?: AbortSignal): Promise<HelperEvent> {
   const r = await fetch(`${HELPER_URL}${path}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
