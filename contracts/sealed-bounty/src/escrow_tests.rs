@@ -126,6 +126,7 @@ fn create(
         "b3duZXJwdWI=".into(),
         secs,
         min_conf,
+        U128(0),
     )
 }
 
@@ -751,6 +752,7 @@ fn create_v2(c: &mut Contract) -> u64 {
         "b3duZXJwdWI=".into(),
         60,
         0,
+        U128(0),
     )
 }
 
@@ -835,6 +837,7 @@ fn create_program_bad_code_hash() {
         "k".into(),
         60,
         0,
+        U128(0),
     );
 }
 
@@ -1152,4 +1155,84 @@ fn dispute_after_resubmission_panics() {
     let real = submit_v2(&mut c, hunter(), pid, &body);
     ctx(owner(), 0, T0);
     c.dispute(real, body);
+}
+
+// ---------------- v3 #4: hunter bond ----------------
+
+const BOND: u128 = NEAR;
+
+/// Live-fixture program with `bond`, the real system prompt hash (finalizable) or `x` (disputable).
+fn bonded_program(c: &mut Contract, prompt_hash: String) -> u64 {
+    ctx(owner(), 20 * NEAR, T0);
+    c.create_program(
+        "bonded".into(),
+        REPO.into(),
+        COMMIT.into(),
+        Fx::load(LIVE_ED).s("model"),
+        prompt_hash,
+        CODE_HASH_PLACEHOLDER.into(),
+        payouts(),
+        "b3duZXJwdWI=".into(),
+        60,
+        0,
+        U128(BOND),
+    )
+}
+
+#[test]
+#[should_panic(expected = "insufficient bond")]
+fn submit_without_bond_panics() {
+    // Storage-only deposit used to be enough to reserve 5 NEAR of the pool.
+    let mut c = setup();
+    let pid = bonded_program(&mut c, Fx::load(LIVE_ED).system_prompt_hash());
+    assert_eq!(c.get_program(pid).unwrap().bond.0, BOND);
+    submit_as(&mut c, hunter(), pid, &Fx::load(LIVE_ED), NEAR / 2, T0);
+}
+
+#[test]
+fn bond_held_then_returned_on_paid() {
+    let mut c = setup();
+    let pid = bonded_program(&mut c, Fx::load(LIVE_ED).system_prompt_hash());
+    let bal = c.get_program(pid).unwrap().balance.0;
+    let cid = submit_as(&mut c, hunter(), pid, &Fx::load(LIVE_ED), 2 * NEAR, T0);
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(cl.bond.0, BOND);
+    // Refund = attached - storage - bond.
+    let t = transfers();
+    assert_eq!(t.len(), 1);
+    assert!(t[0].1 > NEAR / 2 && t[0].1 < NEAR, "refund {}", t[0].1);
+    let p = c.get_program(pid).unwrap();
+    assert_eq!((p.balance.0, p.reserved.0), (bal - 5 * NEAR, 5 * NEAR));
+    ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+    drop(c.finalize(cid));
+    assert_eq!(transfers(), vec![(hunter(), 5 * NEAR + BOND)]);
+    assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Paid);
+}
+
+#[test]
+fn bond_forfeited_to_pool_on_rejected() {
+    let mut c = setup();
+    let pid = bonded_program(&mut c, tee::sha256_hex(b"x"));
+    let bal = c.get_program(pid).unwrap().balance.0;
+    let f = Fx::load(LIVE_ED);
+    let cid = submit_as(&mut c, hunter(), pid, &f, 2 * NEAR, T0);
+    ctx(owner(), 0, T0 + NANOS_PER_SEC);
+    c.dispute(cid, f.request_body());
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(cl.status, ClaimStatus::Rejected);
+    let p = c.get_program(pid).unwrap();
+    assert_eq!(p.reserved.0, 0);
+    assert_eq!(p.balance.0, bal + BOND, "bond forfeited to the pool");
+    assert!(transfers().is_empty());
+}
+
+#[test]
+fn bond_json_shape() {
+    let mut c = setup();
+    let pid = bonded_program(&mut c, Fx::load(LIVE_ED).system_prompt_hash());
+    let cid = submit_as(&mut c, hunter(), pid, &Fx::load(LIVE_ED), 2 * NEAR, T0);
+    let p = serde_json::to_value(c.get_program(pid).unwrap()).unwrap();
+    assert_eq!(p["bond"], BOND.to_string());
+    let cl = serde_json::to_value(c.get_claim(cid).unwrap()).unwrap();
+    assert_eq!(cl["bond"], BOND.to_string());
 }

@@ -58,6 +58,8 @@ pub struct Program {
     pub system_prompt_hash: String,
     /// sha256hex of the canonical code bundle (64 lowercase hex). v2.
     pub code_hash: String,
+    /// Hunter stake (yocto) attached on top of storage to `submit_claim`. v3 #4.
+    pub bond: U128,
     pub payouts: Payouts,
     pub owner_enc_pubkey: String,
     pub dispute_secs: u64,
@@ -97,6 +99,8 @@ pub struct Claim {
     pub submitted_at: U64,
     pub finalize_after: U64,
     pub reject_reason: Option<String>,
+    /// Hunter bond held by this claim: returned on Paid, forfeited to the pool on Rejected. v3 #4.
+    pub bond: U128,
 }
 
 #[near]
@@ -309,6 +313,7 @@ impl Contract {
         owner_enc_pubkey: String,
         dispute_secs: u64,
         min_confidence: u8,
+        bond: U128,
     ) -> u64 {
         let system_prompt_hash = tee::normalize_hash_hex(&system_prompt_hash)
             .unwrap_or_else(|_| env::panic_str("system_prompt_hash must be 64 hex chars"));
@@ -336,6 +341,7 @@ impl Contract {
                 model_id: model_id.clone(),
                 system_prompt_hash,
                 code_hash,
+                bond,
                 payouts,
                 owner_enc_pubkey,
                 dispute_secs,
@@ -479,6 +485,7 @@ impl Contract {
                 submitted_at: U64(now),
                 finalize_after: U64(finalize_after),
                 reject_reason: None,
+                bond: U128(0),
             },
         );
         self.programs.flush();
