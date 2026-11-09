@@ -24,10 +24,16 @@ export const explorerTx = (h: string) => `${EXPLORER}/txns/${h}`;
 
 const b64 = (s: string) => btoa(unescape(encodeURIComponent(s)));
 
-async function viewAt<T>(url: string, method: string, args: Record<string, unknown>): Promise<T> {
+/** Per-call overrides (the tour uses a 4 s timeout and, with an explicit VITE_NEAR_RPC, that RPC only). */
+export interface RpcOpts {
+  urls?: string[];
+  timeoutMs?: number;
+}
+
+async function viewAt<T>(url: string, method: string, args: Record<string, unknown>, timeoutMs = 8000): Promise<T> {
   const res = await fetch(url, {
     method: 'POST',
-    signal: AbortSignal.timeout(8000),
+    signal: AbortSignal.timeout(timeoutMs),
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       jsonrpc: '2.0',
@@ -53,14 +59,28 @@ async function viewAt<T>(url: string, method: string, args: Record<string, unkno
 /** Contract-level errors (CodeDoesNotExist, panics) are final; transport errors (429, 5xx, timeout) try the next RPC. */
 const isContractError = (m: string) => /CodeDoesNotExist|AccountDoesNotExist|GuestPanic|MethodNotFound|wasm execution/i.test(m);
 
-export async function view<T>(method: string, args: Record<string, unknown> = {}): Promise<T> {
+export async function view<T>(method: string, args: Record<string, unknown> = {}, opts: RpcOpts = {}): Promise<T> {
+  if (opts.urls) return viewVia<T>(opts.urls, method, args, opts.timeoutMs);
   let last: Error = new Error('no RPC configured');
   for (let i = 0; i < RPC_URLS.length; i++) {
     const idx = (rpcStart + i) % RPC_URLS.length;
     try {
-      const r = await viewAt<T>(RPC_URLS[idx], method, args);
+      const r = await viewAt<T>(RPC_URLS[idx], method, args, opts.timeoutMs);
       rpcStart = idx;
       return r;
+    } catch (e) {
+      last = e as Error;
+      if (isContractError(last.message)) throw last;
+    }
+  }
+  throw last;
+}
+
+async function viewVia<T>(urls: string[], method: string, args: Record<string, unknown>, timeoutMs?: number): Promise<T> {
+  let last: Error = new Error('no RPC configured');
+  for (const url of urls) {
+    try {
+      return await viewAt<T>(url, method, args, timeoutMs);
     } catch (e) {
       last = e as Error;
       if (isContractError(last.message)) throw last;
@@ -176,32 +196,33 @@ async function paged<T>(fetchPage: (from: number) => Promise<unknown[]>, parse: 
   }
 }
 
-export const getSigners = async (): Promise<SignerEntry[]> => normaliseSigners(await view('get_signers'));
+export const getSigners = async (opts?: RpcOpts): Promise<SignerEntry[]> => normaliseSigners(await view('get_signers', {}, opts));
 export const listPrograms = () => paged((from_index) => view<unknown[]>('list_programs', { from_index, limit: PAGE }), parseProgram);
-export const getProgram = async (id: number) => {
-  const r = await view<unknown>('get_program', { id });
+export const getProgram = async (id: number, opts?: RpcOpts) => {
+  const r = await view<unknown>('get_program', { id }, opts);
   return r == null ? null : parseProgram(r);
 };
 export const listClaims = (program_id: number) =>
   paged((from_index) => view<unknown[]>('list_claims', { program_id, from_index, limit: PAGE }), parseClaim);
-export const getClaim = async (id: number) => {
-  const r = await view<unknown>('get_claim', { id });
+export const getClaim = async (id: number, opts?: RpcOpts) => {
+  const r = await view<unknown>('get_claim', { id }, opts);
   return r == null ? null : parseClaim(r);
 };
 export const getOwner = () => view<string>('get_owner');
 /** v3 #6: is_signer_revoked for each signer. Returns null if the view is unavailable (pre-v3 contract, RPC down). */
-export async function getRevoked(signers: string[]): Promise<Set<string> | null> {
+export async function getRevoked(signers: string[], opts?: RpcOpts & { strict?: boolean }): Promise<Set<string> | null> {
   try {
-    const flags = await Promise.all([...new Set(signers)].map(async (signer) => [signer, await view<boolean>('is_signer_revoked', { signer })] as const));
+    const flags = await Promise.all([...new Set(signers)].map(async (signer) => [signer, await view<boolean>('is_signer_revoked', { signer }, opts)] as const));
     return new Set(flags.filter(([, r]) => r === true).map(([s]) => s));
-  } catch {
+  } catch (e) {
+    if (opts?.strict) throw e;
     return null;
   }
 }
 
 // ---- explorer lookups (best effort, nearblocks v3 public API) ----
 
-const NB_API = 'https://api-testnet.nearblocks.io/v3';
+export const NB_API = 'https://api-testnet.nearblocks.io/v3';
 let paidTxCache: Promise<Record<number, string>> | null = null;
 
 /**
@@ -233,13 +254,13 @@ export function paidClaimIds(txResult: unknown): number[] {
 }
 
 /** RPC `tx` (read-only status lookup) with the same fallback order as `view`. */
-async function rpcTx(hash: string, sender: string): Promise<unknown> {
+export async function rpcTx(hash: string, sender: string, opts: RpcOpts = {}): Promise<unknown> {
   let last: Error = new Error('no RPC configured');
-  for (const url of RPC_URLS) {
+  for (const url of opts.urls ?? RPC_URLS) {
     try {
       const res = await fetch(url, {
         method: 'POST',
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(opts.timeoutMs ?? 8000),
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 'sb', method: 'tx', params: { tx_hash: hash, sender_account_id: sender, wait_until: 'FINAL' } }),
       });
@@ -280,4 +301,109 @@ export function findPaidTxs(): Promise<Record<number, string>> {
     return out;
   })();
   return paidTxCache;
+}
+
+// ---- tx-args reader (guided tour): a contract call's args, outcome and events from an RPC `tx` result ----
+
+export interface SbEvent {
+  event: string;
+  data: Record<string, any>;
+}
+
+export interface DecodedTx {
+  hash: string;
+  signer: string;
+  method: string | null;
+  /** JSON args of the first FunctionCall (null if not JSON). */
+  args: Record<string, any> | null;
+  /** The tx and every receipt succeeded. */
+  ok: boolean;
+  /** Panic / error text of the first failed receipt ("Smart contract panicked: already claimed"). */
+  failure: string | null;
+  /** sealedbounty events from successful receipts. */
+  events: SbEvent[];
+  /** Claims this tx acted on: the claim_id arg, or the claim_submitted event of a submit_claim. */
+  claimIds: number[];
+  /** Claims a finalize actually paid (claim_paid minus payout_failed; see paidClaimIds). */
+  paidClaimIds: number[];
+  rejected: { claim_id: number; reason: string }[];
+  /** ns block timestamp, when the caller knows it (nearblocks list). */
+  blockTimestamp: string | null;
+}
+
+const b64ToUtf8 = (b: string) => new TextDecoder().decode(Uint8Array.from(atob(b), (c) => c.charCodeAt(0)));
+
+function failureText(st: unknown): string | null {
+  if (!st || typeof st !== 'object' || !('Failure' in st)) return null;
+  const f = (st as any).Failure;
+  const exec = f?.ActionError?.kind?.FunctionCallError?.ExecutionError;
+  return typeof exec === 'string' ? exec : JSON.stringify(f).slice(0, 200);
+}
+
+/** Decodes an RPC `tx` result (live, or the trimmed copy in tour-v3-snapshot.json). Pure; tolerates odd shapes. */
+export function decodeTx(raw: unknown, blockTimestamp: string | null = null): DecodedTx {
+  const r = raw as any;
+  const t = r?.transaction ?? {};
+  const fc = ((t.actions ?? []) as any[]).find((a) => a && typeof a === 'object' && a.FunctionCall)?.FunctionCall;
+  let args: Record<string, any> | null = null;
+  try {
+    const j = JSON.parse(b64ToUtf8(fc?.args ?? ''));
+    if (j && typeof j === 'object') args = j;
+  } catch {
+    /* not JSON */
+  }
+  const receipts = ((r?.receipts_outcome ?? []) as any[]).map((x) => x?.outcome ?? {});
+  const failure = failureText(r?.status) ?? receipts.map((o) => failureText(o.status)).find(Boolean) ?? null;
+  const events: SbEvent[] = [];
+  for (const o of receipts) {
+    if (failureText(o.status)) continue;
+    for (const log of (o.logs ?? []) as unknown[]) {
+      if (typeof log !== 'string' || !log.startsWith('EVENT_JSON:')) continue;
+      try {
+        const ev = JSON.parse(log.slice('EVENT_JSON:'.length));
+        if (ev?.standard !== 'sealedbounty') continue;
+        for (const d of Array.isArray(ev.data) ? ev.data : [ev.data]) events.push({ event: String(ev.event), data: d ?? {} });
+      } catch {
+        /* not an event */
+      }
+    }
+  }
+  const ids = new Set<number>();
+  if (Number.isInteger(args?.claim_id)) ids.add(args!.claim_id);
+  for (const e of events) if (e.event === 'claim_submitted' && Number.isInteger(e.data.claim_id)) ids.add(e.data.claim_id);
+  return {
+    hash: String(t.hash ?? ''),
+    signer: String(t.signer_id ?? ''),
+    method: fc?.method_name ?? null,
+    args,
+    ok: failure === null && r?.status != null,
+    failure,
+    events,
+    claimIds: [...ids],
+    paidClaimIds: paidClaimIds(raw),
+    rejected: events.filter((e) => e.event === 'claim_rejected').map((e) => ({ claim_id: e.data.claim_id, reason: e.data.reason })),
+    blockTimestamp,
+  };
+}
+
+export interface NbTxRow {
+  hash: string;
+  signer: string;
+  method: string | null;
+  ok: boolean;
+  blockTimestamp: string;
+}
+
+/** The contract's recent txs from the public nearblocks API (hash, signer, method; no args). */
+export async function listContractTxs(opts: { timeoutMs?: number; limit?: number } = {}): Promise<NbTxRow[]> {
+  const res = await fetch(`${NB_API}/accounts/${CONTRACT_ID}/txns?limit=${opts.limit ?? 100}`, { signal: AbortSignal.timeout(opts.timeoutMs ?? 8000) });
+  if (!res.ok) throw new Error(`nearblocks HTTP ${res.status}`);
+  const j = await res.json();
+  return ((j?.data ?? []) as any[]).map((t) => ({
+    hash: String(t.transaction_hash),
+    signer: String(t.signer_account_id),
+    method: t.actions?.find((a: any) => a?.method)?.method ?? null,
+    ok: t.outcomes?.status === true,
+    blockTimestamp: String(t.block_timestamp ?? t.block?.block_timestamp ?? '0'),
+  }));
 }

@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "sync-fixtures": "node scripts/sync-fixtures.mjs"
+    "sync-fixtures": "node scripts/sync-fixtures.mjs",
+    "record-tour-snapshot": "node scripts/record-tour-snapshot.mjs"
   },
   "dependencies": {
     "@sealedbounty/shared": "link:../shared",

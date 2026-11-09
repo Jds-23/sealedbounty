@@ -100,7 +100,7 @@ export function ProgramDetail() {
   if (!p)
     return (
       <p>
-        Program {id} not found. <Link to="/">Back</Link>
+        Program {id} not found. <Link to="/programs">Back</Link>
       </p>
     );
   const bundleChecked = isDemo && p.code_hash === DEMO_CODE_BUNDLE.code_hash ? sha256hex(DEMO_CODE_BUNDLE.bundle) === p.code_hash : null;
@@ -108,7 +108,7 @@ export function ProgramDetail() {
 
   return (
     <section>
-      <Link to="/" className="muted small">
+      <Link to="/programs" className="muted small">
         ← all programs
       </Link>
       <div className="row between">

@@ -16,6 +16,15 @@
   --code-bg: #eef1f4;
   --mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  /* extensions (guided tour): a display stack, hairlines, a recessed surface, one easing, one fade */
+  --display: ui-sans-serif, -apple-system, 'SF Pro Display', 'Segoe UI Variable Display', system-ui, sans-serif;
+  --surface-2: #eef1f5;
+  --line: #e4e8ed;
+  --faint: #9aa5b2;
+  --grid: rgba(21, 25, 30, 0.035);
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --t-fade: 200ms;
+  --stagger: 120ms;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
@@ -35,6 +44,10 @@
     --info: #7aa7f0;
     --info-bg: #142033;
     --code-bg: #1a2129;
+    --surface-2: #0e1217;
+    --line: #1c232c;
+    --faint: #5d6976;
+    --grid: rgba(227, 232, 238, 0.025);
     color-scheme: dark;
   }
 }
@@ -54,6 +67,10 @@
   --info: #7aa7f0;
   --info-bg: #142033;
   --code-bg: #1a2129;
+  --surface-2: #0e1217;
+  --line: #1c232c;
+  --faint: #5d6976;
+  --grid: rgba(227, 232, 238, 0.025);
   color-scheme: dark;
 }
 

@@ -6,6 +6,7 @@ export default defineConfig({
   base: './',
   // shared/ is linked from ../shared; use web's copies of its deps (one ethers in the bundle).
   resolve: { dedupe: ['ethers', 'tweetnacl'] },
-  server: { fs: { allow: ['.', '../shared'] } },
+  // ../fixtures: the tour imports fixtures/exploits/*.md?raw (bundled at build time).
+  server: { fs: { allow: ['.', '../shared', '../fixtures'] } },
   test: { environment: 'node', server: { deps: { inline: ['@sealedbounty/shared'] } } },
 });
