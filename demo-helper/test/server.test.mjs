@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { afterEach, describe, it } from 'node:test';
 import { createHelperServer } from '../src/server.mjs';
-import { FAKE_API_KEY, FAKE_PRIVATE_KEY, ORIGIN, fakeChain, http, jsonHeaders, listen, makeJudgement, parseSse } from './helpers.mjs';
+import { FAKE_API_KEY, FAKE_PRIVATE_KEY, ORIGIN, fakeChain, http, jsonHeaders, listen, makeJudgement, parseSse, sha256hex } from './helpers.mjs';
 
 const baseConfig = {
   programId: 2,
@@ -146,6 +147,65 @@ describe('key redaction', () => {
     const all = r.text + logs.join('\n');
     assert.ok(!all.includes(FAKE_API_KEY));
     assert.ok(!all.includes(FAKE_PRIVATE_KEY.slice(8)));
+  });
+});
+
+describe('signed data is never rewritten', () => {
+  // Real bundle (contains "Bearer session token" / .replace(/^Bearer /, '')) plus key-shaped strings in the report.
+  const bundle = readFileSync(new URL('../../fixtures/vuln-app/bundle.txt', import.meta.url), 'utf8');
+  const report = `# token bypass\nsend Authorization: Bearer abc\nkey sk-xxxxxxxxxxxxxxxxxxxx\npk ${FAKE_PRIVATE_KEY}\n`;
+  function signedRecord() {
+    const request_body = JSON.stringify({
+      model: 'Qwen/Qwen3.8-27B',
+      messages: [
+        { role: 'system', content: 'judge' },
+        { role: 'user', content: `TARGET x@y\nHUNTER hunter.baldingsucks7993.testnet\n\nCODE\n${bundle}\n\nREPORT\n${report}` },
+      ],
+    });
+    const response = JSON.stringify({ id: 'chatcmpl-9', choices: [{ message: { content: 'uses Bearer abc and sk-xxxxxxxxxxxxxxxxxxxx' } }] });
+    return makeJudgement({ request_body, req_hash: sha256hex(request_body), response_body_b64: Buffer.from(response).toString('base64'), chat_id: 'chatcmpl-9' });
+  }
+
+  it('POST /judge returns request_body / response_body_b64 byte-identical, and /loop accepts it', async () => {
+    const deps = fakeChain();
+    const rec = signedRecord();
+    deps.judge = async () => rec;
+    const { base } = await start({ deps });
+    const r = await http(base, { method: 'POST', path: '/judge', headers: jsonHeaders(), body: { exploitMarkdown: report } });
+    assert.equal(r.status, 200, r.text);
+    const j = JSON.parse(r.text);
+    assert.equal(j.request_body, rec.request_body);
+    assert.equal(j.response_body_b64, rec.response_body_b64);
+    assert.equal(sha256hex(j.request_body), j.req_hash);
+    assert.equal(j.req_hash, rec.req_hash);
+    const loop = await http(base, { method: 'POST', path: '/loop', headers: jsonHeaders(), body: { judgement: j } });
+    assert.equal(loop.status, 200, loop.text);
+    assert.equal(parseSse(loop.text).at(-1).outcome, 'Paid');
+  });
+
+  it('a success payload containing the literal API key fails with 500 instead of being mutated', async () => {
+    const deps = fakeChain();
+    deps.judge = async () => makeJudgement({ chat_id: `chat-${FAKE_API_KEY}` });
+    const { base, logs } = await start({ deps });
+    const r = await http(base, { method: 'POST', path: '/judge', headers: jsonHeaders(), body: { exploitMarkdown: '# x' } });
+    assert.equal(r.status, 500);
+    assert.match(JSON.parse(r.text).error, /secret/);
+    assert.ok(!(r.text + logs.join('\n')).includes(FAKE_API_KEY));
+  });
+
+  it('SSE: signed-data fields pass through untouched; only message fields are pattern-redacted', async () => {
+    const deps = fakeChain();
+    const submit = deps.submit;
+    deps.submit = async (a) => ({ ...(await submit(a)), tx: 'Bearer abc123' });
+    deps.flagUndecryptable = async () => {
+      throw new Error(`panic: Bearer sometoken ${FAKE_PRIVATE_KEY}`);
+    };
+    const { base } = await start({ deps });
+    const events = parseSse((await http(base, { method: 'POST', path: '/loop', headers: jsonHeaders(), body: { judgement: signedRecord() } })).text);
+    assert.equal(events.find((e) => e.step === 'submit_claim' && e.status === 'done').tx, 'Bearer abc123');
+    const err = events.find((e) => e.status === 'error');
+    assert.ok(!err.message.includes('sometoken'));
+    assert.ok(!err.message.includes(FAKE_PRIVATE_KEY.slice(8)));
   });
 });
 
