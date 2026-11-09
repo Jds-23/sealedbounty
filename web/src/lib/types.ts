@@ -74,6 +74,15 @@ export interface Claim {
    * Shown so the real TEE outputs for refused reports are visible; never set from RPC data.
    */
   refused_at_submit?: string;
+  /**
+   * Demo only: a claim built from a real fixture whose request body was changed offline (no NEAR AI call),
+   * so there is no TEE signature over it. Explains what was changed; never set from RPC data.
+   */
+  synthetic?: string;
+  /** Demo only: what happened to the claim, in order (flag, prove, finalize...). */
+  history?: { at: string; event: string }[];
+  /** Demo only: the ephemeral secret the hunter revealed with prove_ciphertext (a public tx arg). */
+  proof_secret?: string;
 }
 
 export interface SignerMeta {
