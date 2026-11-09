@@ -129,7 +129,7 @@ pnpm sb claims 1          # → 0 Paid (critical, CWE-89) | 1 Rejected (params t
                           #   | 3 frontrun.… Rejected (hunter mismatch) | 4 Rejected (undecryptable report)
 pnpm sb verify-claim --claim 0   # → re-checks the TEE signature over model:req_hash:resp_hash from onchain fields → 7 PASS, ALL PASS
 pnpm sb verify-fixture ../fixtures/attack.params-tampered.json   # → genuine TEE signature on valid/critical/100;
-                          #   only "inputs rebuild request_body exactly" FAILs (the params were changed)
+                          #   only "inputs rebuild request_body exactly" FAILs (the params were changed), so it exits 1
 ```
 
 `verify-claim --claim 1` and `--claim 2` also pass: those attacks have genuine TEE signatures. Only the revealed
@@ -267,8 +267,9 @@ payouts 0.1/0.2/0.3/0.5, 90 s window) paid claim 0, a live IDOR report (high, 98
      (11 `PASS` lines), `checkRequestAgainstProgram  ok: a dispute would fail`, the request body encrypted to a
      throwaway key, the exact `submit_claim` args, the storage deposit (about 0.1225 NEAR) plus the 0.05 NEAR bond,
      and `--dry-run: not sent`. No network is used.
-5. Run `make test-cli` to see `Tests 83 passed (83)`, and `make test-web` to see `Tests 125 passed (125)`. The shared
-   library's own tests run with `pnpm test` in `shared/` (`tests 14`, `pass 14`).
+5. Run `make test-cli` to see `Tests 83 passed (83)`, and `make test-web` to see `Tests 124 passed | 1 skipped (125)`
+   (the skipped test needs the v1 owner key file, which only exists on the deployer's machine, where all 125 pass).
+   The shared library's own tests run with `pnpm test` in `shared/` (`tests 14`, `pass 14`).
 6. Run `make test-contract` (the first run takes a few minutes to compile and download `near-sandbox`). You should see
    `124 passed` unit tests plus 5 near-sandbox E2E tests: `escrow_end_to_end_live_fixtures`,
    `escrow_end_to_end_v2_demo_fixtures`, `escrow_end_to_end_decryption_challenge` and
