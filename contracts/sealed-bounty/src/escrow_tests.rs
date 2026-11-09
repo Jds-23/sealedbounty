@@ -456,14 +456,34 @@ fn submit_duplicate_uppercase_hash() {
     submit(&mut c, pid, &f);
 }
 
+/// v3 #5: an attacker copies a signed judgement into their own look-alike program B (never
+/// disputed). That must not burn the req_hash for the real program A.
 #[test]
-#[should_panic(expected = "already claimed")]
-fn submit_duplicate_across_programs() {
+fn cross_program_copy_does_not_burn_hash() {
     let mut c = setup();
     let a = live_program(&mut c, 0, 60, 20 * NEAR);
     let b = live_program(&mut c, 0, 60, 20 * NEAR);
-    submit(&mut c, a, &Fx::load(LIVE_ED));
+    let f = Fx::load(LIVE_ED);
+    let copied = submit_as(&mut c, stranger(), b, &f, NEAR, T0);
+    assert_eq!(c.get_claim(copied).unwrap().program_id, b);
+    let real = submit_as(&mut c, hunter(), a, &f, NEAR, T0);
+    let rc = c.get_claim(real).unwrap();
+    assert_eq!(
+        (rc.program_id, rc.hunter, rc.status),
+        (a, hunter(), ClaimStatus::Pending)
+    );
+}
+
+#[test]
+#[should_panic(expected = "already claimed")]
+fn submit_duplicate_within_program_after_cross_program() {
+    // Dedupe is per program: a second submission to the SAME program still fails.
+    let mut c = setup();
+    let a = live_program(&mut c, 0, 60, 20 * NEAR);
+    let b = live_program(&mut c, 0, 60, 20 * NEAR);
     submit(&mut c, b, &Fx::load(LIVE_ED));
+    submit(&mut c, a, &Fx::load(LIVE_ED));
+    submit(&mut c, a, &Fx::load(LIVE_EC));
 }
 
 #[test]
