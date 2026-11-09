@@ -400,7 +400,7 @@ impl Contract {
 
     // ---------------- claims ----------------
 
-    /// Payable for storage; unused deposit is refunded to the caller.
+    /// Payable: storage + `program.bond` (else "insufficient bond"); the rest is refunded.
     #[payable]
     #[allow(clippy::too_many_arguments)]
     pub fn submit_claim(
@@ -455,6 +455,7 @@ impl Contract {
         let now = env::block_timestamp();
         let finalize_after = now + program.dispute_secs * NANOS_PER_SEC;
         let model = program.model_id.clone();
+        let bond = program.bond.0;
 
         let p = self.program_mut(program_id);
         p.balance = U128(p.balance.0 - payout);
@@ -485,14 +486,20 @@ impl Contract {
                 submitted_at: U64(now),
                 finalize_after: U64(finalize_after),
                 reject_reason: None,
-                bond: U128(0),
+                bond: U128(bond),
             },
         );
         self.programs.flush();
         self.claims.flush();
 
         let cost = charge_storage(before, attached);
-        let refund = attached.saturating_sub(cost);
+        require!(
+            attached.as_yoctonear() >= cost.as_yoctonear() + bond,
+            "insufficient bond"
+        );
+        let refund = attached
+            .saturating_sub(cost)
+            .saturating_sub(NearToken::from_yoctonear(bond));
         if !refund.is_zero() {
             Promise::new(hunter.clone()).transfer(refund).detach();
         }
@@ -500,7 +507,8 @@ impl Contract {
             "claim_submitted",
             json!({
                 "claim_id": id, "program_id": program_id, "hunter": hunter, "req_hash": req_hash,
-                "severity": severity, "payout": U128(payout), "finalize_after": U64(finalize_after),
+                "severity": severity, "payout": U128(payout), "bond": U128(bond),
+                "finalize_after": U64(finalize_after),
             }),
         );
         id
@@ -533,7 +541,7 @@ impl Contract {
         let reason = tamper_reason(program, &claim.hunter, &request_body)
             .unwrap_or_else(|| env::panic_str("dispute invalid: request matches program"));
 
-        let (program_id, payout) = (claim.program_id, claim.payout.0);
+        let (program_id, payout, bond) = (claim.program_id, claim.payout.0, claim.bond.0);
         if reason == HUNTER_MISMATCH {
             let req_hash = claim.req_hash.clone();
             self.used_req_hashes.remove(&req_hash);
@@ -543,14 +551,15 @@ impl Contract {
         c.reject_reason = Some(reason.to_string());
         let p = self.program_mut(program_id);
         p.reserved = U128(p.reserved.0 - payout);
-        p.balance = U128(p.balance.0 + payout);
+        // Payout back to the pool; the hunter's bond is forfeited to it too.
+        p.balance = U128(p.balance.0 + payout + bond);
         emit(
             "claim_rejected",
             json!({"claim_id": claim_id, "program_id": program_id, "reason": reason}),
         );
     }
 
-    /// Anyone, once the dispute window has passed. Pays the hunter.
+    /// Anyone, once the dispute window has passed. Pays the hunter `payout + bond`.
     pub fn finalize(&mut self, claim_id: u64) -> Promise {
         let c = self
             .claims
@@ -562,14 +571,15 @@ impl Contract {
             "dispute window open"
         );
         c.status = ClaimStatus::Paid;
-        let (program_id, payout, hunter) = (c.program_id, c.payout.0, c.hunter.clone());
+        let (program_id, payout, bond, hunter) =
+            (c.program_id, c.payout.0, c.bond.0, c.hunter.clone());
         let p = self.program_mut(program_id);
         p.reserved = U128(p.reserved.0 - payout);
         emit(
             "claim_paid",
-            json!({"claim_id": claim_id, "program_id": program_id, "hunter": hunter, "payout": U128(payout)}),
+            json!({"claim_id": claim_id, "program_id": program_id, "hunter": hunter, "payout": U128(payout), "bond": U128(bond)}),
         );
-        Promise::new(hunter).transfer(NearToken::from_yoctonear(payout))
+        Promise::new(hunter).transfer(NearToken::from_yoctonear(payout + bond))
     }
 
     // ---------------- views ----------------

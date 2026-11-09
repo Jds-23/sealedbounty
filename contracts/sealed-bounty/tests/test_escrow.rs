@@ -8,6 +8,8 @@ use near_sdk::serde_json::{self, Value, json};
 
 const NEAR: u128 = 10u128.pow(24);
 const DISPUTE_SECS: u64 = 20;
+/// Hunter bond for the v2 demo program (v3 #4).
+const BOND: u128 = NEAR / 2;
 /// code_hash for programs judged with v1 (live) bodies; never matches.
 const PLACEHOLDER_CODE_HASH: &str =
     "00000000000000000000000000000000000000000000000000000000000000c0";
@@ -232,6 +234,7 @@ impl Env {
             "payouts": { "low": (NEAR / 2).to_string(), "medium": NEAR.to_string(),
                          "high": (2 * NEAR).to_string(), "critical": (4 * NEAR).to_string() },
             "owner_enc_pubkey": "b3duZXJwdWI=", "dispute_secs": DISPUTE_SECS, "min_confidence": min_conf,
+            "bond": "0",
         });
         let r = self
             .ok(c, &self.owner, "create_program", args, deposit)
@@ -581,6 +584,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
         "payouts": { "low": (NEAR / 2).to_string(), "medium": NEAR.to_string(),
                      "high": (2 * NEAR).to_string(), "critical": (3 * NEAR).to_string() },
         "owner_enc_pubkey": "b3duZXJwdWI=", "dispute_secs": DISPUTE_SECS, "min_confidence": 80,
+        "bond": BOND.to_string(),
     });
     let pid: u64 = e
         .ok(&c, &e.owner, "create_program", args, 10 * NEAR)
@@ -588,7 +592,21 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
         .json()?;
     let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
     assert_eq!(p["code_hash"], code_hash, "stored lowercase");
+    assert_eq!(u128_of(&p["bond"]), BOND);
     let bal0 = u128_of(&p["balance"]);
+    // storage + bond
+    let dep = NEAR / 10 + BOND;
+
+    // storage-only deposit no longer reserves the pool (#4)
+    e.fail(
+        &c,
+        &e.hunter,
+        "submit_claim",
+        sqli.claim_args(pid),
+        NEAR / 10,
+        "insufficient bond",
+    )
+    .await;
 
     // bogus report: TEE said not valid
     e.fail(
@@ -596,7 +614,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
         &e.hunter,
         "submit_claim",
         bogus.claim_args(pid),
-        NEAR / 10,
+        dep,
         "verdict not payable",
     )
     .await;
@@ -608,7 +626,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
             &e.stranger,
             "submit_claim",
             sqli.claim_args(pid),
-            NEAR / 10,
+            dep,
         )
         .await
         .json()?;
@@ -617,7 +635,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
         &e.hunter,
         "submit_claim",
         sqli.claim_args(pid),
-        NEAR / 10,
+        dep,
         "already claimed",
     )
     .await;
@@ -630,8 +648,9 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
     let claim: Value = e.view(&c, "get_claim", json!({ "id": front })).await;
     assert_eq!(claim["status"], "Rejected");
     assert_eq!(claim["reject_reason"], "hunter mismatch");
+    assert_eq!(u128_of(&claim["bond"]), BOND);
     let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
-    assert_eq!(u128_of(&p["balance"]), bal0);
+    assert_eq!(u128_of(&p["balance"]), bal0 + BOND, "front-runner's bond forfeited");
     assert_eq!(u128_of(&p["reserved"]), 0);
 
     // ---- real hunter resubmits the same signed verdict ----
@@ -641,7 +660,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
             &e.hunter,
             "submit_claim",
             sqli.claim_args(pid),
-            NEAR / 10,
+            dep,
         )
         .await
         .json()?;
@@ -655,7 +674,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
         &e.hunter,
         "submit_claim",
         sqli_ec.claim_args(pid),
-        NEAR / 10,
+        dep,
         "already claimed",
     )
     .await;
@@ -678,13 +697,13 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
             &e.hunter,
             "submit_claim",
             fake.claim_args(pid),
-            NEAR / 10,
+            dep,
         )
         .await
         .json()?;
     let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
     assert_eq!(u128_of(&p["reserved"]), 6 * NEAR);
-    assert_eq!(u128_of(&p["balance"]), bal0 - 6 * NEAR);
+    assert_eq!(u128_of(&p["balance"]), bal0 + BOND - 6 * NEAR);
     let rf = json!({ "claim_id": fid, "request_body": fake.s("request_body") });
     let r = e.ok(&c, &e.owner, "dispute", rf, 0).await;
     println!("  [GAS] dispute code mismatch: {}", tgas(r.total_gas_burnt));
@@ -693,7 +712,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
     assert_eq!(claim["reject_reason"], "code mismatch");
     let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
     assert_eq!(u128_of(&p["reserved"]), 3 * NEAR, "fakecode payout back");
-    assert_eq!(u128_of(&p["balance"]), bal0 - 3 * NEAR);
+    assert_eq!(u128_of(&p["balance"]), bal0 + 2 * BOND - 3 * NEAR);
 
     // ---- finalize the honest sqli claim ----
     let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
@@ -702,13 +721,17 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
     let before = e.balance(&e.hunter).await;
     e.ok(&c, &e.stranger, "finalize", json!({ "claim_id": cid }), 0)
         .await;
-    assert_eq!(e.balance(&e.hunter).await - before, 3 * NEAR);
+    assert_eq!(
+        e.balance(&e.hunter).await - before,
+        3 * NEAR + BOND,
+        "payout + bond returned"
+    );
     let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
     assert_eq!(claim["status"], "Paid");
     e.fail(&c, &e.owner, "dispute", rb, 0, "claim not pending")
         .await;
     let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
     assert_eq!(u128_of(&p["reserved"]), 0);
-    assert_eq!(u128_of(&p["balance"]), bal0 - 3 * NEAR);
+    assert_eq!(u128_of(&p["balance"]), bal0 + 2 * BOND - 3 * NEAR);
     Ok(())
 }
