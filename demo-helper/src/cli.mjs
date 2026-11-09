@@ -13,8 +13,12 @@ export function parseSbOutput(out) {
   const txs = [...out.matchAll(TX_RE)].map((m) => m[1]);
   const claim = /^claim_id:\s*(\d+)\s*$/m.exec(out);
   const errs = [...out.matchAll(/^\s*(?:error|FAILED):\s*(.+?)\s*$/gm)].map((m) => m[1]);
-  return { tx: txs.at(-1) ?? null, claimId: claim ? Number(claim[1]) : null, error: errs.at(-1) ?? null };
+  // printChecks rows: "  FAIL  <name padded>  <detail>"
+  const fails = [...out.matchAll(/^\s*FAIL\s+(.+?)\s*$/gm)].map((m) => m[1].replace(/\s+/g, ' '));
+  return { tx: txs.at(-1) ?? null, claimId: claim ? Number(claim[1]) : null, error: errs.at(-1) ?? null, fails };
 }
+
+const failSuffix = (fails) => (fails.length ? ` (${fails.map((f) => `FAIL ${f}`).join('; ')})` : '');
 
 export function sbCommand(config, args) {
   return { cmd: 'pnpm', args: ['-s', '--dir', join(config.repoRoot, 'cli'), 'sb', '--contract', config.contractId, ...args] };
@@ -63,7 +67,7 @@ export function makeCliDeps({ config, runSb = defaultRunSb(config) }) {
     const { code, stdout, stderr } = await runSb(args);
     const out = `${stdout}\n${stderr}`;
     const p = parseSbOutput(out);
-    if (code !== 0) throw Object.assign(new Error(`sb ${args[0]} failed: ${p.error ?? (tail(out) || `exit ${code}`)}`), { tx: p.tx ?? undefined });
+    if (code !== 0) throw Object.assign(new Error(`sb ${args[0]} failed: ${p.error ?? (tail(out) || `exit ${code}`)}${failSuffix(p.fails)}`), { tx: p.tx ?? undefined });
     if (!p.tx) throw new Error(`sb ${args[0]}: no transaction hash in its output (${tail(out) || 'empty'})`);
     return p;
   }

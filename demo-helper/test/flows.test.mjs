@@ -103,13 +103,14 @@ describe('runFrontrun', () => {
     const out = await runFrontrun({ programId: 2, hunter: HUNTER, frontrun: FRONTRUN, deps, emit });
     assert.equal(out, 'Rejected: hunter mismatch');
     assert.deepEqual(
-      deps.calls.map((c) => c.slice(0, 2)),
+      deps.calls.map((c) => [c[0], c[0] === 'judge' ? c[1].split('\n\n---\nDemo run: ')[0] : c[1]]),
       [
-        ['judge', '# SQLi in /users'],
+        ['judge', '# SQLi in /users'], // the default exploit + a run-unique trailer
         ['submit', FRONTRUN],
         ['dispute', OWNER],
       ],
     );
+    assert.match(deps.calls[0][1], /\n\n---\nDemo run: \S+ #[0-9a-f]{6}$/);
     assert.deepEqual(seq(events), ['judge:pending', 'judge:done', 'submit_claim:pending', 'submit_claim:done', 'dispute:pending', 'dispute:done', 'end:Rejected: hunter mismatch']);
     assert.ok(events.find((e) => e.step === 'dispute' && e.status === 'done').tx);
   });

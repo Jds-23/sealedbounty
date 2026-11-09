@@ -5,7 +5,7 @@
 // deps: submit({record, account}) -> {tx, claimId}; flagUndecryptable / proveCiphertext / finalize /
 //       dispute({claimId, account}) -> {tx}; getProgram(id); getClaim(id); judge({exploitMarkdown});
 //       defaultExploit(); now() ms; sleep(ms)
-import { judgeResponse, toJudgeRecord } from './validate.mjs';
+import { judgeResponse, toJudgeRecord, withRunTrailer } from './validate.mjs';
 
 class StepError extends Error {
   constructor(message, tx) {
@@ -121,9 +121,10 @@ export function runFrontrun({ record, resubmit = false, programId, hunter, front
 
     if (!record) {
       await step(emit, 'judge', {}, `fresh TEE judgement bound to HUNTER ${hunter}`, async () => {
-        const j = judgeResponse(await deps.judge({ exploitMarkdown: await deps.defaultExploit() }));
+        const { report, runId } = withRunTrailer(await deps.defaultExploit()); // never-claimed req_hash
+        const j = judgeResponse(await deps.judge({ exploitMarkdown: report }));
         record = toJudgeRecord(j, { attested: true });
-        return { event: { message: j.verdict ? `${j.verdict.valid ? 'valid' : 'invalid'} ${j.verdict.severity} (${j.verdict.confidence})` : 'judged', chat_id: j.chat_id } };
+        return { event: { message: j.verdict ? `${j.verdict.valid ? 'valid' : 'invalid'} ${j.verdict.severity} (${j.verdict.confidence})` : 'judged', chat_id: j.chat_id, runId } };
       });
     }
 

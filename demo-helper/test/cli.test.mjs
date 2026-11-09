@@ -25,16 +25,17 @@ const PANIC = `-> ${OWNER} calls sealedbounty-v3.testnet.dispute  gas=100Tgas de
 
 describe('parseSbOutput', () => {
   it('extracts the tx hash and claim id', () => {
-    assert.deepEqual(parseSbOutput(SUBMIT_OK), { tx: TX, claimId: 12, error: null });
+    assert.deepEqual(parseSbOutput(SUBMIT_OK), { tx: TX, claimId: 12, error: null, fails: [] });
   });
   it('extracts the onchain panic', () => {
-    assert.deepEqual(parseSbOutput(PANIC), { tx: TX, claimId: null, error: 'Smart contract panicked: dispute window closed' });
+    assert.deepEqual(parseSbOutput(PANIC), { tx: TX, claimId: null, error: 'Smart contract panicked: dispute window closed', fails: [] });
   });
   it('extracts a CLI-level refusal (no tx)', () => {
     assert.deepEqual(parseSbOutput('foo\n\nerror: preconditions failed; not sending (use --force)\n'), {
       tx: null,
       claimId: null,
       error: 'preconditions failed; not sending (use --force)',
+      fails: [],
     });
   });
 });

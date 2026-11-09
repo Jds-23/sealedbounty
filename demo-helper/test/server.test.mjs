@@ -114,7 +114,10 @@ describe('POST /judge', () => {
     assert.equal(r.status, 200, r.text);
     const j = JSON.parse(r.text);
     for (const k of ['verdict', 'signature', 'chat_id', 'request_body', 'response_body_b64', 'req_hash', 'signer', 'kind']) assert.ok(k in j, k);
-    assert.deepEqual(deps.calls, [['judge', '# sqli']]);
+    assert.equal(deps.calls.length, 1);
+    assert.equal(deps.calls[0][0], 'judge');
+    assert.ok(deps.calls[0][1].startsWith('# sqli\n\n---\nDemo run: '), 'report + run trailer');
+    assert.match(j.runId, /^[0-9a-f]{6}$/);
     delete j.signer_in_attestation;
     const loop = await http(base, { method: 'POST', path: '/loop', headers: jsonHeaders(), body: { judgement: j } });
     assert.equal(loop.status, 200, loop.text);

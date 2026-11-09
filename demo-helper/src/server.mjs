@@ -10,7 +10,7 @@ import { runFrontrun, runLoop } from './flows.mjs';
 import { createMutex } from './mutex.mjs';
 import { makeRedactor, makeSecretScanner, secretsFromEnv } from './redact.mjs';
 import { openSse } from './sse.mjs';
-import { judgeResponse, toJudgeRecord, validateJudgeRequest, validateJudgement } from './validate.mjs';
+import { judgeResponse, toJudgeRecord, validateJudgeRequest, validateJudgement, withRunTrailer } from './validate.mjs';
 
 export const MAX_BODY_BYTES = 1024 * 1024;
 const ROUTES = { '/health': 'GET', '/judge': 'POST', '/loop': 'POST', '/frontrun': 'POST' };
@@ -153,9 +153,10 @@ export function createHelperServer({ config, deps, log = console.error }) {
       if (!v.ok) throw new HttpError(400, v.error);
       const release = lock('judge');
       try {
-        const out = judgeResponse(await deps.judge(v.value));
+        const { report, runId } = withRunTrailer(v.value.exploitMarkdown);
+        const out = judgeResponse(await deps.judge({ exploitMarkdown: report }));
         if (out.signer_in_attestation) remember(out.req_hash);
-        return sendJson(res, 200, out, cors);
+        return sendJson(res, 200, { ...out, runId }, cors);
       } catch (e) {
         throw new HttpError(502, `judge failed: ${errText(e)}`);
       } finally {

@@ -69,13 +69,23 @@ CORS allows only `http://localhost:5173`. Any other `Origin` gets 403 and nothin
 | Endpoint | Request | Response |
 |---|---|---|
 | `GET /health` | | `{ok:true, programId, contractId}` or `{ok:false, reason, contractId}` |
-| `POST /judge` | `{exploitMarkdown}` (≤ 64 KiB) | `{verdict, signature, chat_id, request_body, response_body_b64, req_hash, signer, kind, resp_hash, model, signer_in_attestation}` |
+| `POST /judge` | `{exploitMarkdown}` (≤ 64 KiB) | `{verdict, signature, chat_id, request_body, response_body_b64, req_hash, signer, kind, resp_hash, model, signer_in_attestation, runId}` |
 | `POST /loop` | `{judgement}` (a `/judge` response) | SSE |
 | `POST /frontrun[?resubmit=1]` | `{judgement?}` (or an empty body) | SSE |
 
 Errors are JSON `{error}`: 400 for a bad body or judgement, 403 for an origin, 404, 405, 409 when busy, 413 for a body
 over 1 MiB, 502 when the judge failed, and 503 when there is no live program. A judgement must be attested: either
 this helper process judged it, or it carries `signer_in_attestation: true`.
+
+**Each live run is a new claim.** The judge request is deterministic (temperature 0, same bundle, same report,
+same HUNTER line), and the contract dedupes identical requests per program by design (`used_req_hashes`,
+"already claimed"). So before judging, the helper appends a run-unique trailer to the REPORT:
+`\n\n---\nDemo run: <ISO time> #<6 hex>`. `runId` is that 6-hex id. The trailer is hunter-controlled report text,
+so the code, params and HUNTER binding stay intact, and retakes of the same exploit work. `/frontrun` does the same
+for its fresh judgement.
+
+When an `sb` command fails, the error `message` includes its failing pre-check rows, for example
+`sb submit failed: pre-checks failed; … (FAIL payout <= pool balance 0.3 NEAR of 0.24248 NEAR)`.
 
 **SSE.** Each frame is one `data: <json>\n\n` line. A `: ping` comment is sent every 15 s. Events:
 
@@ -122,8 +132,17 @@ pnpm --dir cli sb --contract sealedbounty-v3.testnet create-program --name "vuln
 0.05 storage allowance) and saves the owner key to `~/.sealedbounty/owner-sealedbounty-v3.testnet-<id>.json`. Then
 add `DEMO_LIVE_PROGRAM_ID=<id>` to `.env`.
 
-Each honest loop reserves the payout (0.3 for a critical) plus the hunter's 0.05 bond and pays it out. Each
-front-run forfeits the front-runner's bond to the pool. Top the pool up when it runs low.
+Each honest loop pays the payout (0.3 for a critical) out of the pool, and the hunter's 0.05 bond goes back to the
+hunter. Each front-run forfeits the front-runner's bond to the pool. A submit is refused locally when the payout is
+over the pool balance (`FAIL payout <= pool balance`). The 0.5 NEAR pool covers exactly one critical loop, so top it
+up before every extra run. `fund_program` is payable and anyone can call it. The CLI has no command for it, so use
+near-cli-rs (it spends testnet NEAR):
+
+```sh
+near contract call-function as-transaction sealedbounty-v3.testnet fund_program json-args '{"program_id": 2}' \
+  prepaid-gas '30 Tgas' attached-deposit '1 NEAR' sign-as baldingsucks7993.testnet \
+  network-config testnet sign-with-legacy-keychain send
+```
 
 ## Live smoke test
 

@@ -4,7 +4,17 @@
 // plus the optional extras resp_hash, model, signer_in_attestation.
 // The cli's `sb submit --fixture` wants a JudgeRecord (fixtures/live.*.json shape); every extra field
 // of it is derived from the API fields, and the cli re-verifies the signature itself before sending.
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+
+/**
+ * The judge request is deterministic (temperature 0, same bundle, report and HUNTER), and the contract
+ * dedupes req_hash per program ("already claimed"). So every live run appends a run-unique trailer to the
+ * REPORT. It is hunter-controlled report text, so the code/params/hunter binding is untouched.
+ * @returns {{report: string, runId: string}}
+ */
+export function withRunTrailer(markdown, { now = new Date(), rand = randomBytes(3).toString('hex') } = {}) {
+  return { report: `${markdown}\n\n---\nDemo run: ${now.toISOString()} #${rand}`, runId: rand };
+}
 
 export const MAX_EXPLOIT_BYTES = 64 * 1024;
 const MAX_REQUEST_BODY = 512 * 1024;
