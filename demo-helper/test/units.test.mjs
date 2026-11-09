@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 import { ALLOWED_ORIGIN, corsHeaders, originAllowed } from '../src/cors.mjs';
 import { loadConfig, parseDotenv } from '../src/env.mjs';
@@ -153,6 +154,17 @@ describe('request validation', () => {
     assert.equal(eth.signing_algo, 'ecdsa');
     assert.equal(eth.signing_address, '0x' + 'AB'.repeat(20));
     assert.equal(eth.text, `${eth.req_hash}:${eth.resp_hash}`);
+  });
+  it('round-trips the real recorded TEE judgements (fixtures/live.*.json) byte for byte', () => {
+    for (const algo of ['ed25519', 'ecdsa']) {
+      const fx = JSON.parse(readFileSync(new URL(`../../fixtures/live.${algo}.json`, import.meta.url), 'utf8'));
+      const api = judgeResponse(fx);
+      assert.equal(validateJudgement(api).ok, true, algo);
+      const rec = toJudgeRecord(api);
+      for (const k of ['model', 'request_body', 'response_body_b64', 'req_hash', 'resp_hash', 'chat_id', 'signature', 'signing_algo', 'signature_kind', 'text', 'signer_in_attestation'])
+        assert.deepEqual(rec[k], fx[k], `${algo}.${k}`);
+      assert.equal(rec.signing_address.toLowerCase(), fx.signing_address.toLowerCase(), `${algo}.signing_address`);
+    }
   });
   it('judgeResponse exposes the API fields and nothing secret', () => {
     const rec = { ...toJudgeRecord(makeJudgement()), verdict: makeJudgement().verdict, signer: makeJudgement().signer, apiKey: FAKE_API_KEY };
