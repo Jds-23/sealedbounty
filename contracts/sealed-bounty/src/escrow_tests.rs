@@ -1344,3 +1344,90 @@ fn list_claims_pagination_order() {
     assert_eq!(ids(c.list_claims(0, None, None)), vec![5]);
     assert!(c.list_claims(7, None, None).is_empty());
 }
+
+// ---------------- v3 #8: on_payout callback ----------------
+
+/// Context of the `on_payout` callback: the contract calls itself with one promise result.
+fn callback_ctx(result: near_sdk::PromiseResult) {
+    let me = accounts(5);
+    testing_env!(
+        VMContextBuilder::new()
+            .current_account_id(me.clone())
+            .predecessor_account_id(me)
+            .block_timestamp(T0 + 60 * NANOS_PER_SEC)
+            .build(),
+        near_sdk::test_vm_config(),
+        near_sdk::RuntimeFeesConfig::test(),
+        Default::default(),
+        vec![result],
+    );
+}
+
+/// Bonded, finalized (Paid) claim; returns (contract, program id, claim id, balance after submit).
+fn finalized() -> (Contract, u64, u64, u128) {
+    let mut c = setup();
+    let pid = bonded_program(&mut c, Fx::load(LIVE_ED).system_prompt_hash());
+    let cid = submit_as(&mut c, hunter(), pid, &Fx::load(LIVE_ED), 2 * NEAR, T0);
+    let bal = c.get_program(pid).unwrap().balance.0;
+    ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+    drop(c.finalize(cid));
+    assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Paid);
+    (c, pid, cid, bal)
+}
+
+#[test]
+fn finalize_chains_on_payout_callback() {
+    let (_, _, cid, _) = finalized();
+    let calls: Vec<(String, Vec<u8>)> = get_created_receipts()
+        .into_iter()
+        .flat_map(|r| r.actions)
+        .filter_map(|a| match a {
+            MockAction::FunctionCallWeight {
+                method_name, args, ..
+            } => Some((String::from_utf8(method_name).unwrap(), args)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "on_payout");
+    let args: Value = serde_json::from_slice(&calls[0].1).unwrap();
+    assert_eq!(args, json!({"claim_id": cid}));
+}
+
+#[test]
+fn on_payout_success_keeps_paid() {
+    let (mut c, pid, cid, bal) = finalized();
+    callback_ctx(near_sdk::PromiseResult::Successful(vec![]));
+    assert!(c.on_payout(cid));
+    assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Paid);
+    let p = c.get_program(pid).unwrap();
+    assert_eq!((p.balance.0, p.reserved.0), (bal, 0));
+}
+
+#[test]
+fn on_payout_failure_credits_program() {
+    let (mut c, pid, cid, bal) = finalized();
+    callback_ctx(near_sdk::PromiseResult::Failed);
+    assert!(!c.on_payout(cid));
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(cl.status, ClaimStatus::PayoutFailed);
+    let p = c.get_program(pid).unwrap();
+    assert_eq!((p.balance.0, p.reserved.0), (bal + 5 * NEAR + BOND, 0));
+    let ev = events();
+    assert_eq!(ev[0]["event"], "payout_failed");
+    assert_eq!(ev[0]["data"][0]["amount"], (5 * NEAR + BOND).to_string());
+    assert_eq!(serde_json::to_value(&cl).unwrap()["status"], "PayoutFailed");
+    // Not finalizable or disputable again.
+    ctx(stranger(), 0, T0 + 61 * NANOS_PER_SEC);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(c.finalize(cid))));
+    assert!(r.is_err());
+}
+
+#[test]
+#[should_panic(expected = "claim not paid")]
+fn on_payout_failure_only_once() {
+    let (mut c, _, cid, _) = finalized();
+    callback_ctx(near_sdk::PromiseResult::Failed);
+    c.on_payout(cid);
+    c.on_payout(cid);
+}

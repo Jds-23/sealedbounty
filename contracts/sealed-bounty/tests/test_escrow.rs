@@ -397,7 +397,11 @@ async fn escrow_end_to_end_live_fixtures() -> testresult::TestResult<()> {
         let r = e
             .ok(&c, &e.stranger, "finalize", json!({ "claim_id": cid }), 0)
             .await;
-        println!("  [GAS] finalize ({algo}): {}", tgas(r.total_gas_burnt));
+        println!(
+            "  [GAS] finalize + on_payout ({algo}): {}",
+            tgas(r.total_gas_burnt)
+        );
+        assert!(r.json::<bool>()?, "on_payout reports success");
         let after = e.balance(&e.hunter).await;
         assert_eq!(
             after - before,
@@ -809,6 +813,26 @@ async fn finalize_to_deleted_hunter_credits_program() -> testresult::TestResult<
         "transfer refunded to the contract"
     );
     assert!(r.is_ok(), "on_payout handles the failure without panicking");
+    assert!(!r.unwrap().json::<bool>()?, "on_payout reports the failure");
+    // Only the contract itself may call the callback.
+    e.fail(
+        &c,
+        &e.stranger,
+        "on_payout",
+        json!({ "claim_id": cid }),
+        0,
+        "Method on_payout is private",
+    )
+    .await;
+    e.fail(
+        &c,
+        &e.stranger,
+        "finalize",
+        json!({ "claim_id": cid }),
+        0,
+        "claim not pending",
+    )
+    .await;
 
     // The owner can now withdraw it.
     let before = e.balance(&e.owner).await;

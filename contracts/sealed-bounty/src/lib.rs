@@ -8,7 +8,8 @@ use near_sdk::serde::Deserialize;
 use near_sdk::serde_json::{self, json};
 use near_sdk::store::{IterableMap, LookupMap, LookupSet, Vector};
 use near_sdk::{
-    AccountId, BorshStorageKey, NearToken, PanicOnDefault, Promise, env, near, require,
+    AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promise, PromiseError, env, near,
+    require,
 };
 
 use tee::Severity;
@@ -16,6 +17,8 @@ pub use tee::{SigKind, Signer, Verdict};
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 const DEFAULT_LIMIT: u64 = 50;
+/// Static gas for the `on_payout` callback (reads/writes one claim + one program).
+const GAS_ON_PAYOUT: Gas = Gas::from_tgas(10);
 
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +81,9 @@ pub enum ClaimStatus {
     Pending,
     Rejected,
     Paid,
+    /// The payout transfer failed (e.g. the hunter account was deleted); payout + bond went back
+    /// to the program balance. v3 #8.
+    PayoutFailed,
 }
 
 #[near(serializers = [borsh, json])]
@@ -579,7 +585,8 @@ impl Contract {
         );
     }
 
-    /// Anyone, once the dispute window has passed. Pays the hunter `payout + bond`.
+    /// Anyone, once the dispute window has passed. Pays the hunter `payout + bond`, then
+    /// `on_payout` credits it back to the program if the transfer failed.
     pub fn finalize(&mut self, claim_id: u64) -> Promise {
         let c = self
             .claims
@@ -599,7 +606,38 @@ impl Contract {
             "claim_paid",
             json!({"claim_id": claim_id, "program_id": program_id, "hunter": hunter, "payout": U128(payout), "bond": U128(bond)}),
         );
-        Promise::new(hunter).transfer(NearToken::from_yoctonear(payout + bond))
+        Promise::new(hunter)
+            .transfer(NearToken::from_yoctonear(payout + bond))
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_ON_PAYOUT)
+                    .on_payout(claim_id),
+            )
+    }
+
+    /// Callback of `finalize`'s transfer. On failure the transfer was refunded to this contract:
+    /// mark the claim PayoutFailed and credit payout + bond back to the program balance, so the
+    /// funds are not stranded. Returns whether the payout succeeded.
+    #[private]
+    pub fn on_payout(&mut self, claim_id: u64) -> bool {
+        // A transfer has no return data; any non-empty result is still a success.
+        if !matches!(env::promise_result_checked(0, 0), Err(PromiseError::Failed)) {
+            return true;
+        }
+        let c = self
+            .claims
+            .get_mut(&claim_id)
+            .unwrap_or_else(|| env::panic_str("claim not found"));
+        require!(c.status == ClaimStatus::Paid, "claim not paid");
+        c.status = ClaimStatus::PayoutFailed;
+        let (program_id, amount, hunter) = (c.program_id, c.payout.0 + c.bond.0, c.hunter.clone());
+        let p = self.program_mut(program_id);
+        p.balance = U128(p.balance.0 + amount);
+        emit(
+            "payout_failed",
+            json!({"claim_id": claim_id, "program_id": program_id, "hunter": hunter, "amount": U128(amount)}),
+        );
+        false
     }
 
     // ---------------- views ----------------
