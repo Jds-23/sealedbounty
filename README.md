@@ -340,6 +340,25 @@ The CLI reference is in [`cli/README.md`](./cli/README.md). The spec shared by t
 they conflict); it is the authoritative contract API. The contract notes are in
 [`contracts/sealed-bounty/README.md`](./contracts/sealed-bounty/README.md).
 
+### Guided demo live lane (`demo-helper/`, local only)
+
+The tour's "Do it live" buttons (steps 4, 6 and 7) talk to a local helper on `localhost:8787`. It holds the NEAR AI
+key and signs the program-2 writes by running the `sb` commands above. Its API and a smoke test are in
+[`demo-helper/README.md`](./demo-helper/README.md). It needs **program 2** "vuln-app live demo": the same
+`repo_url`, `commit`, bundle and params as program 1, with 45 s / 30 s windows. Create it once as the owner (this
+spends about 0.55 testnet NEAR; try `--dry-run` first):
+
+```sh
+pnpm --dir cli sb --contract sealedbounty-v3.testnet create-program --name "vuln-app live demo" \
+  --repo https://github.com/sealedbounty/sealedbounty/tree/main/fixtures/vuln-app --commit demo-commit-0001 \
+  --code ../fixtures/vuln-app/bundle.txt \
+  --payout-low 0.05 --payout-medium 0.1 --payout-high 0.2 --payout-critical 0.3 --fund 0.5 \
+  --dispute-secs 45 --min-confidence 80 --bond 0.05 --challenge-secs 30 \
+  --account baldingsucks7993.testnet
+```
+
+Then put `DEMO_LIVE_PROGRAM_ID=<id>` in `.env` and run `pnpm --dir demo-helper start`.
+
 ## Repo map
 
 | Path | What |
@@ -348,6 +367,7 @@ they conflict); it is the authoritative contract API. The contract notes are in
 | `shared/` | `judge.mjs`, an isomorphic library shared by the CLI and web: canonical request builder, code bundle + `code_hash`, `params_hash`, request-vs-program checks, hashing, signature verification, nacl-box encryption. Also the frozen system prompt, `demo-data.mjs` and `demo-offline.mjs` |
 | `cli/` | `sb` CLI (TypeScript, near-api-js): attest, create-program, submit, inbox, dispute, flag-undecryptable, prove-ciphertext, set-program-signers, revoke-signer, finalize, verify-claim/fixture |
 | `web/` | Read-only Vite + React UI: programs, claims, signature checks in the browser, owner inbox decrypted locally. Has a demo mode |
+| `demo-helper/` | Local-only `node:http` helper for the guided demo's live lane: `/judge` (NEAR AI TEE via `shared/judge.mjs`), `/loop` and `/frontrun` (SSE; the writes run the `sb` CLI) |
 | `fixtures/` | Real TEE-signed recordings (`demo.*.json`, `live.*.json`, `attack.params-tampered.json`), attestation evidence, exploit reports, and `vuln-app/`, the intentionally vulnerable target with its `bundle.txt` / `bundle.sha256` |
 | `spike/` | Phase 0 spikes (attestation, signing). Their code was later moved into `cli/` and `shared/` |
 | `docs/` | `INTERFACE.md` (spec) and `inspiration.md` (idea list from the NEAR team) |
@@ -473,7 +493,8 @@ Limits:
 | Command | Does |
 |---|---|
 | `make setup` | `pnpm install --frozen-lockfile` in `shared`, `cli`, `web`, `contracts/sealed-bounty/tests/fixtures` |
-| `make test` | `cargo test` (contract) + `pnpm build && pnpm test` (cli) + `pnpm test` (web) |
+| `make test` | `cargo test` (contract) + `pnpm build && pnpm test` (cli) + `pnpm test` (web) + `make test-helper` |
+| `make test-helper` | `demo-helper`: `node --test` (no deps, no network) |
 | `make demo` | `shared`: `pnpm demo:offline` |
 | `make verify-offline` | CLI `verify-fixture` + offline `submit --dry-run --fixture` |
 | `make attest` | CLI `attest`: live TDX + NVIDIA attestation of the model signers (network, no key) |
