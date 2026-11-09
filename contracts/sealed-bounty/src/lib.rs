@@ -1120,16 +1120,10 @@ impl Contract {
         {
             env::panic_str(&e);
         }
-        let verdict = tee::parse_verdict(&resp_body.0).unwrap_or_else(|e| env::panic_str(&e));
-        env::log_str(&format!(
-            "verified {} sig; used_gas={}",
-            match signer {
-                Signer::Ed25519(_) => "ed25519",
-                Signer::Eth(_) => "ecdsa",
-            },
-            env::used_gas().as_gas()
-        ));
-        verdict
+        // No env::used_gas() / log here: this method is called as a free RPC view (the guided
+        // tour's "Ask the contract"), and NEAR prohibits used_gas in views. Gas is measured by the
+        // sandbox tests from the transaction outcome instead.
+        tee::parse_verdict(&resp_body.0).unwrap_or_else(|e| env::panic_str(&e))
     }
 }
 
