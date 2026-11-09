@@ -45,12 +45,13 @@ const EMPTY: StreamState = { events: [], running: false, error: null, outcome: n
 export function useHelperStream() {
   const [st, setSt] = useState<StreamState>(EMPTY);
   const busy = useRef(false);
-  const start = useCallback(async (path: Parameters<typeof streamHelper>[0], body: unknown) => {
+  /** Runs `runner` (it streams helper events into onEvent and resolves with the end event). */
+  const startWith = useCallback(async (runner: (onEvent: (e: HelperEvent) => void) => Promise<HelperEvent>) => {
     if (busy.current) return;
     busy.current = true;
     setSt({ ...EMPTY, running: true });
     try {
-      const end = await streamHelper(path, body, (e) =>
+      const end = await runner((e) =>
         setSt((s) => ({ ...s, events: [...s.events, e], claimId: Number.isInteger(e.claimId) ? (e.claimId as number) : s.claimId })),
       );
       const outcome = typeof end.outcome === 'string' ? end.outcome : JSON.stringify(end.outcome ?? 'done');
@@ -64,7 +65,11 @@ export function useHelperStream() {
       busy.current = false;
     }
   }, []);
-  return { ...st, start };
+  const start = useCallback(
+    (path: Parameters<typeof streamHelper>[0], body: unknown) => startWith((onEvent) => streamHelper(path, body, onEvent)),
+    [startWith],
+  );
+  return { ...st, start, startWith };
 }
 
 /** Latest event per step, in first-seen order. */

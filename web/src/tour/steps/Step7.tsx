@@ -4,6 +4,7 @@
 import { useMemo, useState } from 'react';
 import { fmtDate, yoctoToNear } from '../../lib/format';
 import type { ActionKey } from '../autoplay';
+import { runLiveFrontrun } from '../helper';
 import { LiveGate, StreamView, useHelperStream } from '../LiveLane';
 import { useRestore, useTour, useTourAction } from '../TourContext';
 import { claimTxs, recomputeReject, type RejectRecompute } from '../tourData';
@@ -99,11 +100,14 @@ const FR_LABELS: Record<string, string> = {
 };
 
 function LiveFrontrun() {
-  const { liveJudgement, setResult } = useTour();
+  const { judgementState, trackJudgement, setResult } = useTour();
   const s = useHelperStream();
+  const copies = !!judgementState.judgement && !judgementState.consumed;
   const run = async () => {
     try {
-      const out = await s.start('/frontrun', liveJudgement ? { judgement: liveJudgement.raw } : {});
+      // An unused step-4 judgement is copied; a consumed one (step 6 submitted it) would panic "already claimed",
+      // so the body is {} and the helper judges fresh with a run-unique trailer.
+      const out = await s.startWith((onEvent) => runLiveFrontrun(judgementState, onEvent, trackJudgement));
       setResult('live-frontrun', /hunter mismatch/i.test(out ?? ''), `Live front-run on program 2 → ${out}`);
     } catch (e) {
       setResult('live-frontrun', false, 'Live front-run failed');
@@ -117,7 +121,13 @@ function LiveFrontrun() {
         <HeroButton kind="live" onClick={() => run().catch(() => {})} busy={s.running} done={!!s.outcome}>
           {s.running ? 'Front-running on testnet…' : 'Front-run live'}
         </HeroButton>
-        <span className="muted small">{liveJudgement ? 'copies the verdict judged in step 4' : 'the helper takes a fresh judgement first'}</span>
+        <span className="muted small">
+          {copies
+            ? 'the front-runner copies your unused step-4 judgement'
+            : judgementState.consumed
+              ? 'your step-4 judgement was already submitted, so the helper judges a fresh report first'
+              : 'the helper judges a fresh report first'}
+        </span>
       </div>
       <StreamView st={s} labels={FR_LABELS} />
     </LiveGate>

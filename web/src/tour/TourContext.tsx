@@ -1,8 +1,8 @@
 // Tour session state (React context, no localStorage): the data (live with per-datum snapshot fallback), the results
 // of the hero actions the viewer ran (step 8 scorecard), the helper probe, and an action registry autoplay fires.
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from 'react';
 import type { ActionKey } from './autoplay';
-import { probeHelper, type HelperHealth, type Judgement } from './helper';
+import { judgementReducer, NO_JUDGEMENT, probeHelper, type HelperHealth, type Judgement, type JudgementAction, type LiveJudgementState } from './helper';
 import { loadClaims, loadProgramView, loadTxs, snapshotData, type ProgramView, type Source, type TourData } from './tourData';
 
 export interface ResultEntry {
@@ -28,7 +28,9 @@ interface TourState {
   helper: HelperHealth | null;
   helperChecked: boolean;
   liveJudgement: Judgement | null;
-  setLiveJudgement: (j: Judgement | null) => void;
+  /** The step-4 judgement plus whether a submit_claim already consumed its req_hash (steps 6, 7). */
+  judgementState: LiveJudgementState;
+  trackJudgement: (a: JudgementAction) => void;
   toast: string | null;
   showToast: (t: string | null) => void;
 }
@@ -43,7 +45,8 @@ export function TourProvider({ children }: { children: ReactNode }) {
   const [results, setResults] = useState<TourState['results']>({});
   const [helper, setHelper] = useState<HelperHealth | null>(null);
   const [helperChecked, setHelperChecked] = useState(false);
-  const [liveJudgement, setLiveJudgement] = useState<Judgement | null>(null);
+  const [judgementState, trackJudgement] = useReducer(judgementReducer, NO_JUDGEMENT);
+  const liveJudgement = judgementState.judgement;
   const [toast, setToast] = useState<string | null>(null);
   const actions = useRef(new Map<ActionKey, () => Promise<unknown> | unknown>());
 
@@ -114,11 +117,12 @@ export function TourProvider({ children }: { children: ReactNode }) {
       helper,
       helperChecked,
       liveJudgement,
-      setLiveJudgement,
+      judgementState,
+      trackJudgement,
       toast,
       showToast: setToast,
     }),
-    [data, badge, fallbackErrors, programRead, loadProgram, results, setResult, register, run, helper, helperChecked, liveJudgement, toast],
+    [data, badge, fallbackErrors, programRead, loadProgram, results, setResult, register, run, helper, helperChecked, liveJudgement, judgementState, toast],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

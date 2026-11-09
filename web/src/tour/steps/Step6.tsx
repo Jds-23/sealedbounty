@@ -2,9 +2,12 @@
 // prove_ciphertext args and opens the onchain ciphertext (proveCiphertext), keyless; then the 6 dispute checks
 // (auditRequest) and the tx timeline. Live lane: the full loop on program 2 through the helper.
 import { useMemo, useState } from 'react';
+import { Link, useLocation } from 'react-router-dom';
 import { fmtDate, nsToMs, yoctoToNear } from '../../lib/format';
 import { auditRequest } from '../../lib/requestChecks';
+import { runLiveLoop } from '../helper';
 import { LiveGate, StreamView, useHelperStream } from '../LiveLane';
+import { PRESETS } from './Step4';
 import { useRestore, useTour, useTourAction } from '../TourContext';
 import { claimTxs, decryptClaim } from '../tourData';
 import { CheckList, ErrLine, Exhibit, Hash, HeroButton, KV, TxLink } from '../ui';
@@ -134,6 +137,7 @@ export function Step6() {
 }
 
 const LOOP_LABELS: Record<string, string> = {
+  judge: 'fresh TEE judgement',
   setup: 'setup',
   submit_claim: 'submit_claim (hunter)',
   flag_undecryptable: 'flag_undecryptable (owner)',
@@ -143,25 +147,36 @@ const LOOP_LABELS: Record<string, string> = {
 };
 
 function LiveLoop() {
-  const { liveJudgement, setResult } = useTour();
+  const { judgementState, trackJudgement, setResult } = useTour();
+  const { search } = useLocation();
   const s = useHelperStream();
-  const run = async () => {
+  /** autoFresh (autoplay &live=1): a consumed or missing judgement is re-judged first instead of refused. */
+  const run = async (autoFresh: boolean) => {
     try {
-      const out = await s.start('/loop', { judgement: liveJudgement?.raw });
+      const out = await s.startWith((onEvent) => runLiveLoop(judgementState, onEvent, trackJudgement, { autoFresh, fallbackMarkdown: PRESETS.sqli }));
       setResult('live-loop', /paid/i.test(out ?? ''), `Live loop on program 2 → ${out}`);
     } catch (e) {
       setResult('live-loop', false, 'Live loop failed');
       throw e;
     }
   };
-  useTourAction('live-loop', run);
+  useTourAction('live-loop', () => run(true));
+  const usable = !!judgementState.judgement && !judgementState.consumed;
   return (
     <LiveGate title="Run the full loop live">
       <div className="lane-row">
-        <HeroButton kind="live" onClick={() => run().catch(() => {})} busy={s.running} disabled={!liveJudgement} done={!!s.outcome}>
+        <HeroButton kind="live" onClick={() => run(false).catch(() => {})} busy={s.running} disabled={!usable && !s.running} done={!!s.outcome}>
           {s.running ? 'Running on testnet…' : 'Run the full loop live'}
         </HeroButton>
-        {!liveJudgement && <span className="muted small">Judge a report live in step 4 first.</span>}
+        {!s.running && !judgementState.judgement && <span className="muted small">Judge a report live in step 4 first.</span>}
+        {!s.running && judgementState.consumed && (
+          <span className="muted small">
+            This judgement was already submitted (its req_hash is used).{' '}
+            <Link className="jump" to={`/tour/4${search}`}>
+              Judge again in step 4 ←
+            </Link>
+          </span>
+        )}
       </div>
       <StreamView st={s} labels={LOOP_LABELS} />
     </LiveGate>

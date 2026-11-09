@@ -168,3 +168,78 @@ export async function streamHelper(path: '/loop' | '/frontrun' | '/frontrun?resu
   if (end) return end;
   throw new Error(`helper ${path}: stream ended without an end event${lastErr?.message ? ` (${lastErr.message})` : ''}`);
 }
+
+// ---- the session's live judgement (step 4) and its reuse in steps 6 and 7 ----
+// The contract dedupes req_hash per program and a Paid claim never releases it, so a judgement is single-use: the
+// first submit_claim that lands consumes it, and a second submit panics "already claimed".
+
+export interface LiveJudgementState {
+  judgement: Judgement | null;
+  /** The report it judged, so a consumed judgement can be re-judged (the helper adds a run-unique trailer). */
+  markdown: string | null;
+  /** A submit_claim with this judgement landed (/loop or /frontrun). */
+  consumed: boolean;
+}
+
+export const NO_JUDGEMENT: LiveJudgementState = { judgement: null, markdown: null, consumed: false };
+
+export type JudgementAction = { type: 'judged'; judgement: Judgement; markdown: string } | { type: 'event'; event: HelperEvent };
+
+export const consumesJudgement = (e: HelperEvent) => e.step === 'submit_claim' && e.status === 'done';
+
+export function judgementReducer(s: LiveJudgementState, a: JudgementAction): LiveJudgementState {
+  if (a.type === 'judged') return { judgement: a.judgement, markdown: a.markdown, consumed: false };
+  if (!s.judgement || s.consumed || !consumesJudgement(a.event)) return s;
+  return { ...s, consumed: true };
+}
+
+const usable = (s: LiveJudgementState) => (s.judgement && !s.consumed ? s.judgement : null);
+
+/** /frontrun copies the step-4 judgement while it is unused; otherwise {} and the helper judges fresh. */
+export const frontrunBody = (s: LiveJudgementState): { judgement?: Record<string, unknown> } => {
+  const j = usable(s);
+  return j ? { judgement: j.raw } : {};
+};
+
+export class JudgementUnavailableError extends Error {
+  constructor(readonly reason: 'consumed' | 'absent') {
+    super(reason === 'consumed' ? 'this judgement was already submitted: judge again in step 4' : 'judge a report live in step 4 first');
+  }
+}
+
+type Track = (a: JudgementAction) => void;
+const tracked = (onEvent: (e: HelperEvent) => void, track: Track) => (e: HelperEvent) => {
+  onEvent(e);
+  track({ type: 'event', event: e });
+};
+
+export function runLiveFrontrun(s: LiveJudgementState, onEvent: (e: HelperEvent) => void, track: Track, signal?: AbortSignal): Promise<HelperEvent> {
+  return streamHelper('/frontrun', frontrunBody(s), tracked(onEvent, track), signal);
+}
+
+/**
+ * /loop with the session judgement. A consumed (or missing) one is refused, unless `autoFresh` (autoplay &live=1):
+ * then it judges the same report again first (fresh req_hash) and submits that.
+ */
+export async function runLiveLoop(
+  s: LiveJudgementState,
+  onEvent: (e: HelperEvent) => void,
+  track: Track,
+  opts: { autoFresh?: boolean; fallbackMarkdown?: string; signal?: AbortSignal } = {},
+): Promise<HelperEvent> {
+  let j = usable(s);
+  if (!j) {
+    const md = s.markdown ?? opts.fallbackMarkdown;
+    if (!opts.autoFresh || !md) throw new JudgementUnavailableError(s.consumed ? 'consumed' : 'absent');
+    onEvent({ step: 'judge', status: 'pending', message: s.consumed ? 'the last judgement was already submitted: judging again' : 'judging the report in the TEE' });
+    try {
+      j = await judgeLive(md, opts.signal);
+    } catch (e) {
+      onEvent({ step: 'judge', status: 'error', message: (e as Error).message });
+      throw e;
+    }
+    track({ type: 'judged', judgement: j, markdown: md });
+    onEvent({ step: 'judge', status: 'done' });
+  }
+  return streamHelper('/loop', { judgement: j.raw }, tracked(onEvent, track), opts.signal);
+}

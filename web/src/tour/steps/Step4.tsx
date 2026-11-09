@@ -101,7 +101,7 @@ export function Step4() {
 }
 
 function LiveJudge() {
-  const { liveJudgement, setLiveJudgement, setResult } = useTour();
+  const { liveJudgement, judgementState, trackJudgement, setResult } = useTour();
   const [preset, setPreset] = useState<keyof typeof PRESETS>('sqli');
   const [text, setText] = useState<string>(PRESETS.sqli);
   const [busy, setBusy] = useState(false);
@@ -114,7 +114,7 @@ function LiveJudge() {
     const start = Date.now();
     try {
       const j = await judgeLive(md);
-      setLiveJudgement(j);
+      trackJudgement({ type: 'judged', judgement: j, markdown: md });
       setMs(Date.now() - start);
       setResult('live-judge', true, `Judged live in the TEE (${j.verdict?.severity ?? '?'})`);
     } catch (e) {
@@ -179,7 +179,11 @@ function LiveJudge() {
               ['req_hash', liveJudgement.req_hash ? <Hash key="r" value={liveJudgement.req_hash} /> : '—'],
             ]}
           />
-          <p className="muted small">Kept for this session: steps 6 and 7 can submit it on program 2.</p>
+          <p className="muted small">
+            {judgementState.consumed
+              ? 'Already submitted on program 2: its req_hash is used. Judge again for a fresh one.'
+              : 'Kept for this session: step 6 (or step 7) can submit it once on program 2.'}
+          </p>
         </div>
       )}
     </LiveGate>
