@@ -82,8 +82,8 @@ describe('verifyClaim (demo data)', () => {
     const checks = verifyClaim(c, programs[0], DEMO_SIGNERS, { signersSource: 'demo' });
     expect(checks.find((x) => x.label.startsWith('TEE signature'))!.status).toBe('fail');
   });
-  it('unknown signer fails allowlist', () => {
-    const checks = verifyClaim(claims[0], programs[0], [], { signersSource: 'contract' });
+  it('unknown signer fails allowlist (v2 program, global allowlist only)', () => {
+    const checks = verifyClaim(claims[0], { ...programs[0], signers: null }, [], { signersSource: 'contract' });
     expect(checks.find((x) => x.label.startsWith('Signer allowlisted'))!.status).toBe('fail');
   });
 });

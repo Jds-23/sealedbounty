@@ -5,7 +5,7 @@ import demo from '../fixtures/demo.json';
 import { parseClaim, parseProgram } from './near';
 import { buildDemo } from './demo';
 import { auditRequest } from './requestChecks';
-import { paramsHash } from './shared-v3.mjs';
+import { paramsHash } from '@sealedbounty/shared';
 import { claimStatusInfo, rejectInfo, undecryptableHint } from './status';
 import { countdown } from './format';
 import type { Claim } from './types';
@@ -54,8 +54,8 @@ describe('parseClaim v3', () => {
 
 // ---- #1 params pinning: owner inbox runs 6 checks ----
 describe('auditRequest v3 (params pinning)', () => {
-  const base = buildDemo(0).programs[0];
-  const program = { ...base, params_hash: paramsHash() };
+  const program = buildDemo(0).programs[0];
+  const base = { ...program, params_hash: null };
   const body = demo.cases.idor.request_body;
   const H = demo.cases.idor.hunter;
   const mutate = (f: (r: any) => void) => {

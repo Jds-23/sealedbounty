@@ -9,14 +9,17 @@ import { auditRequest } from './requestChecks';
 import { parseProgram } from './near';
 import type { Claim } from './types';
 
-const { programs, claims } = buildDemo(0);
+const demoData = buildDemo(0);
+const { programs } = demoData;
+// The v2 cases live in program 0 (program 1 holds the v3 cases, see demo-v3.test.ts).
+const claims = demoData.claims.filter((c) => c.program_id === 0);
 const program = programs[0];
 const { secretKey, publicKeyB64 } = parseOwnerSecret(JSON.stringify(demo.owner_secret));
 const decrypt = (c: Claim) => decryptReport(c.ciphertext, secretKey);
 const byFixture = (req: string, hunter?: string) => claims.find((c) => c.req_hash === req && (!hunter || c.hunter === hunter))!;
 const status = (a: ReturnType<typeof auditRequest>) => Object.fromEntries(a.checks.map((x) => [x.key, x.ok]));
 
-describe('demo program (v2)', () => {
+describe('demo program 0 (v2 cases, v3 program)', () => {
   it('code_hash is the sha256 of the bundled fixtures/vuln-app/bundle.txt', () => {
     expect(program.code_hash).toBe('82faf3a0cd6148f95ba3b8011f8e9af67d5f9d5b8f8638002be7787a37285abd');
     expect(codeHash(DEMO_CODE_BUNDLE.bundle)).toBe(program.code_hash);
@@ -46,7 +49,7 @@ describe('auditRequest', () => {
     for (const c of claims.filter((x) => x.status !== 'Rejected')) {
       const a = auditRequest(decrypt(c), program, c.hunter);
       expect(a).toMatchObject({ ok: true, reason: null, v1: false });
-      expect(status(a)).toEqual({ prompt: true, model: true, params: null, code: true, hunter: true, report: true });
+      expect(status(a)).toEqual({ prompt: true, model: true, params: true, code: true, hunter: true, report: true });
     }
   });
 
@@ -56,7 +59,7 @@ describe('auditRequest', () => {
     expect(c.reject_reason).toBe('code mismatch');
     const a = auditRequest(decrypt(c), program, c.hunter);
     expect(a).toMatchObject({ ok: false, reason: 'code mismatch' });
-    expect(status(a)).toEqual({ prompt: true, model: true, params: null, code: false, hunter: true, report: true });
+    expect(status(a)).toEqual({ prompt: true, model: true, params: true, code: false, hunter: true, report: true });
     expect(a.checks.find((x) => x.key === 'code')!.detail).toMatch(/≠ program\.code_hash/);
   });
 
@@ -68,7 +71,7 @@ describe('auditRequest', () => {
     expect(real.status).toBe('Paid');
     const a = auditRequest(decrypt(fr), program, fr.hunter);
     expect(a).toMatchObject({ ok: false, reason: 'hunter mismatch' });
-    expect(status(a)).toEqual({ prompt: true, model: true, params: null, code: true, hunter: false, report: true });
+    expect(status(a)).toEqual({ prompt: true, model: true, params: true, code: true, hunter: false, report: true });
     expect(auditRequest(decrypt(real), program, real.hunter).ok).toBe(true);
   });
 

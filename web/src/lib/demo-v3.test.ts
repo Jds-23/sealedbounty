@@ -4,7 +4,7 @@ import demo from '../fixtures/demo.json';
 import { buildDemo, DEMO_FRONTRUNNER, DEMO_RESP_BODIES, DEMO_SIGNERS } from './demo';
 import { decryptReport, parseOwnerSecret, proveCiphertext } from './crypto';
 import { auditRequest } from './requestChecks';
-import { checkRequestAgainstProgram, paramsHash } from './shared-v3.mjs';
+import { checkRequestAgainstProgram, paramsHash } from '@sealedbounty/shared';
 import { verifyClaim } from './checks';
 import { sha256hex } from './verify';
 import type { Claim } from './types';

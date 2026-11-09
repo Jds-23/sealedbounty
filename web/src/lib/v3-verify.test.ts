@@ -6,7 +6,7 @@ import demo from '../fixtures/demo.json';
 import { buildDemo, DEMO_SIGNERS } from './demo';
 import { verifyClaim } from './checks';
 import { proveCiphertext } from './crypto';
-import { encryptForOwnerWithSecret } from './shared-v3.mjs';
+import { encryptForOwnerWithSecret } from '@sealedbounty/shared';
 import { sha256hex } from './verify';
 
 const { programs, claims } = buildDemo(0);

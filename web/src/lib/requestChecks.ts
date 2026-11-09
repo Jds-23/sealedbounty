@@ -2,8 +2,7 @@
 // `dispute` (docs/INTERFACE.md "v3": prompt -> model -> params -> code -> hunter -> report). The
 // overall verdict comes from the shared checkRequestAgainstProgram (same code the CLI uses); the
 // per-check breakdown below explains it.
-import { sha256hex } from '@sealedbounty/shared';
-import { canonicalJson, checkRequestAgainstProgram, JUDGE_PARAMS, paramsHash, type DisputeReasonV3 as DisputeReason } from './shared-v3.mjs';
+import { canonicalJson, checkRequestAgainstProgram, JUDGE_PARAMS, paramsHash, sha256hex, type DisputeReason } from '@sealedbounty/shared';
 import type { Program } from './types';
 
 export type { DisputeReason };
