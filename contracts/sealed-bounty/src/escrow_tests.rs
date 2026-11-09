@@ -130,6 +130,7 @@ fn create(
         "b3duZXJwdWI=".into(),
         secs,
         min_conf,
+        U128(0),
         None,
     )
 }
@@ -479,14 +480,34 @@ fn submit_duplicate_uppercase_hash() {
     submit(&mut c, pid, &f);
 }
 
+/// v3 #5: an attacker copies a signed judgement into their own look-alike program B (never
+/// disputed). That must not burn the req_hash for the real program A.
 #[test]
-#[should_panic(expected = "already claimed")]
-fn submit_duplicate_across_programs() {
+fn cross_program_copy_does_not_burn_hash() {
     let mut c = setup();
     let a = live_program(&mut c, 0, 60, 20 * NEAR);
     let b = live_program(&mut c, 0, 60, 20 * NEAR);
-    submit(&mut c, a, &Fx::load(LIVE_ED));
+    let f = Fx::load(LIVE_ED);
+    let copied = submit_as(&mut c, stranger(), b, &f, NEAR, T0);
+    assert_eq!(c.get_claim(copied).unwrap().program_id, b);
+    let real = submit_as(&mut c, hunter(), a, &f, NEAR, T0);
+    let rc = c.get_claim(real).unwrap();
+    assert_eq!(
+        (rc.program_id, rc.hunter, rc.status),
+        (a, hunter(), ClaimStatus::Pending)
+    );
+}
+
+#[test]
+#[should_panic(expected = "already claimed")]
+fn submit_duplicate_within_program_after_cross_program() {
+    // Dedupe is per program: a second submission to the SAME program still fails.
+    let mut c = setup();
+    let a = live_program(&mut c, 0, 60, 20 * NEAR);
+    let b = live_program(&mut c, 0, 60, 20 * NEAR);
     submit(&mut c, b, &Fx::load(LIVE_ED));
+    submit(&mut c, a, &Fx::load(LIVE_ED));
+    submit(&mut c, a, &Fx::load(LIVE_EC));
 }
 
 #[test]
@@ -527,7 +548,10 @@ fn dispute_v1_body_is_params_tampered() {
     assert_eq!(cl.reject_reason.as_deref(), Some("params tampered"));
     assert_eq!(c.get_program(pid).unwrap().reserved.0, 0);
     // Not a hunter mismatch: req_hash stays used.
-    assert!(c.used_req_hashes.contains(&f.s("req_hash")));
+    assert!(
+        c.used_req_hashes
+            .contains(&dedupe_key(pid, &f.s("req_hash")))
+    );
 }
 
 #[test]
@@ -777,6 +801,7 @@ fn create_v2(c: &mut Contract) -> u64 {
         "b3duZXJwdWI=".into(),
         60,
         0,
+        U128(0),
         None,
     )
 }
@@ -873,6 +898,7 @@ fn create_program_bad_code_hash() {
         "k".into(),
         60,
         0,
+        U128(0),
         None,
     );
 }
@@ -1108,7 +1134,7 @@ fn dispute_v2_rejects_each_reason() {
         assert_eq!((p.balance.0, p.reserved.0), (bal, 0));
         assert_eq!(events()[0]["data"][0]["reason"], want);
         assert!(
-            c.used_req_hashes.contains(&cl.req_hash),
+            c.used_req_hashes.contains(&dedupe_key(pid, &cl.req_hash)),
             "{want}: hash stays used"
         );
         // and it cannot be resubmitted
@@ -1143,7 +1169,7 @@ fn dispute_hunter_mismatch_releases_req_hash() {
     assert_eq!(cl.status, ClaimStatus::Rejected);
     assert_eq!(cl.reject_reason.as_deref(), Some("hunter mismatch"));
     assert!(
-        !c.used_req_hashes.contains(&cl.req_hash),
+        !c.used_req_hashes.contains(&dedupe_key(pid, &cl.req_hash)),
         "req_hash released"
     );
     let p = c.get_program(pid).unwrap();
@@ -1157,7 +1183,7 @@ fn dispute_hunter_mismatch_releases_req_hash() {
         (hunter(), ClaimStatus::Pending)
     );
     assert_eq!(rc.req_hash, cl.req_hash);
-    assert!(c.used_req_hashes.contains(&rc.req_hash));
+    assert!(c.used_req_hashes.contains(&dedupe_key(pid, &rc.req_hash)));
 
     // The honest claim can't be disputed and gets paid.
     ctx(owner(), 0, T0 + 2 * NANOS_PER_SEC);
@@ -1416,6 +1442,7 @@ fn create_program_bad_params_hash() {
         "k".into(),
         60,
         0,
+        U128(0),
         None,
     );
 }
@@ -1437,6 +1464,7 @@ fn dispute_other_program_params_rejects() {
         "b3duZXJwdWI=".into(),
         60,
         0,
+        U128(0),
         None,
     );
     let body = v2_req(hunter().as_str()).to_string();
@@ -1570,6 +1598,7 @@ fn create_v2_with(c: &mut Contract, signers: Option<Vec<Signer>>) -> u64 {
         "b3duZXJwdWI=".into(),
         60,
         0,
+        U128(0),
         signers,
     )
 }
@@ -1794,4 +1823,282 @@ fn revoked_then_readded_signer_still_blocks_old_claims() {
         c.get_claim(cid).unwrap().reject_reason.as_deref(),
         Some("signer revoked")
     );
+}
+
+// ---------------- v3 #4: hunter bond ----------------
+
+const BOND: u128 = NEAR;
+
+/// Live-fixture program with `bond`, the real system prompt hash (finalizable) or `x` (disputable).
+fn bonded_program(c: &mut Contract, prompt_hash: String) -> u64 {
+    ctx(owner(), 20 * NEAR, T0);
+    c.create_program(
+        "bonded".into(),
+        REPO.into(),
+        COMMIT.into(),
+        Fx::load(LIVE_ED).s("model"),
+        prompt_hash,
+        CODE_HASH_PLACEHOLDER.into(),
+        v2_params_hash(),
+        payouts(),
+        "b3duZXJwdWI=".into(),
+        60,
+        0,
+        U128(BOND),
+        None,
+    )
+}
+
+#[test]
+#[should_panic(expected = "insufficient bond")]
+fn submit_without_bond_panics() {
+    // Storage-only deposit used to be enough to reserve 5 NEAR of the pool.
+    let mut c = setup();
+    let pid = bonded_program(&mut c, Fx::load(LIVE_ED).system_prompt_hash());
+    assert_eq!(c.get_program(pid).unwrap().bond.0, BOND);
+    submit_as(&mut c, hunter(), pid, &Fx::load(LIVE_ED), NEAR / 2, T0);
+}
+
+#[test]
+fn bond_held_then_returned_on_paid() {
+    let mut c = setup();
+    let pid = bonded_program(&mut c, Fx::load(LIVE_ED).system_prompt_hash());
+    let bal = c.get_program(pid).unwrap().balance.0;
+    let cid = submit_as(&mut c, hunter(), pid, &Fx::load(LIVE_ED), 2 * NEAR, T0);
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(cl.bond.0, BOND);
+    // Refund = attached - storage - bond.
+    let t = transfers();
+    assert_eq!(t.len(), 1);
+    assert!(t[0].1 > NEAR / 2 && t[0].1 < NEAR, "refund {}", t[0].1);
+    let p = c.get_program(pid).unwrap();
+    assert_eq!((p.balance.0, p.reserved.0), (bal - 5 * NEAR, 5 * NEAR));
+    ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+    drop(c.finalize(cid));
+    assert_eq!(transfers(), vec![(hunter(), 5 * NEAR + BOND)]);
+    assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Paid);
+}
+
+#[test]
+fn bond_forfeited_to_pool_on_rejected() {
+    let mut c = setup();
+    let pid = bonded_program(&mut c, tee::sha256_hex(b"x"));
+    let bal = c.get_program(pid).unwrap().balance.0;
+    let f = Fx::load(LIVE_ED);
+    let cid = submit_as(&mut c, hunter(), pid, &f, 2 * NEAR, T0);
+    ctx(owner(), 0, T0 + NANOS_PER_SEC);
+    c.dispute(cid, f.request_body());
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(cl.status, ClaimStatus::Rejected);
+    let p = c.get_program(pid).unwrap();
+    assert_eq!(p.reserved.0, 0);
+    assert_eq!(p.balance.0, bal + BOND, "bond forfeited to the pool");
+    assert!(transfers().is_empty());
+}
+
+#[test]
+fn bond_json_shape() {
+    let mut c = setup();
+    let pid = bonded_program(&mut c, Fx::load(LIVE_ED).system_prompt_hash());
+    let cid = submit_as(&mut c, hunter(), pid, &Fx::load(LIVE_ED), 2 * NEAR, T0);
+    let p = serde_json::to_value(c.get_program(pid).unwrap()).unwrap();
+    assert_eq!(p["bond"], BOND.to_string());
+    let cl = serde_json::to_value(c.get_claim(cid).unwrap()).unwrap();
+    assert_eq!(cl["bond"], BOND.to_string());
+}
+
+// ---------------- v3 #7: list_claims per-program index ----------------
+
+/// Contract with v2 programs 0 and 1, and `n` claims on program 1 (distinct reports).
+fn claims_on_program_1(n: usize) -> Contract {
+    let mut c = setup();
+    assert_eq!(create_v2(&mut c), 0);
+    assert_eq!(create_v2(&mut c), 1);
+    ctx(owner(), 5 * NEAR * n as u128, T0);
+    c.fund_program(1);
+    for i in 0..n {
+        let body = with_msg(
+            v2_req(hunter().as_str()),
+            2,
+            "content",
+            format!("REPORT\nfinding #{i}").into(),
+        );
+        submit_v2(&mut c, hunter(), 1, &body.to_string());
+    }
+    c
+}
+
+/// Gas of a fresh `list_claims` call: state is written out and read back so no collection cache
+/// hides the storage reads a real view call pays for.
+fn list_claims_gas(
+    c: Contract,
+    program_id: u64,
+    from: Option<u64>,
+    limit: Option<u64>,
+) -> (u64, Vec<Claim>) {
+    env::state_write(&c);
+    drop(c); // flushes collections
+    ctx(stranger(), 0, T0);
+    let c: Contract = env::state_read().unwrap();
+    let before = env::used_gas().as_gas();
+    let out = c.list_claims(program_id, from, limit);
+    (env::used_gas().as_gas() - before, out)
+}
+
+/// `list_claims_gas` over `claims_on_program_1(n)`, on its own thread so each run gets a fresh
+/// mocked blockchain (testing_env! keeps storage across calls within a thread).
+fn measure(n: usize, program_id: u64, from: Option<u64>, limit: Option<u64>) -> (u64, Vec<Claim>) {
+    std::thread::spawn(move || list_claims_gas(claims_on_program_1(n), program_id, from, limit))
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn list_claims_does_not_scan_other_programs() {
+    let (small, empty) = measure(2, 0, None, None);
+    let (big, empty2) = measure(30, 0, None, None);
+    assert!(empty.is_empty() && empty2.is_empty());
+    println!("list_claims(0) gas: 2 other claims {small}, 30 other claims {big}");
+    assert_eq!(
+        small, big,
+        "list_claims(0) gas must not grow with program 1's claims: 2 claims -> {small}, 30 -> {big}"
+    );
+}
+
+#[test]
+fn list_claims_late_page_costs_like_first_page() {
+    let (first, a) = measure(30, 1, None, Some(1));
+    let (late, b) = measure(30, 1, Some(29), Some(1));
+    assert_eq!((a.len(), b.len()), (1, 1));
+    println!("list_claims(1, _, 1) gas: from 0 {first}, from 29 {late}");
+    assert_eq!((a[0].id, b[0].id), (0, 29));
+    assert_eq!(
+        first, late,
+        "page cost must not depend on from_index: first {first}, from 29 -> {late}"
+    );
+}
+
+#[test]
+fn list_claims_pagination_order() {
+    let mut c = claims_on_program_1(5);
+    submit(&mut c, 0, &Fx::load(LIVE_EC)); // program 0 is v2; live sig still verifies
+    let ids = |v: Vec<Claim>| v.into_iter().map(|c| c.id).collect::<Vec<_>>();
+    assert_eq!(ids(c.list_claims(1, None, None)), vec![0, 1, 2, 3, 4]);
+    assert_eq!(ids(c.list_claims(1, Some(1), Some(2))), vec![1, 2]);
+    assert_eq!(ids(c.list_claims(1, Some(4), Some(9))), vec![4]);
+    assert!(c.list_claims(1, Some(5), None).is_empty());
+    assert!(c.list_claims(1, Some(u64::MAX), None).is_empty());
+    assert_eq!(ids(c.list_claims(0, None, None)), vec![5]);
+    assert!(c.list_claims(7, None, None).is_empty());
+}
+
+// ---------------- v3 #8: on_payout callback ----------------
+
+/// Context of the `on_payout` callback: the contract calls itself with one promise result.
+fn callback_ctx(result: near_sdk::PromiseResult) {
+    let me = accounts(5);
+    testing_env!(
+        VMContextBuilder::new()
+            .current_account_id(me.clone())
+            .predecessor_account_id(me)
+            .block_timestamp(T0 + 60 * NANOS_PER_SEC)
+            .build(),
+        near_sdk::test_vm_config(),
+        near_sdk::RuntimeFeesConfig::test(),
+        Default::default(),
+        vec![result],
+    );
+}
+
+/// Bonded, finalized (Paid) claim; returns (contract, program id, claim id, balance after submit).
+fn finalized() -> (Contract, u64, u64, u128) {
+    let mut c = setup();
+    let pid = bonded_program(&mut c, Fx::load(LIVE_ED).system_prompt_hash());
+    let cid = submit_as(&mut c, hunter(), pid, &Fx::load(LIVE_ED), 2 * NEAR, T0);
+    let bal = c.get_program(pid).unwrap().balance.0;
+    ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+    drop(c.finalize(cid));
+    assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Paid);
+    (c, pid, cid, bal)
+}
+
+#[test]
+fn finalize_chains_on_payout_callback() {
+    let (_, _, cid, _) = finalized();
+    let calls: Vec<(String, Vec<u8>)> = get_created_receipts()
+        .into_iter()
+        .flat_map(|r| r.actions)
+        .filter_map(|a| match a {
+            MockAction::FunctionCallWeight {
+                method_name, args, ..
+            } => Some((String::from_utf8(method_name).unwrap(), args)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "on_payout");
+    let args: Value = serde_json::from_slice(&calls[0].1).unwrap();
+    assert_eq!(args, json!({"claim_id": cid}));
+}
+
+#[test]
+fn on_payout_success_keeps_paid() {
+    let (mut c, pid, cid, bal) = finalized();
+    callback_ctx(near_sdk::PromiseResult::Successful(vec![]));
+    assert!(c.on_payout(cid));
+    assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Paid);
+    let p = c.get_program(pid).unwrap();
+    assert_eq!((p.balance.0, p.reserved.0), (bal, 0));
+}
+
+#[test]
+fn on_payout_failure_credits_program() {
+    let (mut c, pid, cid, bal) = finalized();
+    callback_ctx(near_sdk::PromiseResult::Failed);
+    assert!(!c.on_payout(cid));
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(cl.status, ClaimStatus::PayoutFailed);
+    let p = c.get_program(pid).unwrap();
+    assert_eq!((p.balance.0, p.reserved.0), (bal + 5 * NEAR + BOND, 0));
+    let ev = events();
+    assert_eq!(ev[0]["event"], "payout_failed");
+    assert_eq!(ev[0]["data"][0]["amount"], (5 * NEAR + BOND).to_string());
+    assert_eq!(serde_json::to_value(&cl).unwrap()["status"], "PayoutFailed");
+    // Not finalizable or disputable again.
+    ctx(stranger(), 0, T0 + 61 * NANOS_PER_SEC);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(c.finalize(cid))));
+    assert!(r.is_err());
+}
+
+#[test]
+#[should_panic(expected = "claim not paid")]
+fn on_payout_failure_only_once() {
+    let (mut c, _, cid, _) = finalized();
+    callback_ctx(near_sdk::PromiseResult::Failed);
+    c.on_payout(cid);
+    c.on_payout(cid);
+}
+
+// ---------------- integration: #6 revocation x #4 bond ----------------
+
+/// A revoked-signer claim is Rejected at finalize: no transfer, payout and bond go to the pool.
+#[test]
+fn revoked_signer_forfeits_bond() {
+    let mut c = setup();
+    let f = Fx::load(LIVE_ED);
+    let pid = bonded_program(&mut c, f.system_prompt_hash());
+    let bal = c.get_program(pid).unwrap().balance.0;
+    let cid = submit_as(&mut c, hunter(), pid, &f, 2 * NEAR, T0);
+    ctx(admin(), 0, T0 + NANOS_PER_SEC);
+    c.revoke_signer(f.signer());
+    ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+    assert!(matches!(c.finalize(cid), PromiseOrValue::Value(())));
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(
+        (cl.status, cl.reject_reason.as_deref()),
+        (ClaimStatus::Rejected, Some("signer revoked"))
+    );
+    assert!(transfers().is_empty(), "no payout, no bond refund");
+    let p = c.get_program(pid).unwrap();
+    assert_eq!((p.balance.0, p.reserved.0), (bal + BOND, 0));
 }

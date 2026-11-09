@@ -6,10 +6,10 @@ pub mod tee;
 use near_sdk::json_types::{Base64VecU8, U64, U128};
 use near_sdk::serde::Deserialize;
 use near_sdk::serde_json::{self, json};
-use near_sdk::store::{IterableMap, LookupSet};
+use near_sdk::store::{IterableMap, LookupMap, LookupSet, Vector};
 use near_sdk::{
-    AccountId, BorshStorageKey, NearToken, PanicOnDefault, Promise, PromiseOrValue, env, near,
-    require,
+    AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promise, PromiseError,
+    PromiseOrValue, env, near, require,
 };
 
 use tee::Severity;
@@ -17,6 +17,8 @@ pub use tee::{SigKind, Signer, Verdict};
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 const DEFAULT_LIMIT: u64 = 50;
+/// Static gas for the `on_payout` callback (reads/writes one claim + one program).
+const GAS_ON_PAYOUT: Gas = Gas::from_tgas(10);
 
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,6 +69,8 @@ pub struct Program {
     /// creation (model-matched). Later `add_signer` calls don't affect it; the owner rotates it
     /// with `set_program_signers`.
     pub signers: Vec<Signer>,
+    /// Hunter stake (yocto) attached on top of storage to `submit_claim`. v3 #4.
+    pub bond: U128,
     pub payouts: Payouts,
     pub owner_enc_pubkey: String,
     pub dispute_secs: u64,
@@ -85,6 +89,9 @@ pub enum ClaimStatus {
     Pending,
     Rejected,
     Paid,
+    /// The payout transfer failed (e.g. the hunter account was deleted); payout + bond went back
+    /// to the program balance. v3 #8.
+    PayoutFailed,
 }
 
 #[near(serializers = [borsh, json])]
@@ -106,6 +113,8 @@ pub struct Claim {
     pub submitted_at: U64,
     pub finalize_after: U64,
     pub reject_reason: Option<String>,
+    /// Hunter bond held by this claim: returned on Paid, forfeited to the pool on Rejected. v3 #4.
+    pub bond: U128,
 }
 
 #[near]
@@ -116,6 +125,8 @@ enum StorageKey {
     Claims,
     UsedReqHashes,
     Revoked,
+    ClaimsByProgram,
+    ProgramClaims { program_id: u64 },
 }
 
 #[near(contract_state)]
@@ -125,6 +136,9 @@ pub struct Contract {
     signers: IterableMap<Signer, SignerMeta>,
     programs: IterableMap<u64, Program>,
     claims: IterableMap<u64, Claim>,
+    /// Per-program claim ids in submission order, so `list_claims` never scans other programs (#7).
+    claims_by_program: LookupMap<u64, Vector<u64>>,
+    /// Keys are `dedupe_key(program_id, req_hash)` = `"<program_id>:<req_hash>"`.
     used_req_hashes: LookupSet<String>,
     next_program_id: u64,
     next_claim_id: u64,
@@ -146,6 +160,12 @@ fn charge_storage(before: u64, attached: NearToken) -> NearToken {
     let cost = env::storage_byte_cost().saturating_mul(used as u128);
     require!(attached >= cost, "insufficient storage deposit");
     cost
+}
+
+/// `used_req_hashes` key: duplicates are per program (v3 #5), so a judgement copied into another
+/// program can't burn the hash for the real one.
+pub(crate) fn dedupe_key(program_id: u64, req_hash: &str) -> String {
+    format!("{program_id}:{req_hash}")
 }
 
 /// Lenient shape of the judge request (unknown fields ignored) for the prompt/model/code checks;
@@ -391,6 +411,7 @@ impl Contract {
             signers: IterableMap::new(StorageKey::Signers),
             programs: IterableMap::new(StorageKey::Programs),
             claims: IterableMap::new(StorageKey::Claims),
+            claims_by_program: LookupMap::new(StorageKey::ClaimsByProgram),
             used_req_hashes: LookupSet::new(StorageKey::UsedReqHashes),
             next_program_id: 0,
             next_claim_id: 0,
@@ -511,6 +532,7 @@ impl Contract {
         owner_enc_pubkey: String,
         dispute_secs: u64,
         min_confidence: u8,
+        bond: U128,
         signers: Option<Vec<Signer>>,
     ) -> u64 {
         let system_prompt_hash = tee::normalize_hash_hex(&system_prompt_hash)
@@ -544,6 +566,7 @@ impl Contract {
                 code_hash,
                 params_hash,
                 signers,
+                bond,
                 payouts,
                 owner_enc_pubkey,
                 dispute_secs,
@@ -631,7 +654,7 @@ impl Contract {
 
     // ---------------- claims ----------------
 
-    /// Payable for storage; unused deposit is refunded to the caller.
+    /// Payable: storage + `program.bond` (else "insufficient bond"); the rest is refunded.
     #[payable]
     #[allow(clippy::too_many_arguments)]
     pub fn submit_claim(
@@ -680,7 +703,8 @@ impl Contract {
 
         // verify_tee_signature already validated it; normalise so case variants can't replay.
         let req_hash = tee::normalize_hash_hex(&req_hash).unwrap_or_else(|e| env::panic_str(&e));
-        require!(!self.used_req_hashes.contains(&req_hash), "already claimed");
+        let key = dedupe_key(program_id, &req_hash);
+        require!(!self.used_req_hashes.contains(&key), "already claimed");
 
         let payout = program.payouts.for_severity(verdict.severity);
         require!(payout <= program.balance.0, "insufficient pool");
@@ -688,6 +712,7 @@ impl Contract {
         let now = env::block_timestamp();
         let finalize_after = now + program.dispute_secs * NANOS_PER_SEC;
         let model = program.model_id.clone();
+        let bond = program.bond.0;
 
         let p = self.program_mut(program_id);
         p.balance = U128(p.balance.0 - payout);
@@ -698,7 +723,7 @@ impl Contract {
         let hunter = env::predecessor_account_id();
         let resp_hash = tee::sha256_hex(&resp_body.0);
         let severity = verdict.severity;
-        self.used_req_hashes.insert(req_hash.clone());
+        self.used_req_hashes.insert(key);
         self.claims.insert(
             id,
             Claim {
@@ -718,13 +743,27 @@ impl Contract {
                 submitted_at: U64(now),
                 finalize_after: U64(finalize_after),
                 reject_reason: None,
+                bond: U128(bond),
             },
         );
+        let ids = self
+            .claims_by_program
+            .entry(program_id)
+            .or_insert_with(|| Vector::new(StorageKey::ProgramClaims { program_id }));
+        ids.push(id);
+        ids.flush();
+        self.claims_by_program.flush();
         self.programs.flush();
         self.claims.flush();
 
         let cost = charge_storage(before, attached);
-        let refund = attached.saturating_sub(cost);
+        require!(
+            attached.as_yoctonear() >= cost.as_yoctonear() + bond,
+            "insufficient bond"
+        );
+        let refund = attached
+            .saturating_sub(cost)
+            .saturating_sub(NearToken::from_yoctonear(bond));
         if !refund.is_zero() {
             Promise::new(hunter.clone()).transfer(refund).detach();
         }
@@ -732,7 +771,8 @@ impl Contract {
             "claim_submitted",
             json!({
                 "claim_id": id, "program_id": program_id, "hunter": hunter, "req_hash": req_hash,
-                "severity": severity, "payout": U128(payout), "finalize_after": U64(finalize_after),
+                "severity": severity, "payout": U128(payout), "bond": U128(bond),
+                "finalize_after": U64(finalize_after),
             }),
         );
         id
@@ -765,25 +805,27 @@ impl Contract {
         let reason = tamper_reason(program, &claim.hunter, &request_body)
             .unwrap_or_else(|| env::panic_str("dispute invalid: request matches program"));
 
-        let (program_id, payout) = (claim.program_id, claim.payout.0);
+        let (program_id, payout, bond) = (claim.program_id, claim.payout.0, claim.bond.0);
         if reason == HUNTER_MISMATCH {
-            let req_hash = claim.req_hash.clone();
-            self.used_req_hashes.remove(&req_hash);
+            let key = dedupe_key(program_id, &claim.req_hash);
+            self.used_req_hashes.remove(&key);
         }
         let c = self.claims.get_mut(&claim_id).unwrap();
         c.status = ClaimStatus::Rejected;
         c.reject_reason = Some(reason.to_string());
         let p = self.program_mut(program_id);
         p.reserved = U128(p.reserved.0 - payout);
-        p.balance = U128(p.balance.0 + payout);
+        // Payout back to the pool; the hunter's bond is forfeited to it too.
+        p.balance = U128(p.balance.0 + payout + bond);
         emit(
             "claim_rejected",
             json!({"claim_id": claim_id, "program_id": program_id, "reason": reason}),
         );
     }
 
-    /// Anyone, once the dispute window has passed. Pays the hunter, or rejects the claim with
-    /// "signer revoked" if its signer was revoked meanwhile (#6; funds return to the pool).
+    /// Anyone, once the dispute window has passed. Pays the hunter `payout + bond`, then
+    /// `on_payout` credits it back to the program if the transfer failed. Rejects the claim with
+    /// "signer revoked" if its signer was revoked meanwhile (#6; payout and bond go to the pool).
     pub fn finalize(&mut self, claim_id: u64) -> PromiseOrValue<()> {
         let c = self
             .claims
@@ -797,10 +839,11 @@ impl Contract {
         if self.revoked.contains(&c.signer) {
             c.status = ClaimStatus::Rejected;
             c.reject_reason = Some(SIGNER_REVOKED.to_string());
-            let (program_id, payout) = (c.program_id, c.payout.0);
+            let (program_id, payout, bond) = (c.program_id, c.payout.0, c.bond.0);
             let p = self.program_mut(program_id);
             p.reserved = U128(p.reserved.0 - payout);
-            p.balance = U128(p.balance.0 + payout);
+            // Payout back to the pool; the hunter's bond is forfeited to it too (#4).
+            p.balance = U128(p.balance.0 + payout + bond);
             emit(
                 "claim_rejected",
                 json!({"claim_id": claim_id, "program_id": program_id, "reason": SIGNER_REVOKED}),
@@ -808,16 +851,47 @@ impl Contract {
             return PromiseOrValue::Value(());
         }
         c.status = ClaimStatus::Paid;
-        let (program_id, payout, hunter) = (c.program_id, c.payout.0, c.hunter.clone());
+        let (program_id, payout, bond, hunter) =
+            (c.program_id, c.payout.0, c.bond.0, c.hunter.clone());
         let p = self.program_mut(program_id);
         p.reserved = U128(p.reserved.0 - payout);
         emit(
             "claim_paid",
-            json!({"claim_id": claim_id, "program_id": program_id, "hunter": hunter, "payout": U128(payout)}),
+            json!({"claim_id": claim_id, "program_id": program_id, "hunter": hunter, "payout": U128(payout), "bond": U128(bond)}),
         );
         Promise::new(hunter)
-            .transfer(NearToken::from_yoctonear(payout))
+            .transfer(NearToken::from_yoctonear(payout + bond))
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_ON_PAYOUT)
+                    .on_payout(claim_id),
+            )
             .into()
+    }
+
+    /// Callback of `finalize`'s transfer. On failure the transfer was refunded to this contract:
+    /// mark the claim PayoutFailed and credit payout + bond back to the program balance, so the
+    /// funds are not stranded. Returns whether the payout succeeded.
+    #[private]
+    pub fn on_payout(&mut self, claim_id: u64) -> bool {
+        // A transfer has no return data; any non-empty result is still a success.
+        if !matches!(env::promise_result_checked(0, 0), Err(PromiseError::Failed)) {
+            return true;
+        }
+        let c = self
+            .claims
+            .get_mut(&claim_id)
+            .unwrap_or_else(|| env::panic_str("claim not found"));
+        require!(c.status == ClaimStatus::Paid, "claim not paid");
+        c.status = ClaimStatus::PayoutFailed;
+        let (program_id, amount, hunter) = (c.program_id, c.payout.0 + c.bond.0, c.hunter.clone());
+        let p = self.program_mut(program_id);
+        p.balance = U128(p.balance.0 + amount);
+        emit(
+            "payout_failed",
+            json!({"claim_id": claim_id, "program_id": program_id, "hunter": hunter, "amount": U128(amount)}),
+        );
+        false
     }
 
     // ---------------- views ----------------
@@ -840,19 +914,23 @@ impl Contract {
         self.claims.get(&id).cloned()
     }
 
-    /// Claims of `program_id`, skipping the first `from_index` of them, up to `limit` (default 50).
+    /// Claims of `program_id` in submission order, skipping the first `from_index` of them, up to
+    /// `limit` (default 50). Paginates the per-program index: cost is O(page), not O(all claims).
     pub fn list_claims(
         &self,
         program_id: u64,
         from_index: Option<u64>,
         limit: Option<u64>,
     ) -> Vec<Claim> {
-        self.claims
-            .values()
-            .filter(|c| c.program_id == program_id)
-            .skip(from_index.unwrap_or(0) as usize)
-            .take(limit.unwrap_or(DEFAULT_LIMIT) as usize)
-            .cloned()
+        let Some(ids) = self.claims_by_program.get(&program_id) else {
+            return vec![];
+        };
+        let len = u64::from(ids.len());
+        let from = from_index.unwrap_or(0).min(len);
+        let end = from.saturating_add(limit.unwrap_or(DEFAULT_LIMIT)).min(len);
+        (from..end)
+            .filter_map(|i| ids.get(i as u32))
+            .filter_map(|id| self.claims.get(id).cloned())
             .collect()
     }
 

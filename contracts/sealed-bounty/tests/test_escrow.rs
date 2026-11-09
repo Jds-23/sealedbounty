@@ -9,6 +9,8 @@ use near_sdk::serde_json::{self, Value, json};
 
 const NEAR: u128 = 10u128.pow(24);
 const DISPUTE_SECS: u64 = 20;
+/// Hunter bond for the v2 demo program (v3 #4).
+const BOND: u128 = NEAR / 2;
 /// code_hash for programs judged with v1 (live) bodies; never matches.
 const PLACEHOLDER_CODE_HASH: &str =
     "00000000000000000000000000000000000000000000000000000000000000c0";
@@ -228,6 +230,19 @@ impl Env {
         min_conf: u8,
         deposit: u128,
     ) -> u64 {
+        self.create_program_bonded(c, f, hash, min_conf, deposit, 0)
+            .await
+    }
+
+    async fn create_program_bonded(
+        &self,
+        c: &AccountId,
+        f: &Fx,
+        hash: String,
+        min_conf: u8,
+        deposit: u128,
+        bond: u128,
+    ) -> u64 {
         let args = json!({
             "name": "demo", "repo_url": "https://github.com/x/y", "commit": "abc123",
             "model_id": f.s("model"), "system_prompt_hash": hash,
@@ -235,6 +250,7 @@ impl Env {
             "payouts": { "low": (NEAR / 2).to_string(), "medium": NEAR.to_string(),
                          "high": (2 * NEAR).to_string(), "critical": (4 * NEAR).to_string() },
             "owner_enc_pubkey": "b3duZXJwdWI=", "dispute_secs": DISPUTE_SECS, "min_confidence": min_conf,
+            "bond": bond.to_string(),
             "signers": null,
         });
         let r = self
@@ -388,7 +404,11 @@ async fn escrow_end_to_end_live_fixtures() -> testresult::TestResult<()> {
         let r = e
             .ok(&c, &e.stranger, "finalize", json!({ "claim_id": cid }), 0)
             .await;
-        println!("  [GAS] finalize ({algo}): {}", tgas(r.total_gas_burnt));
+        println!(
+            "  [GAS] finalize + on_payout ({algo}): {}",
+            tgas(r.total_gas_burnt)
+        );
+        assert!(r.json::<bool>()?, "on_payout reports success");
         let after = e.balance(&e.hunter).await;
         assert_eq!(
             after - before,
@@ -559,6 +579,7 @@ async fn escrow_end_to_end_live_fixtures() -> testresult::TestResult<()> {
             "payouts": { "low": (NEAR / 2).to_string(), "medium": NEAR.to_string(),
                          "high": (2 * NEAR).to_string(), "critical": (4 * NEAR).to_string() },
             "owner_enc_pubkey": "b3duZXJwdWI=", "dispute_secs": DISPUTE_SECS, "min_confidence": 0,
+            "bond": "0",
             "signers": ["ed25519:".to_string() + &"00".repeat(32)],
         });
         e.fail(
@@ -661,6 +682,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
         "payouts": { "low": (NEAR / 2).to_string(), "medium": NEAR.to_string(),
                      "high": (2 * NEAR).to_string(), "critical": (3 * NEAR).to_string() },
         "owner_enc_pubkey": "b3duZXJwdWI=", "dispute_secs": DISPUTE_SECS, "min_confidence": 80,
+        "bond": BOND.to_string(),
         "signers": null,
     });
     let pid: u64 = e
@@ -670,7 +692,21 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
     let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
     assert_eq!(p["code_hash"], code_hash, "stored lowercase");
     assert_eq!(p["params_hash"], DEMO_PARAMS_HASH);
+    assert_eq!(u128_of(&p["bond"]), BOND);
     let bal0 = u128_of(&p["balance"]);
+    // storage + bond
+    let dep = NEAR / 10 + BOND;
+
+    // storage-only deposit no longer reserves the pool (#4)
+    e.fail(
+        &c,
+        &e.hunter,
+        "submit_claim",
+        sqli.claim_args(pid),
+        NEAR / 10,
+        "insufficient bond",
+    )
+    .await;
 
     // bogus report: TEE said not valid
     e.fail(
@@ -678,20 +714,14 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
         &e.hunter,
         "submit_claim",
         bogus.claim_args(pid),
-        NEAR / 10,
+        dep,
         "verdict not payable",
     )
     .await;
 
     // ---- front-running: stranger copies the hunter's signed sqli claim ----
     let front: u64 = e
-        .ok(
-            &c,
-            &e.stranger,
-            "submit_claim",
-            sqli.claim_args(pid),
-            NEAR / 10,
-        )
+        .ok(&c, &e.stranger, "submit_claim", sqli.claim_args(pid), dep)
         .await
         .json()?;
     e.fail(
@@ -699,7 +729,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
         &e.hunter,
         "submit_claim",
         sqli.claim_args(pid),
-        NEAR / 10,
+        dep,
         "already claimed",
     )
     .await;
@@ -712,19 +742,18 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
     let claim: Value = e.view(&c, "get_claim", json!({ "id": front })).await;
     assert_eq!(claim["status"], "Rejected");
     assert_eq!(claim["reject_reason"], "hunter mismatch");
+    assert_eq!(u128_of(&claim["bond"]), BOND);
     let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
-    assert_eq!(u128_of(&p["balance"]), bal0);
+    assert_eq!(
+        u128_of(&p["balance"]),
+        bal0 + BOND,
+        "front-runner's bond forfeited"
+    );
     assert_eq!(u128_of(&p["reserved"]), 0);
 
     // ---- real hunter resubmits the same signed verdict ----
     let cid: u64 = e
-        .ok(
-            &c,
-            &e.hunter,
-            "submit_claim",
-            sqli.claim_args(pid),
-            NEAR / 10,
-        )
+        .ok(&c, &e.hunter, "submit_claim", sqli.claim_args(pid), dep)
         .await
         .json()?;
     let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
@@ -737,7 +766,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
         &e.hunter,
         "submit_claim",
         sqli_ec.claim_args(pid),
-        NEAR / 10,
+        dep,
         "already claimed",
     )
     .await;
@@ -755,18 +784,12 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
     // ---- fakecode: TEE judged invented code valid/critical; owner proves code mismatch ----
     assert_eq!(fake.0["verdict"]["severity"], "critical");
     let fid: u64 = e
-        .ok(
-            &c,
-            &e.hunter,
-            "submit_claim",
-            fake.claim_args(pid),
-            NEAR / 10,
-        )
+        .ok(&c, &e.hunter, "submit_claim", fake.claim_args(pid), dep)
         .await
         .json()?;
     let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
     assert_eq!(u128_of(&p["reserved"]), 6 * NEAR);
-    assert_eq!(u128_of(&p["balance"]), bal0 - 6 * NEAR);
+    assert_eq!(u128_of(&p["balance"]), bal0 + BOND - 6 * NEAR);
     let rf = json!({ "claim_id": fid, "request_body": fake.s("request_body") });
     let r = e.ok(&c, &e.owner, "dispute", rf, 0).await;
     println!("  [GAS] dispute code mismatch: {}", tgas(r.total_gas_burnt));
@@ -775,7 +798,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
     assert_eq!(claim["reject_reason"], "code mismatch");
     let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
     assert_eq!(u128_of(&p["reserved"]), 3 * NEAR, "fakecode payout back");
-    assert_eq!(u128_of(&p["balance"]), bal0 - 3 * NEAR);
+    assert_eq!(u128_of(&p["balance"]), bal0 + 2 * BOND - 3 * NEAR);
 
     // ---- finalize the honest sqli claim ----
     let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
@@ -784,13 +807,126 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
     let before = e.balance(&e.hunter).await;
     e.ok(&c, &e.stranger, "finalize", json!({ "claim_id": cid }), 0)
         .await;
-    assert_eq!(e.balance(&e.hunter).await - before, 3 * NEAR);
+    assert_eq!(
+        e.balance(&e.hunter).await - before,
+        3 * NEAR + BOND,
+        "payout + bond returned"
+    );
     let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
     assert_eq!(claim["status"], "Paid");
     e.fail(&c, &e.owner, "dispute", rb, 0, "claim not pending")
         .await;
     let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
     assert_eq!(u128_of(&p["reserved"]), 0);
-    assert_eq!(u128_of(&p["balance"]), bal0 - 3 * NEAR);
+    assert_eq!(u128_of(&p["balance"]), bal0 + 2 * BOND - 3 * NEAR);
+    Ok(())
+}
+
+/// v3 #8: the hunter's account is deleted before finalize, so the payout transfer fails. The
+/// payout + bond must not be stranded on the contract account: the claim becomes "PayoutFailed"
+/// and the program balance is credited payout + bond.
+#[tokio::test]
+async fn finalize_to_deleted_hunter_credits_program() -> testresult::TestResult<()> {
+    let e = start("hunter.sandbox").await?;
+    let f = Fx::load("live.ed25519.json");
+    let c = e.deploy("esc-payout.sandbox").await;
+    let pid = e
+        .create_program_bonded(&c, &f, f.system_prompt_hash(), 0, 10 * NEAR, BOND)
+        .await;
+    let bal0 = u128_of(
+        &e.view::<Value>(&c, "get_program", json!({ "id": pid }))
+            .await["balance"],
+    );
+    let cid: u64 = e
+        .ok(
+            &c,
+            &e.hunter,
+            "submit_claim",
+            f.claim_args(pid),
+            NEAR / 10 + BOND,
+        )
+        .await
+        .json()?;
+    let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
+    assert_eq!(u128_of(&claim["payout"]), 2 * NEAR);
+
+    // The hunter deletes their account (beneficiary: stranger).
+    near_api::Account(e.hunter.clone())
+        .delete_account_with_beneficiary(e.stranger.clone())
+        .with_signer(e.key.clone())
+        .send_to(&e.net)
+        .await?
+        .assert_success();
+    let gone = near_api::Account(e.hunter.clone())
+        .view()
+        .fetch_from(&e.net)
+        .await;
+    assert!(gone.is_err(), "hunter account deleted");
+
+    e.advance_past(claim["finalize_after"].as_str().unwrap().parse::<u64>()?)
+        .await;
+    let contract_before = e.balance(&c).await;
+    let r = e
+        .call(&c, &e.stranger, "finalize", json!({ "claim_id": cid }), 0)
+        .await;
+    match &r {
+        Ok(s) => println!(
+            "  [GAS] finalize, failed payout + on_payout: {}",
+            tgas(s.total_gas_burnt)
+        ),
+        Err(err) => println!(
+            "  finalize outcome: failure, gas {}",
+            tgas(err.total_gas_burnt)
+        ),
+    }
+
+    let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
+    assert_eq!(claim["status"], "PayoutFailed");
+    let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
+    assert_eq!(u128_of(&p["reserved"]), 0);
+    assert_eq!(
+        u128_of(&p["balance"]),
+        bal0 + BOND,
+        "payout + bond credited back to the pool"
+    );
+    // The refunded transfer stays on the contract account, now accounted for.
+    let contract_after = e.balance(&c).await;
+    assert!(
+        contract_after + NEAR / 100 > contract_before,
+        "transfer refunded to the contract"
+    );
+    assert!(r.is_ok(), "on_payout handles the failure without panicking");
+    assert!(!r.unwrap().json::<bool>()?, "on_payout reports the failure");
+    // Only the contract itself may call the callback.
+    e.fail(
+        &c,
+        &e.stranger,
+        "on_payout",
+        json!({ "claim_id": cid }),
+        0,
+        "Method on_payout is private",
+    )
+    .await;
+    e.fail(
+        &c,
+        &e.stranger,
+        "finalize",
+        json!({ "claim_id": cid }),
+        0,
+        "claim not pending",
+    )
+    .await;
+
+    // The owner can now withdraw it.
+    let before = e.balance(&e.owner).await;
+    e.ok(
+        &c,
+        &e.owner,
+        "close_program",
+        json!({ "program_id": pid }),
+        0,
+    )
+    .await;
+    assert!(e.balance(&e.owner).await > before + bal0 + BOND - NEAR / 100);
     Ok(())
 }
