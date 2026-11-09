@@ -11,9 +11,10 @@ names the hunter, so invented code and front-run claims can be disputed. The bin
 4. During `dispute_secs`, the owner can `dispute` by revealing the exact request body (its sha256 must equal the claim's `req_hash`). The claim is `Rejected` with the FIRST failing reason below, and the payout returns to `balance`:
    1. `system prompt tampered`: not JSON, `messages[0]` not `system`, its sha256 ≠ `system_prompt_hash`, or more than 3 messages
    2. `model mismatch`: `model` ≠ `program.model_id`
-   3. `code mismatch`: `messages[1]` is not a `user` message equal to `TARGET <repo_url>@<commit>\nHUNTER <hunter>\n\nCODE\n<bundle>` with sha256(bundle) = `code_hash`. The TARGET line, the framing and the code hash are checked first, so a wrong TARGET or wrong code wins over a wrong HUNTER line.
-   4. `hunter mismatch`: everything else in `messages[1]` matches but the HUNTER line ≠ `claim.hunter` (someone front-ran the real hunter's signed claim). The `req_hash` is also released from `used_req_hashes`, so the real hunter can resubmit the same signed verdict.
-   5. `report missing`: `messages[2]` missing, not `user`, or not starting with `REPORT\n`
+   3. `params tampered` (v3, #1): the top-level keys are not exactly `model, messages, response_format, chat_template_kwargs, temperature, max_tokens`, a message is not exactly `{role, content}`, a key is duplicated anywhere, or sha256 of the canonical JSON (keys sorted recursively, compact) of `{chat_template_kwargs, max_tokens, response_format, temperature}` ≠ `params_hash`
+   4. `code mismatch`: `messages[1]` is not a `user` message equal to `TARGET <repo_url>@<commit>\nHUNTER <hunter>\n\nCODE\n<bundle>` with sha256(bundle) = `code_hash`. The TARGET line, the framing and the code hash are checked first, so a wrong TARGET or wrong code wins over a wrong HUNTER line.
+   5. `hunter mismatch`: everything else in `messages[1]` matches but the HUNTER line ≠ `claim.hunter` (someone front-ran the real hunter's signed claim). The `req_hash` is also released from `used_req_hashes`, so the real hunter can resubmit the same signed verdict.
+   6. `report missing`: `messages[2]` missing, not `user`, or not starting with `REPORT\n`
 
    If every check passes, `dispute` panics with `dispute invalid: request matches program`.
 5. After the window, anyone can call `finalize`. The claim becomes `Paid` and the payout is transferred to the hunter.
@@ -23,7 +24,7 @@ names the hunter, so invented code and front-run claims can be disputed. The bin
 |---|---|---|
 | `new(owner?)` | init | admin = `owner` or caller |
 | `add_signer(signer, meta)` / `remove_signer(signer)` | admin | `signer` = `"ed25519:<hex>"` / `"eth:0x<hex>"`, `meta = {kind, model?}` |
-| `create_program(name, repo_url, commit, model_id, system_prompt_hash, code_hash, payouts, owner_enc_pubkey, dispute_secs, min_confidence) -> u64` | anyone, payable | ids start at 0. Both hashes are 64 hex chars and are stored lowercase |
+| `create_program(name, repo_url, commit, model_id, system_prompt_hash, code_hash, params_hash, payouts, owner_enc_pubkey, dispute_secs, min_confidence) -> u64` | anyone, payable | ids start at 0. All hashes are 64 hex chars and are stored lowercase |
 | `fund_program(program_id)` | anyone, payable | program must be open |
 | `close_program(program_id)` | program owner | refunds `balance`, keeps `reserved`. Can be called again to sweep funds from claims rejected later |
 | `submit_claim(program_id, req_hash, resp_body, signature, signer, kind, ciphertext) -> u64` | hunter, payable (storage) | |
@@ -43,7 +44,7 @@ Panic strings: `owner only`, `program owner only`, `program not found`, `program
 `bad signature`, `bad completion json: ...`/`bad verdict json: ...`, `verdict not payable`,
 `already claimed`, `insufficient pool`, `insufficient storage deposit`, `body mismatch`,
 `dispute invalid: request matches program`, `dispute window closed`, `dispute window open`,
-`system_prompt_hash must be 64 hex chars`, `code_hash must be 64 hex chars`, `min_confidence must be <= 100`, `attach a deposit`.
+`system_prompt_hash must be 64 hex chars`, `code_hash must be 64 hex chars`, `params_hash must be 64 hex chars`, `min_confidence must be <= 100`, `attach a deposit`.
 
 ## Build / test / deploy
 ```sh

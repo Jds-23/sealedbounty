@@ -122,6 +122,7 @@ fn create(
         model.into(),
         hash,
         CODE_HASH_PLACEHOLDER.into(),
+        v2_params_hash(),
         payouts(),
         "b3duZXJwdWI=".into(),
         secs,
@@ -492,14 +493,15 @@ fn pending() -> (Contract, u64, u64, Fx) {
 }
 
 #[test]
-fn dispute_v1_body_is_code_mismatch() {
-    // Live fixture: right prompt + model, but v1 single-user-message format -> code mismatch.
+fn dispute_v1_body_is_params_tampered() {
+    // Live fixture: right prompt + model, but the v1 body has an extra `stream` key -> params
+    // tampered (v3 #1 strict shape; in v2 this was "code mismatch").
     let (mut c, pid, cid, f) = pending();
     ctx(owner(), 0, T0 + NANOS_PER_SEC);
     c.dispute(cid, f.request_body());
     let cl = c.get_claim(cid).unwrap();
     assert_eq!(cl.status, ClaimStatus::Rejected);
-    assert_eq!(cl.reject_reason.as_deref(), Some("code mismatch"));
+    assert_eq!(cl.reject_reason.as_deref(), Some("params tampered"));
     assert_eq!(c.get_program(pid).unwrap().reserved.0, 0);
     // Not a hunter mismatch: req_hash stays used.
     assert!(c.used_req_hashes.contains(&f.s("req_hash")));
@@ -747,6 +749,7 @@ fn create_v2(c: &mut Contract) -> u64 {
         MODEL.into(),
         tee::sha256_hex(SYS.as_bytes()),
         tee::sha256_hex(BUNDLE.as_bytes()).to_uppercase(),
+        v2_params_hash().to_uppercase(),
         payouts(),
         "b3duZXJwdWI=".into(),
         60,
@@ -831,6 +834,7 @@ fn create_program_bad_code_hash() {
         MODEL.into(),
         tee::sha256_hex(SYS.as_bytes()),
         "zz".repeat(32),
+        v2_params_hash(),
         payouts(),
         "k".into(),
         60,
@@ -1278,8 +1282,117 @@ fn tamper_reasons_params_order() {
         Some("params tampered")
     );
     // a duplicated `model` key is a parse failure, as in v2
-    let dup_model = v2_req(h.as_str())
-        .to_string()
-        .replacen("\"model\":", "\"model\":\"x\",\"model\":", 1);
+    let dup_model =
+        v2_req(h.as_str())
+            .to_string()
+            .replacen("\"model\":", "\"model\":\"x\",\"model\":", 1);
     assert_eq!(tamper_reason(&p, &h, &dup_model), Some(TAMPERED));
+}
+
+/// params_hash of the in-test v2 request (`v2_req`; same for any hunter).
+fn v2_params_hash() -> String {
+    request_params_hash(&v2_req("anyone").to_string()).unwrap()
+}
+
+/// sha256hex(canonicalJson(params)) of the real demo request, as computed by shared/judge.mjs
+/// `paramsHash()` (pinned in shared/test/params.test.mjs too).
+const DEMO_PARAMS_HASH_JS: &str =
+    "61b52e7b87e42a2bc4b6f417d21ba0e9d44f3e1f4ff49fa9d2f3334e5aa0eda7";
+
+#[test]
+fn params_hash_matches_js_for_demo_fixtures() {
+    for f in [
+        include_str!("../tests/fixtures/demo.sqli.json"),
+        include_str!("../tests/fixtures/demo.sqli.ecdsa.json"),
+        include_str!("../tests/fixtures/demo.bogus.json"),
+        include_str!("../tests/fixtures/demo.fakecode.json"),
+    ] {
+        let body = Fx::load(f).request_body();
+        assert_eq!(
+            request_params_hash(&body).as_deref(),
+            Some(DEMO_PARAMS_HASH_JS)
+        );
+    }
+    // v1 live bodies carry an extra `stream` key: not the canonical shape
+    assert_eq!(request_params_hash(&Fx::load(LIVE_ED).request_body()), None);
+}
+
+#[test]
+fn canonical_json_sorts_despite_preserve_order() {
+    // near-sdk turns on serde_json/preserve_order, so Value keeps insertion order...
+    let v: Value =
+        serde_json::from_str(r#"{"b":1,"a":{"d":[{"z":0,"y":1.5}],"c":"q\"\n\u0001é"}}"#).unwrap();
+    // ...but canonical_json sorts every object.
+    assert_eq!(
+        canonical_json(&v),
+        r#"{"a":{"c":"q\"\n\u0001é","d":[{"y":1.5,"z":0}]},"b":1}"#
+    );
+    // byte order (as JS canonicalJson): U+FF5E (EF BD 9E) < U+1F600 (F0 9F 98 80)
+    let v: Value = serde_json::from_str("{\"\u{1F600}\":1,\"\u{FF5E}\":2}").unwrap();
+    assert_eq!(canonical_json(&v), "{\"\u{FF5E}\":2,\"\u{1F600}\":1}");
+    // key order and whitespace of the body don't change the hash
+    let body = Fx::load(include_str!("../tests/fixtures/demo.sqli.json")).request_body();
+    let pretty =
+        serde_json::to_string_pretty(&serde_json::from_str::<Value>(&body).unwrap()).unwrap();
+    assert_eq!(
+        request_params_hash(&pretty).as_deref(),
+        Some(DEMO_PARAMS_HASH_JS)
+    );
+}
+
+#[test]
+fn create_program_params_hash_stored_lowercase() {
+    let (c, pid) = v2_program();
+    let p = c.get_program(pid).unwrap();
+    assert_eq!(p.params_hash, v2_params_hash());
+    let j = serde_json::to_value(&p).unwrap();
+    assert_eq!(j["params_hash"], v2_params_hash());
+}
+
+#[test]
+#[should_panic(expected = "params_hash must be 64 hex chars")]
+fn create_program_bad_params_hash() {
+    let mut c = setup();
+    ctx(owner(), NEAR, T0);
+    c.create_program(
+        "x".into(),
+        REPO.into(),
+        COMMIT.into(),
+        MODEL.into(),
+        tee::sha256_hex(SYS.as_bytes()),
+        tee::sha256_hex(BUNDLE.as_bytes()),
+        "abc".into(),
+        payouts(),
+        "k".into(),
+        60,
+        0,
+    );
+}
+
+/// A program pinned to different params rejects the otherwise honest request.
+#[test]
+fn dispute_other_program_params_rejects() {
+    let mut c = setup();
+    ctx(owner(), 20 * NEAR, T0);
+    let pid = c.create_program(
+        "v2".into(),
+        REPO.into(),
+        COMMIT.into(),
+        MODEL.into(),
+        tee::sha256_hex(SYS.as_bytes()),
+        tee::sha256_hex(BUNDLE.as_bytes()),
+        DEMO_PARAMS_HASH_JS.into(),
+        payouts(),
+        "b3duZXJwdWI=".into(),
+        60,
+        0,
+    );
+    let body = v2_req(hunter().as_str()).to_string();
+    let cid = submit_v2(&mut c, hunter(), pid, &body);
+    ctx(owner(), 0, T0 + NANOS_PER_SEC);
+    c.dispute(cid, body);
+    assert_eq!(
+        c.get_claim(cid).unwrap().reject_reason.as_deref(),
+        Some(PARAMS_TAMPERED)
+    );
 }
