@@ -128,7 +128,7 @@ Each issue is fixed with TDD on its own branch: a RED test commit (proves the bu
 
 ## #1 params pinning
 - `params_hash` = sha256hex(canonical JSON of `{chat_template_kwargs, max_tokens, response_format, temperature}`). Canonical = recursively sorted object keys, no whitespace, standard JSON escapes. JS: `canonicalJson(v)` in shared/judge.mjs. Rust: `serde_json::Value` (BTreeMap → sorted); assert `preserve_order` is NOT enabled.
-- The dispute request must parse with `deny_unknown_fields`: top-level keys exactly `model, messages, response_format, chat_template_kwargs, temperature, max_tokens`, and each message exactly `{role, content}`. Any parse failure → `"system prompt tampered"` (as in v2).
+- The dispute request must parse with `deny_unknown_fields`: top-level keys exactly `model, messages, response_format, chat_template_kwargs, temperature, max_tokens`, and each message exactly `{role, content}`. A basic parse failure (invalid JSON, wrong types, missing `model`/`messages`, a duplicated top-level `model`/`messages` key) → `"system prompt tampered"` (as in v2). A shape failure under the strict parse (an extra or missing top-level key, an extra message field, a duplicate key in a nested value or a duplicated params key) → `"params tampered"`. (Accepted deviation from the original v3 draft, merged with #1.)
 - Reason order: prompt → model → **`"params tampered"`** → code → hunter → report.
 
 ## #2 decryption challenge

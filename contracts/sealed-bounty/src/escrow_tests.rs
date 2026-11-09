@@ -85,6 +85,9 @@ fn payouts() -> Payouts {
 
 /// Contract with both live signers allowlisted.
 fn setup() -> Contract {
+    // Fresh storage: testing_env! carries the trie over, and a stale IterableMap entry from an
+    // earlier contract in the same test would hide signers from `iter()`.
+    near_sdk::mock::with_mocked_blockchain(|b| drop(b.take_storage()));
     ctx(admin(), 0, T0);
     let mut c = Contract::new(None);
     for f in [Fx::load(LIVE_ED), Fx::load(LIVE_EC), Fx::load(SYN_GW)] {
@@ -100,7 +103,7 @@ fn setup() -> Contract {
         test_signer(),
         SignerMeta {
             kind: SigKind::ProviderTee,
-            model: None,
+            model: Some(MODEL.into()),
         },
     );
     c
@@ -127,6 +130,7 @@ fn create(
         "b3duZXJwdWI=".into(),
         secs,
         min_conf,
+        None,
     )
 }
 
@@ -405,17 +409,27 @@ fn submit_tampered_response() {
 #[test]
 #[should_panic(expected = "bad signature")]
 fn submit_wrong_program_model() {
+    // A key allowlisted for gpt-oss signs a Qwen response: the program's model is in the
+    // signed text, so it fails verification.
     let mut c = setup();
-    let f = Fx::load(LIVE_ED);
+    ctx(admin(), 0, T0);
+    c.add_signer(
+        evil_signer(),
+        SignerMeta {
+            kind: SigKind::ProviderTee,
+            model: Some("openai/gpt-oss-120b".into()),
+        },
+    );
     let pid = create(
         &mut c,
-        f.system_prompt_hash(),
+        tee::sha256_hex(SYS.as_bytes()),
         "openai/gpt-oss-120b",
         0,
         60,
         20 * NEAR,
     );
-    submit(&mut c, pid, &f);
+    let args = signed_with(&evil_key(), &v2_req(hunter().as_str()).to_string(), "high");
+    submit_signed(&mut c, hunter(), pid, evil_signer(), args);
 }
 
 #[test]
@@ -429,10 +443,19 @@ fn submit_low_confidence() {
 #[test]
 #[should_panic(expected = "verdict not payable")]
 fn submit_invalid_verdict() {
-    // Synthetic gateway fixture: valid=false, severity=none (gateway text has no model).
+    // Synthetic gateway fixture: valid=false, severity=none (gateway text has no model, but the
+    // program's signer set is model-matched, so the program uses the fixture's model).
     let mut c = setup();
-    let pid = live_program(&mut c, 0, 60, 20 * NEAR);
-    submit(&mut c, pid, &Fx::load(SYN_GW));
+    let f = Fx::load(SYN_GW);
+    let pid = create(
+        &mut c,
+        tee::sha256_hex(b"x"),
+        &f.s("model"),
+        0,
+        60,
+        20 * NEAR,
+    );
+    submit(&mut c, pid, &f);
 }
 
 #[test]
@@ -754,6 +777,7 @@ fn create_v2(c: &mut Contract) -> u64 {
         "b3duZXJwdWI=".into(),
         60,
         0,
+        None,
     )
 }
 
@@ -775,9 +799,19 @@ fn v2_req(hunter: &str) -> Value {
 
 /// submit_claim args for `body`, TEE-signed (provider_tee) by the in-test key with a high verdict.
 fn signed(body: &str) -> (String, Base64VecU8, String) {
+    signed_with(&test_key(), body, "high")
+}
+
+/// submit_claim args for `body`, signed (provider_tee, program MODEL) by `key` with `severity`.
+fn signed_with(
+    key: &ed25519_dalek::SigningKey,
+    body: &str,
+    severity: &str,
+) -> (String, Base64VecU8, String) {
     use ed25519_dalek::Signer as _;
     let req_hash = tee::sha256_hex(body.as_bytes());
-    let content = r#"{"valid":true,"severity":"high","cwe":"CWE-89","confidence":90}"#;
+    let content =
+        format!(r#"{{"valid":true,"severity":"{severity}","cwe":"CWE-89","confidence":90}}"#);
     let resp = json!({
         "id": format!("chatcmpl-{}", &req_hash[..16]),
         "choices": [{"index": 0, "message": {"role": "assistant", "content": content}}],
@@ -789,7 +823,7 @@ fn signed(body: &str) -> (String, Base64VecU8, String) {
         &req_hash,
         &tee::sha256_hex(resp.as_bytes()),
     );
-    let sig = hex::encode(test_key().sign(text.as_bytes()).to_bytes());
+    let sig = hex::encode(key.sign(text.as_bytes()).to_bytes());
     (req_hash, resp.into_bytes().into(), sig)
 }
 
@@ -839,6 +873,7 @@ fn create_program_bad_code_hash() {
         "k".into(),
         60,
         0,
+        None,
     );
 }
 
@@ -1213,7 +1248,22 @@ fn params_tampered_bodies() -> Vec<(&'static str, String)> {
     ]
 }
 
-fn panic_msg(e: &(dyn std::any::Any + Send)) -> String {
+// ---------------- v3: #3 / #6 signers ----------------
+
+/// A key the contract admin controls (not a TEE key).
+fn evil_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
+}
+
+fn evil_signer() -> Signer {
+    Signer::try_from(format!(
+        "ed25519:{}",
+        hex::encode(evil_key().verifying_key().to_bytes())
+    ))
+    .unwrap()
+}
+
+fn panic_msg(e: Box<dyn std::any::Any + Send>) -> String {
     e.downcast_ref::<String>()
         .cloned()
         .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
@@ -1234,7 +1284,7 @@ fn dispute_params_tampered_rejects() {
             c.dispute(cid, body.clone())
         }));
         if let Err(e) = r {
-            failures.push(format!("{name}: dispute panicked {:?}", panic_msg(&*e)));
+            failures.push(format!("{name}: dispute panicked {:?}", panic_msg(e)));
             continue;
         }
         let cl = c.get_claim(cid).unwrap();
@@ -1366,6 +1416,7 @@ fn create_program_bad_params_hash() {
         "k".into(),
         60,
         0,
+        None,
     );
 }
 
@@ -1386,6 +1437,7 @@ fn dispute_other_program_params_rejects() {
         "b3duZXJwdWI=".into(),
         60,
         0,
+        None,
     );
     let body = v2_req(hunter().as_str()).to_string();
     let cid = submit_v2(&mut c, hunter(), pid, &body);
@@ -1394,5 +1446,352 @@ fn dispute_other_program_params_rejects() {
     assert_eq!(
         c.get_claim(cid).unwrap().reject_reason.as_deref(),
         Some(PARAMS_TAMPERED)
+    );
+}
+
+fn submit_signed(
+    c: &mut Contract,
+    who: AccountId,
+    pid: u64,
+    signer: Signer,
+    (req_hash, resp, sig): (String, Base64VecU8, String),
+) -> u64 {
+    ctx(who, NEAR, T0);
+    c.submit_claim(
+        pid,
+        req_hash,
+        resp,
+        sig,
+        signer,
+        SigKind::ProviderTee,
+        "Y2lwaGVy".into(),
+    )
+}
+
+/// #3: after a program exists, the admin allowlists their own key and signs a fake critical
+/// verdict for a request that matches the program (hunter = admin). It must not be claimable.
+#[test]
+fn admin_add_signer_cannot_drain_existing_program() {
+    let (mut c, pid) = v2_program();
+    ctx(admin(), 0, T0);
+    c.add_signer(
+        evil_signer(),
+        SignerMeta {
+            kind: SigKind::ProviderTee,
+            model: Some(MODEL.into()),
+        },
+    );
+    let body = v2_req(admin().as_str()).to_string();
+    let args = signed_with(&evil_key(), &body, "critical");
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        submit_signed(&mut c, admin(), pid, evil_signer(), args)
+    }));
+    match r {
+        Err(e) => assert!(
+            panic_msg(e).contains("signer not allowlisted"),
+            "blocked for the wrong reason"
+        ),
+        Ok(cid) => {
+            ctx(owner(), 0, T0 + NANOS_PER_SEC);
+            let d = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                c.dispute(cid, body.clone())
+            }))
+            .map_err(panic_msg);
+            ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+            drop(c.finalize(cid));
+            panic!(
+                "THEFT: admin-signed claim {cid} accepted; owner dispute -> {d:?}; \
+                 finalize status {:?}, transfers {:?}",
+                c.get_claim(cid).unwrap().status,
+                transfers()
+            );
+        }
+    }
+    assert!(c.list_claims(pid, None, None).is_empty());
+}
+
+/// #3: `SignerMeta.model` is enforced: a key allowlisted for another model can't sign for this one.
+#[test]
+#[should_panic(expected = "signer not allowlisted")]
+fn submit_rejects_signer_for_other_model() {
+    let mut c = setup();
+    ctx(admin(), 0, T0);
+    c.add_signer(
+        evil_signer(),
+        SignerMeta {
+            kind: SigKind::ProviderTee,
+            model: Some("openai/gpt-oss-120b".into()),
+        },
+    );
+    let pid = create_v2(&mut c);
+    let body = v2_req(hunter().as_str()).to_string();
+    let args = signed_with(&evil_key(), &body, "high");
+    submit_signed(&mut c, hunter(), pid, evil_signer(), args);
+}
+
+/// #6: a pending claim whose signer is revoked is rejected at finalize, funds back to the pool.
+#[test]
+fn revoked_signer_pending_claim_rejected_at_finalize() {
+    let (mut c, pid) = v2_program();
+    let bal = c.get_program(pid).unwrap().balance.0;
+    let cid = submit_v2(
+        &mut c,
+        hunter(),
+        pid,
+        &v2_req(hunter().as_str()).to_string(),
+    );
+    ctx(admin(), 0, T0 + NANOS_PER_SEC);
+    c.revoke_signer(test_signer());
+    ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+    drop(c.finalize(cid));
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(
+        (cl.status, cl.reject_reason.as_deref()),
+        (ClaimStatus::Rejected, Some("signer revoked"))
+    );
+    assert!(transfers().is_empty(), "no payout");
+    let p = c.get_program(pid).unwrap();
+    assert_eq!((p.balance.0, p.reserved.0), (bal, 0));
+    assert_eq!(events()[0]["event"], "claim_rejected");
+    assert_eq!(events()[0]["data"][0]["reason"], "signer revoked");
+}
+
+fn create_v2_with(c: &mut Contract, signers: Option<Vec<Signer>>) -> u64 {
+    ctx(owner(), 20 * NEAR, T0);
+    c.create_program(
+        "v2".into(),
+        REPO.into(),
+        COMMIT.into(),
+        MODEL.into(),
+        tee::sha256_hex(SYS.as_bytes()),
+        tee::sha256_hex(BUNDLE.as_bytes()),
+        v2_params_hash(),
+        payouts(),
+        "b3duZXJwdWI=".into(),
+        60,
+        0,
+        signers,
+    )
+}
+
+fn add_evil(c: &mut Contract, model: &str) {
+    ctx(admin(), 0, T0);
+    c.add_signer(
+        evil_signer(),
+        SignerMeta {
+            kind: SigKind::ProviderTee,
+            model: Some(model.into()),
+        },
+    );
+}
+
+#[test]
+fn create_program_snapshots_model_matched_signers() {
+    let (c, pid) = v2_program();
+    let p = c.get_program(pid).unwrap();
+    // live ed + live ec + test key serve MODEL; the gateway fixture (DeepSeek) is excluded.
+    let want = vec![
+        Fx::load(LIVE_ED).signer(),
+        Fx::load(LIVE_EC).signer(),
+        test_signer(),
+    ];
+    assert_eq!(p.signers.len(), 3);
+    for s in &want {
+        assert!(p.signers.contains(s), "{s:?}");
+    }
+    assert!(!p.signers.contains(&Fx::load(SYN_GW).signer()));
+    let j = serde_json::to_value(&p).unwrap();
+    assert!(j["signers"][0].is_string());
+}
+
+#[test]
+fn create_program_explicit_subset() {
+    let mut c = setup();
+    let pid = create_v2_with(&mut c, Some(vec![test_signer(), test_signer()]));
+    assert_eq!(c.get_program(pid).unwrap().signers, vec![test_signer()]);
+    // A globally-allowlisted signer outside the program's set is refused.
+    let f = Fx::load(LIVE_ED);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| submit(&mut c, pid, &f)))
+        .map_err(panic_msg);
+    assert!(r.unwrap_err().contains("signer not allowlisted"));
+    submit_v2(
+        &mut c,
+        hunter(),
+        pid,
+        &v2_req(hunter().as_str()).to_string(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "signer not allowlisted")]
+fn create_program_subset_not_allowlisted() {
+    let mut c = setup();
+    create_v2_with(&mut c, Some(vec![evil_signer()]));
+}
+
+#[test]
+#[should_panic(expected = "signer not allowlisted")]
+fn create_program_subset_wrong_model() {
+    let mut c = setup();
+    create_v2_with(&mut c, Some(vec![Fx::load(SYN_GW).signer()]));
+}
+
+#[test]
+#[should_panic(expected = "no signers for model")]
+fn create_program_empty_subset() {
+    let mut c = setup();
+    create_v2_with(&mut c, Some(vec![]));
+}
+
+#[test]
+#[should_panic(expected = "no signers for model")]
+fn create_program_no_signers_for_model() {
+    let mut c = setup();
+    create(
+        &mut c,
+        tee::sha256_hex(b"x"),
+        "openai/gpt-oss-120b",
+        0,
+        60,
+        NEAR,
+    );
+}
+
+#[test]
+fn set_program_signers_rotates_future_submissions_only() {
+    let (mut c, pid) = v2_program();
+    let body = v2_req(hunter().as_str()).to_string();
+    let pending = submit_v2(&mut c, hunter(), pid, &body);
+
+    add_evil(&mut c, MODEL);
+    ctx(owner(), NEAR, T0);
+    c.set_program_signers(pid, vec![evil_signer()]);
+    assert_eq!(c.get_program(pid).unwrap().signers, vec![evil_signer()]);
+    assert_eq!(events().last().unwrap()["event"], "program_signers_set");
+    // Unused deposit refunded to the owner.
+    let t = transfers();
+    assert_eq!(t.len(), 1);
+    assert_eq!(t[0].0, owner());
+
+    // The old key can no longer submit; the new one can.
+    let other = v2_req(stranger().as_str()).to_string();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        submit_v2(&mut c, stranger(), pid, &other)
+    }))
+    .map_err(panic_msg);
+    assert!(r.unwrap_err().contains("signer not allowlisted"));
+    let args = signed_with(&evil_key(), &other, "low");
+    submit_signed(&mut c, stranger(), pid, evil_signer(), args);
+
+    // The claim signed before rotation still finalizes (rotation is not revocation).
+    ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+    drop(c.finalize(pending));
+    assert_eq!(c.get_claim(pending).unwrap().status, ClaimStatus::Paid);
+}
+
+#[test]
+#[should_panic(expected = "program owner only")]
+fn set_program_signers_owner_only() {
+    let (mut c, pid) = v2_program();
+    ctx(admin(), 0, T0);
+    c.set_program_signers(pid, vec![test_signer()]);
+}
+
+#[test]
+#[should_panic(expected = "signer not allowlisted")]
+fn set_program_signers_subset_rule() {
+    let (mut c, pid) = v2_program();
+    add_evil(&mut c, "openai/gpt-oss-120b");
+    ctx(owner(), 0, T0);
+    c.set_program_signers(pid, vec![evil_signer()]);
+}
+
+#[test]
+#[should_panic(expected = "no signers for model")]
+fn set_program_signers_empty() {
+    let (mut c, pid) = v2_program();
+    ctx(owner(), 0, T0);
+    c.set_program_signers(pid, vec![]);
+}
+
+#[test]
+#[should_panic(expected = "program not found")]
+fn set_program_signers_missing_program() {
+    let mut c = setup();
+    ctx(owner(), 0, T0);
+    c.set_program_signers(4, vec![test_signer()]);
+}
+
+#[test]
+fn revoke_signer_removes_and_marks() {
+    let (mut c, pid) = v2_program();
+    ctx(admin(), 0, T0);
+    assert!(c.revoke_signer(test_signer()));
+    assert!(!c.revoke_signer(test_signer()), "already revoked");
+    assert!(c.is_signer_revoked(test_signer()));
+    assert!(!c.is_signer_revoked(Fx::load(LIVE_ED).signer()));
+    assert!(!c.get_signers().iter().any(|(s, _)| *s == test_signer()));
+    assert_eq!(events()[0]["event"], "signer_revoked");
+    // New submissions with it fail (it's off the global allowlist).
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        submit_v2(
+            &mut c,
+            hunter(),
+            pid,
+            &v2_req(hunter().as_str()).to_string(),
+        )
+    }))
+    .map_err(panic_msg);
+    assert!(r.unwrap_err().contains("signer not allowlisted"));
+}
+
+#[test]
+#[should_panic(expected = "owner only")]
+fn revoke_signer_admin_only() {
+    let mut c = setup();
+    ctx(owner(), 0, T0);
+    c.revoke_signer(test_signer());
+}
+
+#[test]
+fn remove_signer_keeps_pending_claims() {
+    let (mut c, pid) = v2_program();
+    let cid = submit_v2(
+        &mut c,
+        hunter(),
+        pid,
+        &v2_req(hunter().as_str()).to_string(),
+    );
+    ctx(admin(), 0, T0);
+    assert!(c.remove_signer(test_signer()));
+    ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+    drop(c.finalize(cid));
+    assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Paid);
+    assert_eq!(transfers(), vec![(hunter(), 5 * NEAR)]);
+}
+
+#[test]
+fn revoked_then_readded_signer_still_blocks_old_claims() {
+    let (mut c, pid) = v2_program();
+    let cid = submit_v2(
+        &mut c,
+        hunter(),
+        pid,
+        &v2_req(hunter().as_str()).to_string(),
+    );
+    ctx(admin(), 0, T0);
+    c.revoke_signer(test_signer());
+    c.add_signer(
+        test_signer(),
+        SignerMeta {
+            kind: SigKind::ProviderTee,
+            model: Some(MODEL.into()),
+        },
+    );
+    ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+    drop(c.finalize(cid));
+    assert_eq!(
+        c.get_claim(cid).unwrap().reject_reason.as_deref(),
+        Some("signer revoked")
     );
 }

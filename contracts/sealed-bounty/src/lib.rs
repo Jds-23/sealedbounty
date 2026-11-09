@@ -8,7 +8,8 @@ use near_sdk::serde::Deserialize;
 use near_sdk::serde_json::{self, json};
 use near_sdk::store::{IterableMap, LookupSet};
 use near_sdk::{
-    AccountId, BorshStorageKey, NearToken, PanicOnDefault, Promise, env, near, require,
+    AccountId, BorshStorageKey, NearToken, PanicOnDefault, Promise, PromiseOrValue, env, near,
+    require,
 };
 
 use tee::Severity;
@@ -21,7 +22,8 @@ const DEFAULT_LIMIT: u64 = 50;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignerMeta {
     pub kind: SigKind,
-    /// Informational: which model this provider key serves (not enforced; the signed text binds the model).
+    /// Which model this key serves. v3 (#3): a program only snapshots signers whose model equals
+    /// its `model_id`; `None` matches no program.
     pub model: Option<String>,
 }
 
@@ -61,6 +63,10 @@ pub struct Program {
     /// sha256hex of the canonical JSON of the request params
     /// `{chat_template_kwargs, max_tokens, response_format, temperature}`. v3 (#1).
     pub params_hash: String,
+    /// v3 (#3): signers accepted for this program, snapshotted from the global allowlist at
+    /// creation (model-matched). Later `add_signer` calls don't affect it; the owner rotates it
+    /// with `set_program_signers`.
+    pub signers: Vec<Signer>,
     pub payouts: Payouts,
     pub owner_enc_pubkey: String,
     pub dispute_secs: u64,
@@ -109,6 +115,7 @@ enum StorageKey {
     Programs,
     Claims,
     UsedReqHashes,
+    Revoked,
 }
 
 #[near(contract_state)]
@@ -121,6 +128,8 @@ pub struct Contract {
     used_req_hashes: LookupSet<String>,
     next_program_id: u64,
     next_claim_id: u64,
+    /// v3 (#6): signers revoked by the admin; their pending claims are rejected at finalize.
+    revoked: LookupSet<Signer>,
 }
 
 /// NEP-297 event: `EVENT_JSON:{"standard":"sealedbounty","version":"1.0.0","event":..,"data":[..]}`.
@@ -294,6 +303,7 @@ pub(crate) const PARAMS_TAMPERED: &str = "params tampered";
 pub(crate) const CODE_MISMATCH: &str = "code mismatch";
 pub(crate) const HUNTER_MISMATCH: &str = "hunter mismatch";
 pub(crate) const REPORT_MISSING: &str = "report missing";
+pub(crate) const SIGNER_REVOKED: &str = "signer revoked";
 
 /// `None` if the revealed request matches the program and the claim's hunter, else the FIRST
 /// failing reject reason (INTERFACE.md v3 order):
@@ -384,6 +394,7 @@ impl Contract {
             used_req_hashes: LookupSet::new(StorageKey::UsedReqHashes),
             next_program_id: 0,
             next_claim_id: 0,
+            revoked: LookupSet::new(StorageKey::Revoked),
         }
     }
 
@@ -424,6 +435,53 @@ impl Contract {
         removed
     }
 
+    /// v3 (#6): admin only. Removes `signer` from the allowlist AND marks it revoked: its pending
+    /// claims are rejected at finalize ("signer revoked"). The admin can block payouts this way
+    /// but can't redirect them. Returns true if it was newly revoked.
+    pub fn revoke_signer(&mut self, signer: Signer) -> bool {
+        self.assert_owner();
+        self.signers.remove(&signer);
+        let newly = self.revoked.insert(signer.clone());
+        if newly {
+            emit("signer_revoked", json!({"signer": signer}));
+        }
+        newly
+    }
+
+    pub fn is_signer_revoked(&self, signer: Signer) -> bool {
+        self.revoked.contains(&signer)
+    }
+
+    /// `requested` None → every allowlisted signer whose `meta.model == model_id`. Some(list) →
+    /// each entry must be allowlisted with that model ("signer not allowlisted"); duplicates are
+    /// dropped. Panics "no signers for model" if the result is empty.
+    fn program_signers(&self, model_id: &str, requested: Option<Vec<Signer>>) -> Vec<Signer> {
+        let matches = |m: &SignerMeta| m.model.as_deref() == Some(model_id);
+        let out: Vec<Signer> = match requested {
+            None => self
+                .signers
+                .iter()
+                .filter(|(_, m)| matches(m))
+                .map(|(s, _)| s.clone())
+                .collect(),
+            Some(list) => {
+                let mut out: Vec<Signer> = Vec::with_capacity(list.len());
+                for s in list {
+                    require!(
+                        self.signers.get(&s).is_some_and(matches),
+                        "signer not allowlisted"
+                    );
+                    if !out.contains(&s) {
+                        out.push(s);
+                    }
+                }
+                out
+            }
+        };
+        require!(!out.is_empty(), "no signers for model");
+        out
+    }
+
     pub fn get_signers(&self) -> Vec<(Signer, SignerMeta)> {
         self.signers
             .iter()
@@ -453,6 +511,7 @@ impl Contract {
         owner_enc_pubkey: String,
         dispute_secs: u64,
         min_confidence: u8,
+        signers: Option<Vec<Signer>>,
     ) -> u64 {
         let system_prompt_hash = tee::normalize_hash_hex(&system_prompt_hash)
             .unwrap_or_else(|_| env::panic_str("system_prompt_hash must be 64 hex chars"));
@@ -465,6 +524,7 @@ impl Contract {
             dispute_secs.checked_mul(NANOS_PER_SEC).is_some(),
             "dispute_secs too large"
         );
+        let signers = self.program_signers(&model_id, signers);
 
         let before = env::storage_usage();
         let attached = env::attached_deposit();
@@ -483,6 +543,7 @@ impl Contract {
                 system_prompt_hash,
                 code_hash,
                 params_hash,
+                signers,
                 payouts,
                 owner_enc_pubkey,
                 dispute_secs,
@@ -503,6 +564,35 @@ impl Contract {
             json!({"program_id": id, "owner": owner, "model_id": model_id, "balance": U128(balance)}),
         );
         id
+    }
+
+    /// v3 (#3): program owner only. Replaces the program's signer set (e.g. after re-attesting
+    /// with `sb attest`); same subset rule as `create_program`. Affects future submissions only.
+    /// Payable for any storage growth; unused deposit is refunded.
+    #[payable]
+    pub fn set_program_signers(&mut self, program_id: u64, signers: Vec<Signer>) {
+        let p = self
+            .programs
+            .get(&program_id)
+            .unwrap_or_else(|| env::panic_str("program not found"));
+        Self::assert_program_owner(p);
+        let model_id = p.model_id.clone();
+        let signers = self.program_signers(&model_id, Some(signers));
+        let before = env::storage_usage();
+        let attached = env::attached_deposit();
+        self.program_mut(program_id).signers = signers.clone();
+        self.programs.flush();
+        let cost = charge_storage(before, attached);
+        let refund = attached.saturating_sub(cost);
+        if !refund.is_zero() {
+            Promise::new(env::predecessor_account_id())
+                .transfer(refund)
+                .detach();
+        }
+        emit(
+            "program_signers_set",
+            json!({"program_id": program_id, "signers": signers}),
+        );
     }
 
     /// Payable. Adds the attached deposit to the program's unreserved balance.
@@ -562,6 +652,8 @@ impl Contract {
             .unwrap_or_else(|| env::panic_str("program not found"));
         require!(program.open, "program closed");
 
+        // v3 (#3): the signer must be in the program's own set (and still globally allowlisted).
+        require!(program.signers.contains(&signer), "signer not allowlisted");
         let meta = self
             .signers
             .get(&signer)
@@ -690,8 +782,9 @@ impl Contract {
         );
     }
 
-    /// Anyone, once the dispute window has passed. Pays the hunter.
-    pub fn finalize(&mut self, claim_id: u64) -> Promise {
+    /// Anyone, once the dispute window has passed. Pays the hunter, or rejects the claim with
+    /// "signer revoked" if its signer was revoked meanwhile (#6; funds return to the pool).
+    pub fn finalize(&mut self, claim_id: u64) -> PromiseOrValue<()> {
         let c = self
             .claims
             .get_mut(&claim_id)
@@ -701,6 +794,19 @@ impl Contract {
             env::block_timestamp() >= c.finalize_after.0,
             "dispute window open"
         );
+        if self.revoked.contains(&c.signer) {
+            c.status = ClaimStatus::Rejected;
+            c.reject_reason = Some(SIGNER_REVOKED.to_string());
+            let (program_id, payout) = (c.program_id, c.payout.0);
+            let p = self.program_mut(program_id);
+            p.reserved = U128(p.reserved.0 - payout);
+            p.balance = U128(p.balance.0 + payout);
+            emit(
+                "claim_rejected",
+                json!({"claim_id": claim_id, "program_id": program_id, "reason": SIGNER_REVOKED}),
+            );
+            return PromiseOrValue::Value(());
+        }
         c.status = ClaimStatus::Paid;
         let (program_id, payout, hunter) = (c.program_id, c.payout.0, c.hunter.clone());
         let p = self.program_mut(program_id);
@@ -709,7 +815,9 @@ impl Contract {
             "claim_paid",
             json!({"claim_id": claim_id, "program_id": program_id, "hunter": hunter, "payout": U128(payout)}),
         );
-        Promise::new(hunter).transfer(NearToken::from_yoctonear(payout))
+        Promise::new(hunter)
+            .transfer(NearToken::from_yoctonear(payout))
+            .into()
     }
 
     // ---------------- views ----------------

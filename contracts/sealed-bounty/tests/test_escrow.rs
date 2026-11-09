@@ -235,6 +235,7 @@ impl Env {
             "payouts": { "low": (NEAR / 2).to_string(), "medium": NEAR.to_string(),
                          "high": (2 * NEAR).to_string(), "critical": (4 * NEAR).to_string() },
             "owner_enc_pubkey": "b3duZXJwdWI=", "dispute_secs": DISPUTE_SECS, "min_confidence": min_conf,
+            "signers": null,
         });
         let r = self
             .ok(c, &self.owner, "create_program", args, deposit)
@@ -318,6 +319,9 @@ async fn escrow_end_to_end_live_fixtures() -> testresult::TestResult<()> {
         let pid = e
             .create_program(&c, f, f.system_prompt_hash(), 0, 10 * NEAR)
             .await;
+        // v3 (#3): signers: null snapshots the model-matched global allowlist.
+        let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
+        assert_eq!(p["signers"].as_array().unwrap().len(), 2);
 
         // tampered response -> bad signature
         let mut body = unb64(&f.s("response_body_b64"));
@@ -545,6 +549,79 @@ async fn escrow_end_to_end_live_fixtures() -> testresult::TestResult<()> {
             "already claimed",
         )
         .await;
+
+        // ---- program 4 (fresh escrow), v3 #3/#6: explicit signer subset + revocation ----
+        let c = e.deploy(&format!("esc4-{algo}.sandbox")).await;
+        let mut args = json!({
+            "name": "demo", "repo_url": "https://github.com/x/y", "commit": "abc123",
+            "model_id": f.s("model"), "system_prompt_hash": f.system_prompt_hash(),
+            "code_hash": PLACEHOLDER_CODE_HASH, "params_hash": DEMO_PARAMS_HASH,
+            "payouts": { "low": (NEAR / 2).to_string(), "medium": NEAR.to_string(),
+                         "high": (2 * NEAR).to_string(), "critical": (4 * NEAR).to_string() },
+            "owner_enc_pubkey": "b3duZXJwdWI=", "dispute_secs": DISPUTE_SECS, "min_confidence": 0,
+            "signers": ["ed25519:".to_string() + &"00".repeat(32)],
+        });
+        e.fail(
+            &c,
+            &e.owner,
+            "create_program",
+            args.clone(),
+            5 * NEAR,
+            "signer not allowlisted",
+        )
+        .await;
+        args["signers"] = json!([f.signer()]);
+        let pid: u64 = e
+            .ok(&c, &e.owner, "create_program", args, 5 * NEAR)
+            .await
+            .json()?;
+        let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
+        let bal0 = u128_of(&p["balance"]);
+        assert_eq!(p["signers"], json!([f.signer().to_lowercase()]));
+        // globally allowlisted, but not in this program's set
+        e.fail(
+            &c,
+            &e.hunter,
+            "submit_claim",
+            other.claim_args(pid),
+            NEAR / 10,
+            "signer not allowlisted",
+        )
+        .await;
+        e.fail(
+            &c,
+            &e.stranger,
+            "set_program_signers",
+            json!({ "program_id": pid, "signers": [other.signer()] }),
+            0,
+            "program owner only",
+        )
+        .await;
+        let cid: u64 = e
+            .ok(&c, &e.hunter, "submit_claim", f.claim_args(pid), NEAR / 10)
+            .await
+            .json()?;
+        e.ok(
+            &c,
+            &e.admin,
+            "revoke_signer",
+            json!({ "signer": f.signer() }),
+            0,
+        )
+        .await;
+        let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
+        e.advance_past(claim["finalize_after"].as_str().unwrap().parse::<u64>()?)
+            .await;
+        let before = e.balance(&e.hunter).await;
+        e.ok(&c, &e.stranger, "finalize", json!({ "claim_id": cid }), 0)
+            .await;
+        assert_eq!(e.balance(&e.hunter).await, before, "no payout");
+        let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
+        assert_eq!(claim["status"], "Rejected");
+        assert_eq!(claim["reject_reason"], "signer revoked");
+        let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
+        assert_eq!(u128_of(&p["balance"]), bal0);
+        assert_eq!(u128_of(&p["reserved"]), 0);
     }
     Ok(())
 }
@@ -584,6 +661,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
         "payouts": { "low": (NEAR / 2).to_string(), "medium": NEAR.to_string(),
                      "high": (2 * NEAR).to_string(), "critical": (3 * NEAR).to_string() },
         "owner_enc_pubkey": "b3duZXJwdWI=", "dispute_secs": DISPUTE_SECS, "min_confidence": 80,
+        "signers": null,
     });
     let pid: u64 = e
         .ok(&c, &e.owner, "create_program", args, 10 * NEAR)
