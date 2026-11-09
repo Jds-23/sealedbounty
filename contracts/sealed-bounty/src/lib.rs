@@ -281,6 +281,11 @@ impl Contract {
         removed
     }
 
+    /// RED stub for #6 (same as remove_signer); the GREEN commit implements it.
+    pub fn revoke_signer(&mut self, signer: Signer) -> bool {
+        self.remove_signer(signer)
+    }
+
     pub fn get_signers(&self) -> Vec<(Signer, SignerMeta)> {
         self.signers
             .iter()
