@@ -68,6 +68,34 @@ export function HowItWorks() {
         claim&apos;s args from another account is rejected with <code>hunter mismatch</code>, and the real hunter can resubmit.
       </p>
 
+      <h2>v3 hardening</h2>
+      <ul>
+        <li>
+          <strong>Params pinning.</strong> <code>program.params_hash</code> is the sha256 of the canonical (sorted-key) JSON of{' '}
+          <code>temperature</code>, <code>max_tokens</code>, <code>response_format</code> and <code>chat_template_kwargs</code>. The request must
+          have exactly the canonical keys. A hunter who swaps in a schema that forces <code>valid:true</code>, or raises the temperature and
+          resamples, is rejected with <code>params tampered</code>. The owner checks this in the Inbox: prompt, model, params, code, hunter, report.
+        </li>
+        <li>
+          <strong>Decryption challenge.</strong> The contract can&apos;t read the ciphertext, so a hunter could attach junk and the owner would
+          have nothing to dispute. Now the owner can <code>flag_undecryptable</code>, which sets the claim to <em>Challenged</em>. The hunter has{' '}
+          <code>challenge_secs</code> to <code>prove_ciphertext</code> by revealing the ephemeral secret. The contract re-derives the key, opens the
+          box, checks <code>sha256 == req_hash</code> and runs the dispute checks. An honest claim goes back to Pending and can be finalized right
+          away. Without a proof it is rejected with <code>undecryptable report</code>. The revealed secret is public, so this page re-checks the
+          proof too.
+        </li>
+        <li>
+          <strong>Per-program signers.</strong> Each program snapshots its own TEE signer set when it is created (or when its owner calls{' '}
+          <code>set_program_signers</code>). An admin <code>add_signer</code> can no longer slip a key into existing programs. The Verified panel
+          checks <em>signer in PROGRAM set</em> and that the signer isn&apos;t revoked.
+        </li>
+        <li>
+          <strong>Bond.</strong> Every claim stakes <code>program.bond</code>. It is returned with the payout, and it goes to the pool when the
+          claim is rejected, so spam and junk claims cost money. If the payout transfer fails, the claim becomes <em>PayoutFailed</em> and the
+          payout plus bond go back to the pool. Dedupe is per program.
+        </li>
+      </ul>
+
       <h2>What this page verifies</h2>
       <p>
         Each claim's <em>Verified</em> panel re-checks the TEE signature in your browser, plus the allowlist (from the contract's{' '}
@@ -97,10 +125,27 @@ export function HowItWorks() {
         </li>
         <li>
           <strong>You trust the TEE vendor chain.</strong> That means Intel, NVIDIA and NEAR AI's attested deployment. Signers rotate when NEAR AI
-          redeploys, and the admin has to re-attest them and add them to the allowlist.
+          redeploys, and the admin has to re-attest them and add them to the allowlist. A new key reaches an existing program only when its owner
+          calls <code>set_program_signers</code>.
         </li>
         <li>
-          <strong>The owner sees the exploit; the public sees only hashes.</strong> A malicious owner can't block payment except by a valid dispute.
+          <strong>The admin can block payouts, not steal them.</strong> <code>revoke_signer</code> makes <code>finalize</code> reject every
+          pending claim signed by that key (&quot;signer revoked&quot;), and the funds go back to the program pool. The admin can&apos;t add keys
+          to existing programs or redirect funds. Revocation is the emergency brake for a compromised enclave key, and it is a trust assumption.
+        </li>
+        <li>
+          <strong>Params pinning only covers the four pinned params.</strong> They have to match the program byte for byte (canonical JSON). A
+          program created with weak params pins those weak params.
+        </li>
+        <li>
+          <strong>The challenge adds delay.</strong> An owner can flag even an honest claim. The hunter then has to come back and reveal the key
+          within <code>challenge_secs</code>, or lose the claim and the bond. Answering it publishes the ephemeral secret, and with the public{' '}
+          <code>owner_enc_pubkey</code> that opens the box, so <strong>anyone can then read that report</strong>. A malicious owner can force an
+          honest hunter to disclose the exploit publicly in order to get paid.
+        </li>
+        <li>
+          <strong>The owner sees the exploit; the public sees only hashes.</strong> A malicious owner can't block payment except by a valid
+          dispute, or by a flag the hunter fails to answer.
         </li>
       </ul>
     </section>

@@ -189,6 +189,15 @@ export const getClaim = async (id: number) => {
   return r == null ? null : parseClaim(r);
 };
 export const getOwner = () => view<string>('get_owner');
+/** v3 #6: is_signer_revoked for each signer. Returns null if the view is unavailable (pre-v3 contract, RPC down). */
+export async function getRevoked(signers: string[]): Promise<Set<string> | null> {
+  try {
+    const flags = await Promise.all([...new Set(signers)].map(async (signer) => [signer, await view<boolean>('is_signer_revoked', { signer })] as const));
+    return new Set(flags.filter(([, r]) => r === true).map(([s]) => s));
+  } catch {
+    return null;
+  }
+}
 
 // ---- explorer lookups (best effort, nearblocks v3 public API) ----
 
