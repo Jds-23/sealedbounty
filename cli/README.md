@@ -110,7 +110,9 @@ For every claim, `inbox` runs `checkRequestAgainstProgram(body, program, claim.h
 checks the contract's `dispute` runs, in the same order: `system prompt tampered`, `model mismatch`,
 `params tampered`, `code mismatch`, `hunter mismatch`, `report missing`. On a mismatch it prints the
 reason and the `dispute` command to run. The code bundle is printed only when it differs from
-`program.code_hash`.
+`program.code_hash`. The checks are gated by the program's contract version (`inbox`, `dispute`,
+`verify-claim`, `prove-ciphertext`): a v1 program (no `code_hash`) gets prompt + model only, a v2
+program (no `params_hash`) skips params, a v3 program runs all six.
 
 A ciphertext can fail to decrypt, or decrypt to a body whose sha256 is not `req_hash`. In both
 cases there is nothing to reveal, so `dispute` can't work, and `inbox` prints

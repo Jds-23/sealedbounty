@@ -267,11 +267,11 @@ payouts 0.1/0.2/0.3/0.5, 90 s window) paid claim 0, a live IDOR report (high, 98
      (11 `PASS` lines), `checkRequestAgainstProgram  ok: a dispute would fail`, the request body encrypted to a
      throwaway key, the exact `submit_claim` args, the storage deposit (about 0.1225 NEAR) plus the 0.05 NEAR bond,
      and `--dry-run: not sent`. No network is used.
-5. Run `make test-cli` to see `Tests 83 passed (83)`, and `make test-web` to see `Tests 124 passed | 1 skipped (125)`
-   (the skipped test needs the v1 owner key file, which only exists on the deployer's machine, where all 125 pass).
-   The shared library's own tests run with `pnpm test` in `shared/` (`tests 14`, `pass 14`).
+5. Run `make test-cli` to see `Tests 89 passed (89)`, and `make test-web` to see `Tests 128 passed | 1 skipped (129)`
+   (the skipped test needs the v1 owner key file, which only exists on the deployer's machine, where all 129 pass).
+   The shared library's own tests run with `pnpm test` in `shared/` (`tests 101`, `pass 101`, including the Rust/JS canonical-number vectors).
 6. Run `make test-contract` (the first run takes a few minutes to compile and download `near-sandbox`). You should see
-   `124 passed` unit tests plus 5 near-sandbox E2E tests: `escrow_end_to_end_live_fixtures`,
+   `126 passed` unit tests, a README-coverage test (`tests/readme_methods.rs`: every `pub fn` is documented) and 5 near-sandbox E2E tests: `escrow_end_to_end_live_fixtures`,
    `escrow_end_to_end_v2_demo_fixtures`, `escrow_end_to_end_decryption_challenge` and
    `finalize_to_deleted_hunter_credits_program` in `tests/test_escrow.rs`, and `verify_tee_response_on_sandbox` in
    `tests/test_verify.rs`. The E2E tests deploy the wasm to a local sandbox and submit **real** TEE-signed responses
@@ -425,9 +425,11 @@ Limits:
   plus their inclusion proofs.
 - **JSON edge cases.** Duplicate JSON keys are rejected anywhere in a revealed request (`params tampered`, or `system
   prompt tampered` for a duplicated `model`/`messages`), so a parser can't be tricked into reading a different value
-  than the TEE did. Number formatting is stricter onchain than in the JS inbox: the contract keeps `0.0` as written,
-  while the JS `canonicalJson` re-serializes it as `0`, so a request that writes `temperature: 0.0` is "params
-  tampered" onchain although the inbox shows it as matching. Honest clients always send the canonical integer params.
+  than the TEE did. Numbers follow serde_json exactly: an integer that fits u64/i64 stays as written, anything else
+  becomes an f64 (`0.0` stays `0.0`, `1e2` → `100.0`). The JS inbox replays this byte-for-byte (`requestParamsHash`,
+  cross-checked against `contracts/sealed-bounty/tests/fixtures/canonical-vectors.json`; fixed in #15). serde_json's
+  float parsing isn't correctly rounded, so the next deploy rejects any non-integer param (`STRICT_PARAM_NUMBERS`,
+  in source, not on `sealedbounty-v3.testnet`). Honest clients always send integer params.
 - On duplicate bugs, the first claim wins. There is no semantic deduplication across different reports.
 - **The contract accounts still hold full-access keys on testnet** (`sealedbounty-v3.testnet`, and the v2 and v1
   escrows), so their deployer could redeploy the code. Before mainnet, delete those keys (or hand upgrades to a DAO)
