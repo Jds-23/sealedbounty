@@ -12,12 +12,15 @@ export function yoctoToNear(y: string, digits = 2): string {
 export const nsToMs = (ns: string) => Number(BigInt(ns) / 1_000_000n);
 export const fmtDate = (ns: string) => new Date(nsToMs(ns)).toLocaleString();
 
-export function countdown(msLeft: number): string {
-  if (msLeft <= 0) return 'dispute window closed — anyone can finalize';
+/** `dispute`: the owner's dispute window (finalize_after); `challenge`: the hunter's prove_ciphertext window (v3 #2). */
+export function countdown(msLeft: number, kind: 'dispute' | 'challenge' = 'dispute'): string {
+  if (msLeft <= 0)
+    return kind === 'dispute' ? 'dispute window closed — anyone can finalize' : 'challenge expired — finalize rejects it as "undecryptable report"';
   const s = Math.floor(msLeft / 1000);
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
-  return `${h}h ${String(m).padStart(2, '0')}m ${String(s % 60).padStart(2, '0')}s left to dispute`;
+  const left = `${h}h ${String(m).padStart(2, '0')}m ${String(s % 60).padStart(2, '0')}s left`;
+  return kind === 'dispute' ? `${left} to dispute` : `${left} for the hunter to prove_ciphertext`;
 }
 
 /** Human duration for contract `*_secs` fields (live program uses 90 s; demo uses 24 h). */

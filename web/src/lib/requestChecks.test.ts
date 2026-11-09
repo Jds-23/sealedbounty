@@ -46,7 +46,7 @@ describe('auditRequest', () => {
     for (const c of claims.filter((x) => x.status !== 'Rejected')) {
       const a = auditRequest(decrypt(c), program, c.hunter);
       expect(a).toMatchObject({ ok: true, reason: null, v1: false });
-      expect(status(a)).toEqual({ prompt: true, model: true, code: true, hunter: true, report: true });
+      expect(status(a)).toEqual({ prompt: true, model: true, params: null, code: true, hunter: true, report: true });
     }
   });
 
@@ -56,7 +56,7 @@ describe('auditRequest', () => {
     expect(c.reject_reason).toBe('code mismatch');
     const a = auditRequest(decrypt(c), program, c.hunter);
     expect(a).toMatchObject({ ok: false, reason: 'code mismatch' });
-    expect(status(a)).toEqual({ prompt: true, model: true, code: false, hunter: true, report: true });
+    expect(status(a)).toEqual({ prompt: true, model: true, params: null, code: false, hunter: true, report: true });
     expect(a.checks.find((x) => x.key === 'code')!.detail).toMatch(/≠ program\.code_hash/);
   });
 
@@ -68,7 +68,7 @@ describe('auditRequest', () => {
     expect(real.status).toBe('Paid');
     const a = auditRequest(decrypt(fr), program, fr.hunter);
     expect(a).toMatchObject({ ok: false, reason: 'hunter mismatch' });
-    expect(status(a)).toEqual({ prompt: true, model: true, code: true, hunter: false, report: true });
+    expect(status(a)).toEqual({ prompt: true, model: true, params: null, code: true, hunter: false, report: true });
     expect(auditRequest(decrypt(real), program, real.hunter).ok).toBe(true);
   });
 
@@ -100,7 +100,7 @@ describe('auditRequest', () => {
   it('v1 program (no code_hash): only prompt + model are checked, the rest is n/a', () => {
     const a = auditRequest(body, { ...program, code_hash: null }, 'anyone.testnet');
     expect(a).toMatchObject({ ok: true, reason: null, v1: true });
-    expect(status(a)).toEqual({ prompt: true, model: true, code: null, hunter: null, report: null });
+    expect(status(a)).toEqual({ prompt: true, model: true, params: null, code: null, hunter: null, report: null });
   });
 });
 
