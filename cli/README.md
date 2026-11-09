@@ -89,15 +89,18 @@ owner_enc_pubkey, dispute_secs, min_confidence, bond, challenge_secs, signers)`.
   it, `signers: null` is sent, and the contract takes a snapshot of every allowlisted signer whose
   model matches.
 
+`create-program` attaches `fund + 0.05 NEAR` (the storage allowance; the contract adds whatever is
+left of it to the pool, so the pool starts slightly above `--fund`: the live v3 program 1 got
+`--fund 1.5` and started at 1.54248 NEAR). The secret key is written to
+`~/.sealedbounty/owner-pending-*.json` **before** the transaction is sent and renamed to
+`~/.sealedbounty/owner-<contract>-<programId>.json` (chmod 600) after it succeeds. Back this file up: without it
+you cannot read the reports.
+
 ```sh
 pnpm sb set-program-signers --program 0 --signers ed25519:<hex> eth:0x<hex> [--dry-run]
 ```
 This checks every signer against `get_signers` (`meta.model == program.model_id`) before sending. It
-only affects future submissions. It attaches `fund + 0.05 NEAR` (the storage allowance; the contract
-adds whatever is left of it to the pool). The secret key is written to
-`~/.sealedbounty/owner-pending-*.json` **before** the transaction is sent and renamed to
-`~/.sealedbounty/owner-<contract>-<programId>.json` (chmod 600) after it succeeds. Back this file up: without it
-you cannot read the reports.
+only affects future submissions.
 
 ```sh
 pnpm sb inbox --program 0 [--status Pending]   # decrypt each report; sha256(body)==req_hash; request vs program
@@ -140,7 +143,7 @@ The hunter is the signer account (`--account` or `$NEAR_TESTNET_ACCOUNT_ID`). `-
 program's bundle: if it does not hash to `program.code_hash`, the CLI refuses unless you pass `--force`.
 
 The flow:
-1. Build the v2 body (`TARGET …@…\nHUNTER <you>\n\nCODE\n<bundle>` + `REPORT\n<report>`) and pre-check
+1. Build the request body (`TARGET …@…\nHUNTER <you>\n\nCODE\n<bundle>` + `REPORT\n<report>`, with the pinned params) and pre-check
    it with `checkRequestAgainstProgram` before spending a NEAR AI call.
 2. Judge it, then run `verifyFixture` (hashes, signed text, signature, verdict, prompt hash).
 3. Check the request against the program again (this includes `params tampered`). Any mismatch is
@@ -196,7 +199,7 @@ status after the transaction:
 
 ## Tests
 ```sh
-pnpm build && pnpm test
+pnpm build && pnpm test      # Tests 83 passed (83)
 ```
 The tests cover:
 - the args builders, including `code_hash` in `create_program`
