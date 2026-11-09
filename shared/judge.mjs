@@ -122,6 +122,101 @@ export function codeMessagePrefix({ repoUrl, commit, hunter }) {
   return `TARGET ${repoUrl}@${commit}\nHUNTER ${hunter}\n\nCODE\n`;
 }
 
+// ---------------------------------------------------------------- params pinning (v3 #1)
+
+/** utf8 byte-order string compare (== Rust String Ord; JS `<` compares UTF-16 code units). */
+const utf8Cmp = (a, b) => {
+  const x = utf8(a), y = utf8(b);
+  for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i] - y[i];
+  return x.length - y.length;
+};
+
+/**
+ * Canonical JSON (docs/INTERFACE.md v3 #1): object keys sorted recursively in utf8 byte order,
+ * no whitespace, standard JSON.stringify escapes. Matches the contract's `canonical_json`.
+ * Note: numbers are re-serialized by JSON.stringify, so `0.0` becomes `0` here while the contract
+ * keeps `0.0` (the contract is stricter; the canonical request only has integer params).
+ * @param {unknown} v JSON value
+ * @returns {string}
+ */
+export function canonicalJson(v) {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`;
+  if (v !== null && typeof v === 'object') {
+    return `{${Object.keys(v).sort(utf8Cmp).map((k) => `${JSON.stringify(k)}:${canonicalJson(v[k])}`).join(',')}}`;
+  }
+  const s = JSON.stringify(v);
+  if (s === undefined) throw new Error(`canonicalJson: not a JSON value (${typeof v})`);
+  return s;
+}
+
+/** The canonical judge request params (what buildRequestBody sends besides model + messages). */
+export const JUDGE_PARAMS = Object.freeze({
+  response_format: VERDICT_RESPONSE_FORMAT,
+  chat_template_kwargs: Object.freeze({ enable_thinking: false }),
+  temperature: 0,
+  max_tokens: 400,
+});
+
+/** Exact top-level keys of a judge request; each message is exactly {role, content}. */
+const REQUEST_KEYS = ['model', 'messages', 'response_format', 'chat_template_kwargs', 'temperature', 'max_tokens'];
+
+/**
+ * Program.params_hash: sha256hex(canonicalJson({chat_template_kwargs, max_tokens, response_format, temperature})).
+ * @param {{chat_template_kwargs?: unknown, max_tokens?: unknown, response_format?: unknown, temperature?: unknown}} [req]
+ *   a parsed request (or just its params); defaults to the canonical JUDGE_PARAMS
+ * @returns {string} 64 lowercase hex chars
+ */
+export function paramsHash(req = JUDGE_PARAMS) {
+  const { chat_template_kwargs, max_tokens, response_format, temperature } = req;
+  return sha256hex(canonicalJson({ chat_template_kwargs, max_tokens, response_format, temperature }));
+}
+
+/**
+ * Paths of duplicated object keys in a JSON text (JSON.parse silently keeps the last copy; the
+ * contract rejects them). Assumes `text` is valid JSON.
+ * @param {string} text
+ * @returns {(string|number)[][]} e.g. [['temperature'], ['messages', 2, 'role']]
+ */
+function duplicateKeyPaths(text) {
+  const dups = [];
+  let i = 0;
+  const ws = () => { while (/\s/.test(text[i] ?? '')) i++; };
+  const str = () => {
+    const m = /"(?:[^"\\]|\\.)*"/y; m.lastIndex = i;
+    const s = m.exec(text)[0]; i += s.length;
+    return JSON.parse(s);
+  };
+  const value = (path) => {
+    ws();
+    const c = text[i];
+    if (c === '{') {
+      i++; ws();
+      const seen = new Set();
+      if (text[i] === '}') { i++; return; }
+      for (;;) {
+        ws(); const k = str(); ws(); i++; // ':'
+        if (seen.has(k)) dups.push([...path, k]);
+        seen.add(k);
+        value([...path, k]); ws();
+        if (text[i++] === '}') return; // else ','
+      }
+    }
+    if (c === '[') {
+      i++; ws();
+      if (text[i] === ']') { i++; return; }
+      for (let n = 0; ; n++) {
+        value([...path, n]); ws();
+        if (text[i++] === ']') return;
+      }
+    }
+    if (c === '"') { str(); return; }
+    const m = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null/y; m.lastIndex = i;
+    i += m.exec(text)[0].length;
+  };
+  value([]);
+  return dups;
+}
+
 // ---------------------------------------------------------------- request body
 
 /**
@@ -179,19 +274,22 @@ export function buildRequestBodyV1({ model, repoUrl, commit, codeExcerpt, report
 }
 
 /**
- * Pre-check a request body against a program the way the v2 contract's `dispute` does (after its
+ * Pre-check a request body against a program the way the v3 contract's `dispute` does (after its
  * sha256 == req_hash check), returning the FIRST failing reason in contract order:
  * 1 "system prompt tampered" (unparsable JSON, messages[0] not system / hash != system_prompt_hash,
- *   or more than 3 messages), 2 "model mismatch", 3 "code mismatch" (messages[1] not user, TARGET line,
- *   malformed HUNTER/CODE header, or sha256(code) != code_hash), 4 "hunter mismatch" (only the HUNTER
- *   line differs from `hunter`: front-running), 5 "report missing" (messages[2] missing / not user /
- *   not starting with "REPORT\n").
+ *   or more than 3 messages), 2 "model mismatch", 3 "params tampered" (top-level keys not exactly
+ *   model/messages/response_format/chat_template_kwargs/temperature/max_tokens, a message that is not
+ *   exactly {role, content}, a duplicate key anywhere, or paramsHash(req) != params_hash; skipped when
+ *   the program has no params_hash, i.e. a v2 contract), 4 "code mismatch" (messages[1] not user, TARGET
+ *   line, malformed HUNTER/CODE header, or sha256(code) != code_hash), 5 "hunter mismatch" (only the
+ *   HUNTER line differs from `hunter`: front-running), 6 "report missing" (messages[2] missing / not
+ *   user / not starting with "REPORT\n").
  * ok:true means a dispute would fail with "dispute invalid: request matches program".
  * @param {string} requestBody exact request body
- * @param {{repo_url: string, commit: string, model_id: string, system_prompt_hash: string, code_hash: string}} program
+ * @param {{repo_url: string, commit: string, model_id: string, system_prompt_hash: string, code_hash: string, params_hash?: string}} program
  *   contract Program view (snake_case, as returned by get_program)
  * @param {string} hunter the account that submits (or submitted) the claim
- * @returns {{ok: boolean, reason: null|'system prompt tampered'|'model mismatch'|'code mismatch'|'hunter mismatch'|'report missing'}}
+ * @returns {{ok: boolean, reason: null|'system prompt tampered'|'model mismatch'|'params tampered'|'code mismatch'|'hunter mismatch'|'report missing'}}
  */
 export function checkRequestAgainstProgram(requestBody, program, hunter) {
   const fail = (reason) => ({ ok: false, reason });
@@ -203,12 +301,27 @@ export function checkRequestAgainstProgram(requestBody, program, hunter) {
   const msgs = req.messages;
   const isMsg = (m) => m !== null && typeof m === 'object' && typeof m.role === 'string' && 'content' in m;
   if (!msgs.every(isMsg)) return fail('system prompt tampered'); // contract: messages fail to deserialize
+  // The contract's lenient serde structs reject a repeated `model`/`messages` key or a repeated
+  // `role`/`content` key in a message; any other duplicate is caught at the params step.
+  const dups = duplicateKeyPaths(requestBody);
+  const structDup = (p) => (p.length === 1 && (p[0] === 'model' || p[0] === 'messages')) ||
+    (p.length === 3 && p[0] === 'messages' && (p[2] === 'role' || p[2] === 'content'));
+  if (dups.some(structDup)) return fail('system prompt tampered');
   const m0 = msgs[0];
   if (!m0 || m0.role !== 'system' || typeof m0.content !== 'string' || sha256hex(m0.content) !== program.system_prompt_hash) {
     return fail('system prompt tampered');
   }
   if (msgs.length > 3) return fail('system prompt tampered');
   if (req.model !== program.model_id) return fail('model mismatch');
+
+  // v3 #1: exact request shape, no duplicate keys, params hash pinned. A v2 program (no
+  // params_hash) skips this step, as the v2 contract does.
+  if (program.params_hash != null) {
+    const keys = Object.keys(req);
+    const exactShape = keys.length === REQUEST_KEYS.length && REQUEST_KEYS.every((k) => Object.hasOwn(req, k)) &&
+      msgs.every((m) => Object.keys(m).length === 2);
+    if (!exactShape || dups.length || paramsHash(req) !== program.params_hash) return fail('params tampered');
+  }
 
   const m1 = msgs[1];
   if (!m1 || m1.role !== 'user' || typeof m1.content !== 'string') return fail('code mismatch');

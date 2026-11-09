@@ -15,7 +15,8 @@
   "scripts": {
     "gen:prompt": "node gen-prompt.mjs",
     "record:demo": "node record-demo.mjs",
-    "demo:offline": "node demo-offline.mjs"
+    "demo:offline": "node demo-offline.mjs",
+    "test": "node --test 'test/*.test.mjs'"
   },
   "dependencies": {
     "ethers": "^6.17.0",

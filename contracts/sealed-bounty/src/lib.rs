@@ -58,6 +58,9 @@ pub struct Program {
     pub system_prompt_hash: String,
     /// sha256hex of the canonical code bundle (64 lowercase hex). v2.
     pub code_hash: String,
+    /// sha256hex of the canonical JSON of the request params
+    /// `{chat_template_kwargs, max_tokens, response_format, temperature}`. v3 (#1).
+    pub params_hash: String,
     pub payouts: Payouts,
     pub owner_enc_pubkey: String,
     pub dispute_secs: u64,
@@ -136,7 +139,8 @@ fn charge_storage(before: u64, attached: NearToken) -> NearToken {
     cost
 }
 
-/// Minimal shape of the canonical judge request (unknown fields ignored).
+/// Lenient shape of the judge request (unknown fields ignored) for the prompt/model/code checks;
+/// the exact shape is enforced by [`StrictRequest`] at the params step.
 #[derive(Deserialize)]
 #[serde(crate = "near_sdk::serde")]
 struct JudgeRequest {
@@ -150,19 +154,155 @@ struct JudgeMessage {
     content: serde_json::Value,
 }
 
+/// Strict shape of the canonical judge request (v3 #1): exactly these top-level keys and exactly
+/// `{role, content}` per message. Values are parsed with [`NoDupValue`], so no object anywhere may
+/// repeat a key (a provider could read the first copy where we read the last).
+#[derive(Deserialize)]
+#[serde(crate = "near_sdk::serde", deny_unknown_fields)]
+struct StrictRequest {
+    #[allow(dead_code)]
+    model: NoDupValue,
+    #[allow(dead_code)]
+    messages: Vec<StrictMessage>,
+    response_format: NoDupValue,
+    chat_template_kwargs: NoDupValue,
+    temperature: NoDupValue,
+    max_tokens: NoDupValue,
+}
+#[derive(Deserialize)]
+#[serde(crate = "near_sdk::serde", deny_unknown_fields)]
+struct StrictMessage {
+    #[allow(dead_code)]
+    role: NoDupValue,
+    #[allow(dead_code)]
+    content: NoDupValue,
+}
+
+/// A `serde_json::Value` whose objects must not contain duplicate keys.
+struct NoDupValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for NoDupValue {
+    fn deserialize<D: near_sdk::serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use near_sdk::serde::de::{Error, MapAccess, SeqAccess, Visitor};
+        use serde_json::Value;
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Value;
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                f.write_str("JSON value")
+            }
+            fn visit_bool<E>(self, b: bool) -> Result<Value, E> {
+                Ok(Value::Bool(b))
+            }
+            fn visit_i64<E>(self, n: i64) -> Result<Value, E> {
+                Ok(n.into())
+            }
+            fn visit_u64<E>(self, n: u64) -> Result<Value, E> {
+                Ok(n.into())
+            }
+            fn visit_f64<E>(self, n: f64) -> Result<Value, E> {
+                Ok(n.into())
+            }
+            fn visit_str<E>(self, s: &str) -> Result<Value, E> {
+                Ok(s.into())
+            }
+            fn visit_string<E>(self, s: String) -> Result<Value, E> {
+                Ok(s.into())
+            }
+            fn visit_unit<E>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+                let mut v = Vec::new();
+                while let Some(NoDupValue(x)) = seq.next_element()? {
+                    v.push(x);
+                }
+                Ok(Value::Array(v))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+                let mut m = serde_json::Map::new();
+                while let Some(k) = map.next_key::<String>()? {
+                    if m.contains_key(&k) {
+                        return Err(A::Error::custom(format!("duplicate key {k}")));
+                    }
+                    let NoDupValue(v) = map.next_value()?;
+                    m.insert(k, v);
+                }
+                Ok(Value::Object(m))
+            }
+        }
+        d.deserialize_any(V).map(NoDupValue)
+    }
+}
+
+/// Canonical JSON (v3 #1): object keys sorted recursively (byte order), no whitespace, serde_json
+/// escapes. Sorts explicitly: near-sdk enables serde_json `preserve_order`, so `Value` maps keep
+/// insertion order and plain `to_string` would NOT be canonical.
+pub(crate) fn canonical_json(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    fn write(v: &Value, out: &mut String) {
+        match v {
+            Value::Array(a) => {
+                out.push('[');
+                for (i, x) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write(x, out);
+                }
+                out.push(']');
+            }
+            Value::Object(m) => {
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort();
+                out.push('{');
+                for (i, k) in keys.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&Value::String(k.clone()).to_string());
+                    out.push(':');
+                    write(&m[k], out);
+                }
+                out.push('}');
+            }
+            scalar => out.push_str(&scalar.to_string()),
+        }
+    }
+    let mut out = String::new();
+    write(v, &mut out);
+    out
+}
+
+/// `Some(params_hash)` if `request_body` has exactly the canonical request shape (no unknown or
+/// missing keys, no duplicate keys anywhere), else `None`.
+/// params_hash = sha256hex(canonical_json({chat_template_kwargs, max_tokens, response_format, temperature})).
+pub(crate) fn request_params_hash(request_body: &str) -> Option<String> {
+    let r = serde_json::from_str::<StrictRequest>(request_body).ok()?;
+    let params = json!({
+        "chat_template_kwargs": r.chat_template_kwargs.0,
+        "max_tokens": r.max_tokens.0,
+        "response_format": r.response_format.0,
+        "temperature": r.temperature.0,
+    });
+    Some(tee::sha256_hex(canonical_json(&params).as_bytes()))
+}
+
 pub(crate) const TAMPERED: &str = "system prompt tampered";
 pub(crate) const MODEL_MISMATCH: &str = "model mismatch";
+pub(crate) const PARAMS_TAMPERED: &str = "params tampered";
 pub(crate) const CODE_MISMATCH: &str = "code mismatch";
 pub(crate) const HUNTER_MISMATCH: &str = "hunter mismatch";
 pub(crate) const REPORT_MISSING: &str = "report missing";
 
 /// `None` if the revealed request matches the program and the claim's hunter, else the FIRST
-/// failing reject reason (INTERFACE.md v2 order):
+/// failing reject reason (INTERFACE.md v3 order):
 /// 1. system prompt tampered (also: not JSON, or more than 3 messages)
 /// 2. model mismatch
-/// 3. code mismatch (messages[1] role/TARGET line/CODE framing/code hash)
-/// 4. hunter mismatch (only the HUNTER line differs from `hunter`)
-/// 5. report missing
+/// 3. params tampered (not exactly the canonical keys, duplicate keys, or params hash != params_hash)
+/// 4. code mismatch (messages[1] role/TARGET line/CODE framing/code hash)
+/// 5. hunter mismatch (only the HUNTER line differs from `hunter`)
+/// 6. report missing
 fn tamper_reason(
     program: &Program,
     hunter: &AccountId,
@@ -184,6 +324,9 @@ fn tamper_reason(
     }
     if req.model != program.model_id {
         return Some(MODEL_MISMATCH);
+    }
+    if request_params_hash(request_body).as_deref() != Some(program.params_hash.as_str()) {
+        return Some(PARAMS_TAMPERED);
     }
     if let Err(r) = code_check(program, hunter, req.messages.get(1)) {
         return Some(r);
@@ -305,6 +448,7 @@ impl Contract {
         model_id: String,
         system_prompt_hash: String,
         code_hash: String,
+        params_hash: String,
         payouts: Payouts,
         owner_enc_pubkey: String,
         dispute_secs: u64,
@@ -314,6 +458,8 @@ impl Contract {
             .unwrap_or_else(|_| env::panic_str("system_prompt_hash must be 64 hex chars"));
         let code_hash = tee::normalize_hash_hex(&code_hash)
             .unwrap_or_else(|_| env::panic_str("code_hash must be 64 hex chars"));
+        let params_hash = tee::normalize_hash_hex(&params_hash)
+            .unwrap_or_else(|_| env::panic_str("params_hash must be 64 hex chars"));
         require!(min_confidence <= 100, "min_confidence must be <= 100");
         require!(
             dispute_secs.checked_mul(NANOS_PER_SEC).is_some(),
@@ -336,6 +482,7 @@ impl Contract {
                 model_id: model_id.clone(),
                 system_prompt_hash,
                 code_hash,
+                params_hash,
                 payouts,
                 owner_enc_pubkey,
                 dispute_secs,

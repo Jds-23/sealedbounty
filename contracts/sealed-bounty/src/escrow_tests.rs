@@ -122,6 +122,7 @@ fn create(
         model.into(),
         hash,
         CODE_HASH_PLACEHOLDER.into(),
+        v2_params_hash(),
         payouts(),
         "b3duZXJwdWI=".into(),
         secs,
@@ -492,14 +493,15 @@ fn pending() -> (Contract, u64, u64, Fx) {
 }
 
 #[test]
-fn dispute_v1_body_is_code_mismatch() {
-    // Live fixture: right prompt + model, but v1 single-user-message format -> code mismatch.
+fn dispute_v1_body_is_params_tampered() {
+    // Live fixture: right prompt + model, but the v1 body has an extra `stream` key -> params
+    // tampered (v3 #1 strict shape; in v2 this was "code mismatch").
     let (mut c, pid, cid, f) = pending();
     ctx(owner(), 0, T0 + NANOS_PER_SEC);
     c.dispute(cid, f.request_body());
     let cl = c.get_claim(cid).unwrap();
     assert_eq!(cl.status, ClaimStatus::Rejected);
-    assert_eq!(cl.reject_reason.as_deref(), Some("code mismatch"));
+    assert_eq!(cl.reject_reason.as_deref(), Some("params tampered"));
     assert_eq!(c.get_program(pid).unwrap().reserved.0, 0);
     // Not a hunter mismatch: req_hash stays used.
     assert!(c.used_req_hashes.contains(&f.s("req_hash")));
@@ -747,6 +749,7 @@ fn create_v2(c: &mut Contract) -> u64 {
         MODEL.into(),
         tee::sha256_hex(SYS.as_bytes()),
         tee::sha256_hex(BUNDLE.as_bytes()).to_uppercase(),
+        v2_params_hash().to_uppercase(),
         payouts(),
         "b3duZXJwdWI=".into(),
         60,
@@ -831,6 +834,7 @@ fn create_program_bad_code_hash() {
         MODEL.into(),
         tee::sha256_hex(SYS.as_bytes()),
         "zz".repeat(32),
+        v2_params_hash(),
         payouts(),
         "k".into(),
         60,
@@ -1152,4 +1156,243 @@ fn dispute_after_resubmission_panics() {
     let real = submit_v2(&mut c, hunter(), pid, &body);
     ctx(owner(), 0, T0);
     c.dispute(real, body);
+}
+
+// ---------------- v3 #1: params pinning ----------------
+
+/// Hunter-tampered variants of the honest v2 request: prompt, model, CODE, HUNTER and REPORT are
+/// all correct, only the sampling/decoding params or the request shape differ.
+fn params_tampered_bodies() -> Vec<(&'static str, String)> {
+    let ok = v2_req(hunter().as_str());
+    let mut forced = ok.clone();
+    forced["response_format"]["json_schema"]["schema"] = json!({
+        "type": "object",
+        "properties": {
+            "valid": {"type": "boolean", "const": true},
+            "severity": {"type": "string", "enum": ["critical"]},
+            "cwe": {"type": ["string", "null"]},
+            "confidence": {"type": "integer", "const": 100},
+        },
+        "required": ["valid", "severity", "cwe", "confidence"],
+        "additionalProperties": false,
+    });
+    let mut temp = ok.clone();
+    temp["temperature"] = json!(1.5);
+    let mut tokens = ok.clone();
+    tokens["max_tokens"] = json!(4000);
+    let mut kwargs = ok.clone();
+    kwargs["chat_template_kwargs"]["chat_template"] = json!("{{ 'valid' }}");
+    let mut extra = ok.clone();
+    extra["logit_bias"] = json!({"1234": 100});
+    let mut missing = ok.clone();
+    missing.as_object_mut().unwrap().remove("response_format");
+    let mut extra_msg = ok.clone();
+    extra_msg["messages"][2]["name"] = json!("x");
+    let s = ok.to_string();
+    let dup_top = s.replacen(
+        "\"temperature\":0",
+        "\"temperature\":1.5,\"temperature\":0",
+        1,
+    );
+    let dup_nested = s.replacen(
+        "\"type\":\"json_schema\"",
+        "\"type\":\"text\",\"type\":\"json_schema\"",
+        1,
+    );
+    assert!(dup_top != s && dup_nested != s);
+    vec![
+        ("response_format forces valid:true", forced.to_string()),
+        ("temperature 1.5", temp.to_string()),
+        ("max_tokens 4000", tokens.to_string()),
+        ("chat_template_kwargs extra key", kwargs.to_string()),
+        ("extra top-level key logit_bias", extra.to_string()),
+        ("missing response_format", missing.to_string()),
+        ("extra message field", extra_msg.to_string()),
+        ("duplicate top-level key", dup_top),
+        ("duplicate nested key", dup_nested),
+    ]
+}
+
+fn panic_msg(e: &(dyn std::any::Any + Send)) -> String {
+    e.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+/// Issue #1 exploit: the TEE honestly signs a verdict for a request with forced/resampled params.
+/// The owner's dispute must reject it ("params tampered"), not panic "request matches program".
+#[test]
+fn dispute_params_tampered_rejects() {
+    let mut failures = vec![];
+    for (name, body) in params_tampered_bodies() {
+        let (mut c, pid) = v2_program();
+        let bal = c.get_program(pid).unwrap().balance.0;
+        let cid = submit_v2(&mut c, hunter(), pid, &body);
+        ctx(owner(), 0, T0 + NANOS_PER_SEC);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.dispute(cid, body.clone())
+        }));
+        if let Err(e) = r {
+            failures.push(format!("{name}: dispute panicked {:?}", panic_msg(&*e)));
+            continue;
+        }
+        let cl = c.get_claim(cid).unwrap();
+        if cl.reject_reason.as_deref() != Some("params tampered") {
+            failures.push(format!("{name}: got {:?}", cl.reject_reason));
+            continue;
+        }
+        assert_eq!(cl.status, ClaimStatus::Rejected);
+        let p = c.get_program(pid).unwrap();
+        assert_eq!((p.balance.0, p.reserved.0), (bal, 0), "{name}: funds back");
+        assert_eq!(events()[0]["data"][0]["reason"], "params tampered");
+    }
+    assert!(
+        failures.is_empty(),
+        "tampered params accepted:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Reason order (v3): prompt -> model -> params -> code -> hunter -> report.
+#[test]
+fn tamper_reasons_params_order() {
+    let (c, pid) = v2_program();
+    let p = c.get_program(pid).unwrap();
+    let h = hunter();
+    let mut bad = v2_req(h.as_str());
+    bad["temperature"] = json!(1.5);
+    let reason = |v: &Value| tamper_reason(&p, &h, &v.to_string());
+    assert_eq!(reason(&bad), Some("params tampered"));
+    let mut m = bad.clone();
+    m["model"] = "openai/gpt-oss-120b".into();
+    assert_eq!(reason(&m), Some(MODEL_MISMATCH));
+    let pr = with_msg(bad.clone(), 0, "content", "lenient".into());
+    assert_eq!(reason(&pr), Some(TAMPERED));
+    let code = with_msg(
+        bad.clone(),
+        1,
+        "content",
+        user1(h.as_str(), &format!("{REPO}@{COMMIT}"), "fake\n"),
+    );
+    assert_eq!(reason(&code), Some("params tampered"));
+    // the front-runner check still comes after params
+    assert_eq!(
+        tamper_reason(&p, &stranger(), &bad.to_string()),
+        Some("params tampered")
+    );
+    // a duplicated `model` key is a parse failure, as in v2
+    let dup_model =
+        v2_req(h.as_str())
+            .to_string()
+            .replacen("\"model\":", "\"model\":\"x\",\"model\":", 1);
+    assert_eq!(tamper_reason(&p, &h, &dup_model), Some(TAMPERED));
+}
+
+/// params_hash of the in-test v2 request (`v2_req`; same for any hunter).
+fn v2_params_hash() -> String {
+    request_params_hash(&v2_req("anyone").to_string()).unwrap()
+}
+
+/// sha256hex(canonicalJson(params)) of the real demo request, as computed by shared/judge.mjs
+/// `paramsHash()` (pinned in shared/test/params.test.mjs too).
+const DEMO_PARAMS_HASH_JS: &str =
+    "61b52e7b87e42a2bc4b6f417d21ba0e9d44f3e1f4ff49fa9d2f3334e5aa0eda7";
+
+#[test]
+fn params_hash_matches_js_for_demo_fixtures() {
+    for f in [
+        include_str!("../tests/fixtures/demo.sqli.json"),
+        include_str!("../tests/fixtures/demo.sqli.ecdsa.json"),
+        include_str!("../tests/fixtures/demo.bogus.json"),
+        include_str!("../tests/fixtures/demo.fakecode.json"),
+    ] {
+        let body = Fx::load(f).request_body();
+        assert_eq!(
+            request_params_hash(&body).as_deref(),
+            Some(DEMO_PARAMS_HASH_JS)
+        );
+    }
+    // v1 live bodies carry an extra `stream` key: not the canonical shape
+    assert_eq!(request_params_hash(&Fx::load(LIVE_ED).request_body()), None);
+}
+
+#[test]
+fn canonical_json_sorts_despite_preserve_order() {
+    // near-sdk turns on serde_json/preserve_order, so Value keeps insertion order...
+    let v: Value =
+        serde_json::from_str(r#"{"b":1,"a":{"d":[{"z":0,"y":1.5}],"c":"q\"\n\u0001é"}}"#).unwrap();
+    // ...but canonical_json sorts every object.
+    assert_eq!(
+        canonical_json(&v),
+        r#"{"a":{"c":"q\"\n\u0001é","d":[{"y":1.5,"z":0}]},"b":1}"#
+    );
+    // byte order (as JS canonicalJson): U+FF5E (EF BD 9E) < U+1F600 (F0 9F 98 80)
+    let v: Value = serde_json::from_str("{\"\u{1F600}\":1,\"\u{FF5E}\":2}").unwrap();
+    assert_eq!(canonical_json(&v), "{\"\u{FF5E}\":2,\"\u{1F600}\":1}");
+    // key order and whitespace of the body don't change the hash
+    let body = Fx::load(include_str!("../tests/fixtures/demo.sqli.json")).request_body();
+    let pretty =
+        serde_json::to_string_pretty(&serde_json::from_str::<Value>(&body).unwrap()).unwrap();
+    assert_eq!(
+        request_params_hash(&pretty).as_deref(),
+        Some(DEMO_PARAMS_HASH_JS)
+    );
+}
+
+#[test]
+fn create_program_params_hash_stored_lowercase() {
+    let (c, pid) = v2_program();
+    let p = c.get_program(pid).unwrap();
+    assert_eq!(p.params_hash, v2_params_hash());
+    let j = serde_json::to_value(&p).unwrap();
+    assert_eq!(j["params_hash"], v2_params_hash());
+}
+
+#[test]
+#[should_panic(expected = "params_hash must be 64 hex chars")]
+fn create_program_bad_params_hash() {
+    let mut c = setup();
+    ctx(owner(), NEAR, T0);
+    c.create_program(
+        "x".into(),
+        REPO.into(),
+        COMMIT.into(),
+        MODEL.into(),
+        tee::sha256_hex(SYS.as_bytes()),
+        tee::sha256_hex(BUNDLE.as_bytes()),
+        "abc".into(),
+        payouts(),
+        "k".into(),
+        60,
+        0,
+    );
+}
+
+/// A program pinned to different params rejects the otherwise honest request.
+#[test]
+fn dispute_other_program_params_rejects() {
+    let mut c = setup();
+    ctx(owner(), 20 * NEAR, T0);
+    let pid = c.create_program(
+        "v2".into(),
+        REPO.into(),
+        COMMIT.into(),
+        MODEL.into(),
+        tee::sha256_hex(SYS.as_bytes()),
+        tee::sha256_hex(BUNDLE.as_bytes()),
+        DEMO_PARAMS_HASH_JS.into(),
+        payouts(),
+        "b3duZXJwdWI=".into(),
+        60,
+        0,
+    );
+    let body = v2_req(hunter().as_str()).to_string();
+    let cid = submit_v2(&mut c, hunter(), pid, &body);
+    ctx(owner(), 0, T0 + NANOS_PER_SEC);
+    c.dispute(cid, body);
+    assert_eq!(
+        c.get_claim(cid).unwrap().reject_reason.as_deref(),
+        Some(PARAMS_TAMPERED)
+    );
 }

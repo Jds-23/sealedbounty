@@ -1,6 +1,7 @@
 //! Sandbox end-to-end test of the escrow with the REAL live TEE fixtures (ed25519 + ecdsa).
-//! The live fixtures use the v1 single-user-message request format, so under the v2 dispute
-//! rules an honest-prompt dispute now rejects them with "code mismatch".
+//! The live fixtures use the v1 single-user-message request format, so under the v2/v3 dispute
+//! rules an honest-prompt dispute rejects them: v2 "code mismatch", v3 "params tampered" (they
+//! carry an extra `stream` key).
 
 use near_api::{AccountId, NearGas, NearToken};
 use near_sdk::serde::de::DeserializeOwned;
@@ -11,6 +12,8 @@ const DISPUTE_SECS: u64 = 20;
 /// code_hash for programs judged with v1 (live) bodies; never matches.
 const PLACEHOLDER_CODE_HASH: &str =
     "00000000000000000000000000000000000000000000000000000000000000c0";
+/// params_hash of the canonical demo request (shared/judge.mjs `paramsHash()`; v3 #1).
+const DEMO_PARAMS_HASH: &str = "61b52e7b87e42a2bc4b6f417d21ba0e9d44f3e1f4ff49fa9d2f3334e5aa0eda7";
 
 struct Fx(Value);
 
@@ -228,7 +231,7 @@ impl Env {
         let args = json!({
             "name": "demo", "repo_url": "https://github.com/x/y", "commit": "abc123",
             "model_id": f.s("model"), "system_prompt_hash": hash,
-            "code_hash": PLACEHOLDER_CODE_HASH,
+            "code_hash": PLACEHOLDER_CODE_HASH, "params_hash": DEMO_PARAMS_HASH,
             "payouts": { "low": (NEAR / 2).to_string(), "medium": NEAR.to_string(),
                          "high": (2 * NEAR).to_string(), "critical": (4 * NEAR).to_string() },
             "owner_enc_pubkey": "b3duZXJwdWI=", "dispute_secs": DISPUTE_SECS, "min_confidence": min_conf,
@@ -508,7 +511,7 @@ async fn escrow_end_to_end_live_fixtures() -> testresult::TestResult<()> {
             .await;
         assert_eq!(claims.len(), 1);
 
-        // ---- program 3 (fresh escrow): right prompt + model, v1 body -> "code mismatch" ----
+        // ---- program 3 (fresh escrow): right prompt + model, v1 body (extra `stream` key) -> "params tampered" ----
         let c = e.deploy(&format!("esc3-{algo}.sandbox")).await;
         let pid = e
             .create_program(&c, f, f.system_prompt_hash(), 0, 10 * NEAR)
@@ -528,7 +531,7 @@ async fn escrow_end_to_end_live_fixtures() -> testresult::TestResult<()> {
         );
         let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
         assert_eq!(claim["status"], "Rejected");
-        assert_eq!(claim["reject_reason"], "code mismatch");
+        assert_eq!(claim["reject_reason"], "params tampered");
         let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
         assert_eq!(u128_of(&p["balance"]), bal0);
         assert_eq!(u128_of(&p["reserved"]), 0);
@@ -577,7 +580,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
     let args = json!({
         "name": "vuln-app", "repo_url": inputs["repoUrl"], "commit": inputs["commit"],
         "model_id": sqli.s("model"), "system_prompt_hash": prompt_hash,
-        "code_hash": code_hash.to_uppercase(),
+        "code_hash": code_hash.to_uppercase(), "params_hash": DEMO_PARAMS_HASH,
         "payouts": { "low": (NEAR / 2).to_string(), "medium": NEAR.to_string(),
                      "high": (2 * NEAR).to_string(), "critical": (3 * NEAR).to_string() },
         "owner_enc_pubkey": "b3duZXJwdWI=", "dispute_secs": DISPUTE_SECS, "min_confidence": 80,
@@ -588,6 +591,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
         .json()?;
     let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
     assert_eq!(p["code_hash"], code_hash, "stored lowercase");
+    assert_eq!(p["params_hash"], DEMO_PARAMS_HASH);
     let bal0 = u128_of(&p["balance"]);
 
     // bogus report: TEE said not valid
