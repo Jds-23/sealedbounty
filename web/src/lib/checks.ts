@@ -27,6 +27,8 @@ export interface CheckOptions {
   /** Raw response body, if known (demo mode). Onchain only resp_hash is stored. */
   respBodyB64?: string;
   signersSource: 'contract' | 'demo';
+  /** v3 #6: signers known to be revoked (is_signer_revoked). null/undefined = unknown. */
+  revoked?: ReadonlySet<string> | null;
 }
 
 export function verifyClaim(claim: Claim, program: Program | undefined, signers: SignerEntry[] | null, opts: CheckOptions): Check[] {
@@ -44,19 +46,48 @@ export function verifyClaim(claim: Claim, program: Program | undefined, signers:
   }
 
   // 2. Signature
-  const sig = verifySignature(claim.signer, text, claim.signature);
-  checks.push({ label: `TEE signature over "model:req_hash:resp_hash"`, status: sig.ok ? 'pass' : 'fail', detail: sig.detail });
+  if (claim.synthetic) {
+    checks.push({ label: `TEE signature over "model:req_hash:resp_hash"`, status: 'na', detail: `synthetic demo claim: ${claim.synthetic}` });
+  } else {
+    const sig = verifySignature(claim.signer, text, claim.signature);
+    checks.push({ label: `TEE signature over "model:req_hash:resp_hash"`, status: sig.ok ? 'pass' : 'fail', detail: sig.detail });
+  }
 
-  // 3. Allowlist
-  if (signers === null) {
+  // 3. Signer set: v3 programs pin their own set (#3); before v3 only the global allowlist exists.
+  const src = opts.signersSource === 'contract' ? 'contract get_signers' : 'demo allowlist = INTERFACE.md testnet signers';
+  const entry = signers ? findSigner(signers, claim.signer) : undefined;
+  if (program?.signers) {
+    const inSet = program.signers.some((s) => s.toLowerCase() === claim.signer.toLowerCase());
+    const kindOk = !entry || entry.meta.kind === claim.kind;
+    let detail = `in program.signers (${program.signers.length}); submit_claim only accepts these`;
+    if (!inSet) detail = `not in program.signers (${program.signers.length}): ${program.signers.map((s) => s.slice(0, 16) + '…').join(', ')}`;
+    else if (!kindOk) detail = `kind mismatch: global allowlist says ${entry!.meta.kind}, claim ${claim.kind}`;
+    else if (!entry) detail += signers ? '; no longer in the global allowlist (removed after submit)' : '; global allowlist not loaded';
+    else detail += `; ${src}: kind ${entry.meta.kind}, model ${entry.meta.model ?? 'any'}`;
+    checks.push({ label: 'Signer in PROGRAM set (program.signers)', status: inSet && kindOk ? 'pass' : 'fail', detail });
+
+    const r = opts.revoked;
+    const revoked = r?.has(claim.signer);
+    checks.push({
+      label: 'Signer not revoked (is_signer_revoked)',
+      status: r == null ? 'na' : revoked ? 'fail' : 'pass',
+      detail:
+        r == null
+          ? 'could not load is_signer_revoked from RPC'
+          : revoked
+            ? 'the admin revoked this key: finalize rejects the claim with "signer revoked" (payout + bond back to the pool)'
+            : opts.signersSource === 'demo'
+              ? 'demo: no signer revoked'
+              : 'contract is_signer_revoked = false',
+    });
+  } else if (signers === null) {
     checks.push({ label: 'Signer allowlisted (get_signers)', status: 'na', detail: 'could not load get_signers from RPC' });
   } else {
-    const e = findSigner(signers, claim.signer);
+    const e = entry;
     const kindOk = !!e && e.meta.kind === claim.kind;
     // A signer may be pinned to one model (SignerMeta.model); null/absent = any model.
     const modelOk = !!e && (e.meta.model == null || e.meta.model === claim.model);
     const ok = kindOk && modelOk;
-    const src = opts.signersSource === 'contract' ? 'contract get_signers' : 'demo allowlist = INTERFACE.md testnet signers';
     let detail = `not in ${src}`;
     if (e && !kindOk) detail = `kind mismatch: ${e.meta.kind} vs ${claim.kind}`;
     else if (e && !modelOk) detail = `signer pinned to ${e.meta.model}, claim model ${claim.model}`;

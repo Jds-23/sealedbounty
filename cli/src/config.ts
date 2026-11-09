@@ -39,7 +39,7 @@ export function config(): Config {
     network,
     rpcUrl: e.NEAR_RPC_URL || (network === "mainnet" ? "https://free.rpc.fastnear.com" : "https://test.rpc.fastnear.com"),
     // Deliberately NOT falling back to CONTRACT_ID: in .env that points at the Phase 0 spike contract.
-    contractId: e.ESCROW_CONTRACT_ID || 'sealedbounty-v2.testnet',
+    contractId: e.ESCROW_CONTRACT_ID || 'sealedbounty-v3.testnet',
     accountId: e.NEAR_TESTNET_ACCOUNT_ID || e.NEAR_ACCOUNT_ID || undefined,
     credentialsPath: e.NEAR_CREDENTIALS_PATH ? expandHome(e.NEAR_CREDENTIALS_PATH) : undefined,
     nearaiBaseUrl: (e.NEARAI_BASE_URL || 'https://cloud-api.near.ai/v1').replace(/\/$/, ''),

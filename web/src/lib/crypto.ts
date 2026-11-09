@@ -59,3 +59,28 @@ export function parseOwnerSecret(input: string): { secretKey: Uint8Array; public
 export function reportMatchesHash(plaintext: string, reqHash: string): boolean {
   return sha256hex(plaintext) === reqHash.toLowerCase();
 }
+
+export type ProofResult = { ok: true; plaintext: string } | { ok: false; reason: 'bad secret' | 'ephemeral key mismatch' | 'undecryptable report' };
+
+/**
+ * Re-runs the contract's prove_ciphertext (INTERFACE.md v3 #2) with the hunter's revealed ephemeral secret:
+ * x25519_base(secret) must equal ciphertext[0..32] (else the tx panics), the box must open with
+ * (owner_enc_pubkey, secret), and sha256(plaintext) must equal req_hash (else "undecryptable report").
+ * Needs no owner secret: anyone can check a proof.
+ */
+export function proveCiphertext(ciphertextB64: string, ownerPubB64: string, secretHex: string, reqHash: string): ProofResult {
+  if (!/^[0-9a-fA-F]{64}$/.test(secretHex)) return { ok: false, reason: 'bad secret' };
+  const secret = Uint8Array.from(secretHex.match(/../g)!, (h) => parseInt(h, 16));
+  let ct: Uint8Array;
+  try {
+    ct = decodeBase64(ciphertextB64.trim());
+  } catch {
+    return { ok: false, reason: 'undecryptable report' };
+  }
+  const eph = nacl.box.keyPair.fromSecretKey(secret).publicKey;
+  if (ct.length < 56 || !eph.every((b, i) => b === ct[i])) return { ok: false, reason: 'ephemeral key mismatch' };
+  const opened = nacl.box.open(ct.slice(56), ct.slice(32, 56), decodeBase64(ownerPubB64), secret);
+  if (!opened) return { ok: false, reason: 'undecryptable report' };
+  const plaintext = new TextDecoder().decode(opened);
+  return reportMatchesHash(plaintext, reqHash) ? { ok: true, plaintext } : { ok: false, reason: 'undecryptable report' };
+}

@@ -23,6 +23,8 @@ export const getClaim = (id: number) => view<Claim | null>('get_claim', { id });
 export const listPrograms = (from_index = 0, limit = 50) => view<Program[]>('list_programs', { from_index, limit });
 export const listClaims = (program_id: number, from_index = 0, limit = 50) => view<Claim[]>('list_claims', { program_id, from_index, limit });
 export const getSigners = () => view<[string, SignerMeta][]>('get_signers');
+/** v3 #6 */
+export const isSignerRevoked = (signer: string) => view<boolean>('is_signer_revoked', { signer });
 
 export async function mustGetProgram(id: number): Promise<Program> {
   const p = await getProgram(id);

@@ -29,6 +29,14 @@ export interface Program {
   system_prompt_hash: string;
   /** v2: sha256hex of the published code bundle (buildCodeBundle). */
   code_hash: string;
+  /** v3 #1: sha256hex(canonicalJson of the judge params) = shared.paramsHash(). */
+  params_hash: string;
+  /** v3 #3: signers accepted by this program (snapshot at creation; set_program_signers rotates it). */
+  signers: Signer[];
+  /** v3 #4: hunter stake (yocto U128) attached on top of storage to submit_claim. */
+  bond: string;
+  /** v3 #2: seconds the hunter has to prove_ciphertext after flag_undecryptable. */
+  challenge_secs: number;
   payouts: Payouts;
   owner_enc_pubkey: string;
   dispute_secs: number;
@@ -39,7 +47,7 @@ export interface Program {
   created_at: string;
 }
 
-export type ClaimStatus = 'Pending' | 'Rejected' | 'Paid';
+export type ClaimStatus = 'Pending' | 'Rejected' | 'Paid' | 'Challenged' | 'PayoutFailed';
 
 export interface Claim {
   id: number;
@@ -58,6 +66,10 @@ export interface Claim {
   submitted_at: string;
   finalize_after: string;
   reject_reason: string | null;
+  /** v3 #4: paid back with the payout on Paid, forfeited to the pool on Rejected. */
+  bond: string;
+  /** v3 #2: ns deadline set by flag_undecryptable. */
+  challenge_deadline: string | null;
 }
 
 export interface SignerMeta {

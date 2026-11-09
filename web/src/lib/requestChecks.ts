@@ -1,14 +1,16 @@
-// Owner-side audit of a decrypted judge request against the program, mirroring the v2 contract's
-// `dispute` (docs/INTERFACE.md "Contract v2 changes"). The overall verdict comes from the shared
-// checkRequestAgainstProgram (same code the CLI uses); the per-check breakdown below explains it.
-import { checkRequestAgainstProgram, sha256hex, type DisputeReason } from '@sealedbounty/shared';
+// Owner-side audit of a decrypted judge request against the program, mirroring the v3 contract's
+// `dispute` (docs/INTERFACE.md "v3": prompt -> model -> params -> code -> hunter -> report). The
+// overall verdict comes from the shared checkRequestAgainstProgram (same code the CLI uses); the
+// per-check breakdown below explains it.
+import { canonicalJson, checkRequestAgainstProgram, JUDGE_PARAMS, paramsHash, sha256hex, type DisputeReason } from '@sealedbounty/shared';
 import type { Program } from './types';
 
-export type ReqCheckKey = 'prompt' | 'model' | 'code' | 'hunter' | 'report';
+export type { DisputeReason };
+export type ReqCheckKey = 'prompt' | 'model' | 'params' | 'code' | 'hunter' | 'report';
 export interface ReqCheck {
   key: ReqCheckKey;
   label: string;
-  /** null = not applicable (v1 program without code_hash) */
+  /** null = not applicable (v1 program without code_hash, or v2 without params_hash) */
   ok: boolean | null;
   detail: string;
 }
@@ -30,7 +32,7 @@ interface Msg {
 }
 
 export function auditRequest(body: string, program: Program, hunter: string): RequestAudit {
-  let req: { model?: unknown; messages?: unknown } | null = null;
+  let req: Record<string, unknown> | null = null;
   try {
     const j = JSON.parse(body);
     if (j && typeof j === 'object') req = j;
@@ -77,8 +79,16 @@ export function auditRequest(body: string, program: Program, hunter: string): Re
       detail: 'v1 program: no code_hash onchain, so the request is not bound to the code or the hunter',
     });
     const reason: DisputeReason | null = !prompt.ok ? 'system prompt tampered' : !model.ok ? 'model mismatch' : null;
-    return { ok: reason === null, reason, v1: true, checks: [prompt, model, na('code', 'Code bundle'), na('hunter', 'Hunter'), na('report', 'Report')] };
+    return {
+      ok: reason === null,
+      reason,
+      v1: true,
+      checks: [prompt, model, na('params', 'Params'), na('code', 'Code bundle'), na('hunter', 'Hunter'), na('report', 'Report')],
+    };
   }
+
+  // 3. params (v3 #1)
+  const params = req ? checkParams(req, program.params_hash) : { key: 'params' as const, label: 'Params', ok: false, detail: 'request is not JSON' };
 
   // 3 + 4. code bundle and hunter, both in messages[1]
   const m1 = msgs[1];
@@ -128,7 +138,40 @@ export function auditRequest(body: string, program: Program, hunter: string): Re
   };
 
   const overall = checkRequestAgainstProgram(body, { ...program, code_hash: program.code_hash }, hunter);
-  return { ok: overall.ok, reason: overall.reason, v1: false, checks: [prompt, model, code, hunterCheck, report] };
+  return { ok: overall.ok, reason: overall.reason, v1: false, checks: [prompt, model, params, code, hunterCheck, report] };
+}
+
+const REQUEST_KEYS = ['model', 'messages', 'response_format', 'chat_template_kwargs', 'temperature', 'max_tokens'];
+const PARAM_KEYS = ['response_format', 'chat_template_kwargs', 'temperature', 'max_tokens'] as const;
+
+/** Explains the params step: which keys are extra / missing / differ from the canonical judge params. */
+function checkParams(req: Record<string, unknown>, pinned: string | null): ReqCheck {
+  const label = 'Params';
+  if (pinned === null) return { key: 'params', label, ok: null, detail: 'v2 program: no params_hash onchain, so temperature, max_tokens and response_format are not pinned' };
+  let h: string | null = null;
+  try {
+    h = paramsHash(req);
+  } catch {
+    /* a param is missing: canonicalJson has nothing to hash */
+  }
+  const extra = Object.keys(req).filter((k) => !REQUEST_KEYS.includes(k));
+  const missing = REQUEST_KEYS.filter((k) => !Object.hasOwn(req, k));
+  const msgExtra = Array.isArray(req.messages) && (req.messages as object[]).some((m) => m && typeof m === 'object' && Object.keys(m).length !== 2);
+  const differ = PARAM_KEYS.filter((k) => Object.hasOwn(req, k) && canonicalJson(req[k]) !== canonicalJson(JUDGE_PARAMS[k]));
+  const ok = h === pinned && !extra.length && !missing.length && !msgExtra;
+  if (ok) return { key: 'params', label, ok, detail: `sha256(canonical params) = program.params_hash (${short(pinned)})` };
+  const why = [
+    extra.length && `extra key ${extra.join(', ')}`,
+    missing.length && `missing ${missing.join(', ')}`,
+    msgExtra && 'a message has fields besides role/content',
+    differ.length && `${differ.map((k) => (k === 'temperature' || k === 'max_tokens' ? `${k}=${JSON.stringify(req[k])}` : k)).join(', ')} differs from the canonical judge params`,
+  ].filter(Boolean);
+  return {
+    key: 'params',
+    label,
+    ok: false,
+    detail: `${why.length ? why.join('; ') + ': ' : ''}${h ? `sha256 ${short(h)} ≠ ` : 'cannot match '}program.params_hash ${short(pinned)}`,
+  };
 }
 
 function checkHunter(claimed: string, hunter: string): ReqCheck {
@@ -145,6 +188,7 @@ function checkHunter(claimed: string, hunter: string): ReqCheck {
 export const REASON_TEXT: Record<DisputeReason, string> = {
   'system prompt tampered': 'the system prompt differs from the program',
   'model mismatch': 'the model differs from the program',
+  'params tampered': 'temperature, max_tokens or response_format differ from program.params_hash',
   'code mismatch': 'the CODE section is not the program code bundle',
   'hunter mismatch': 'the HUNTER line names another account (front-run)',
   'report missing': 'the REPORT message is missing',

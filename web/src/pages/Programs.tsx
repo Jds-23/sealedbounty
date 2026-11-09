@@ -34,6 +34,14 @@ export function Programs() {
                 <dd className="small" onClick={(e) => e.preventDefault()}>
                   {p.code_hash ? <Hash value={p.code_hash} /> : <span className="muted">none (v1)</span>}
                 </dd>
+                {p.bond !== null && (
+                  <>
+                    <dt>Bond</dt>
+                    <dd>
+                      {yoctoToNear(p.bond)} Ⓝ <span className="muted small">per claim · {p.signers?.length ?? 0} program signers</span>
+                    </dd>
+                  </>
+                )}
                 <dt>Claims</dt>
                 <dd>{n}</dd>
               </dl>

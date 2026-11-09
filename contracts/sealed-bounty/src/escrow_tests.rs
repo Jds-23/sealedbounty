@@ -15,6 +15,8 @@ const NEAR: u128 = 10u128.pow(24);
 /// code_hash for programs that only see v1 (live) bodies; never matches anything.
 const CODE_HASH_PLACEHOLDER: &str =
     "00000000000000000000000000000000000000000000000000000000000000c0";
+/// Hunter's window to prove a flagged ciphertext.
+const CHALLENGE_SECS: u64 = 120;
 const T0: u64 = 1_700_000_000 * NANOS_PER_SEC;
 
 struct Fx(Value);
@@ -85,6 +87,9 @@ fn payouts() -> Payouts {
 
 /// Contract with both live signers allowlisted.
 fn setup() -> Contract {
+    // Fresh storage: testing_env! carries the trie over, and a stale IterableMap entry from an
+    // earlier contract in the same test would hide signers from `iter()`.
+    near_sdk::mock::with_mocked_blockchain(|b| drop(b.take_storage()));
     ctx(admin(), 0, T0);
     let mut c = Contract::new(None);
     for f in [Fx::load(LIVE_ED), Fx::load(LIVE_EC), Fx::load(SYN_GW)] {
@@ -100,7 +105,7 @@ fn setup() -> Contract {
         test_signer(),
         SignerMeta {
             kind: SigKind::ProviderTee,
-            model: None,
+            model: Some(MODEL.into()),
         },
     );
     c
@@ -122,10 +127,14 @@ fn create(
         model.into(),
         hash,
         CODE_HASH_PLACEHOLDER.into(),
+        v2_params_hash(),
         payouts(),
         "b3duZXJwdWI=".into(),
         secs,
         min_conf,
+        U128(0),
+        CHALLENGE_SECS,
+        None,
     )
 }
 
@@ -404,17 +413,27 @@ fn submit_tampered_response() {
 #[test]
 #[should_panic(expected = "bad signature")]
 fn submit_wrong_program_model() {
+    // A key allowlisted for gpt-oss signs a Qwen response: the program's model is in the
+    // signed text, so it fails verification.
     let mut c = setup();
-    let f = Fx::load(LIVE_ED);
+    ctx(admin(), 0, T0);
+    c.add_signer(
+        evil_signer(),
+        SignerMeta {
+            kind: SigKind::ProviderTee,
+            model: Some("openai/gpt-oss-120b".into()),
+        },
+    );
     let pid = create(
         &mut c,
-        f.system_prompt_hash(),
+        tee::sha256_hex(SYS.as_bytes()),
         "openai/gpt-oss-120b",
         0,
         60,
         20 * NEAR,
     );
-    submit(&mut c, pid, &f);
+    let args = signed_with(&evil_key(), &v2_req(hunter().as_str()).to_string(), "high");
+    submit_signed(&mut c, hunter(), pid, evil_signer(), args);
 }
 
 #[test]
@@ -428,10 +447,19 @@ fn submit_low_confidence() {
 #[test]
 #[should_panic(expected = "verdict not payable")]
 fn submit_invalid_verdict() {
-    // Synthetic gateway fixture: valid=false, severity=none (gateway text has no model).
+    // Synthetic gateway fixture: valid=false, severity=none (gateway text has no model, but the
+    // program's signer set is model-matched, so the program uses the fixture's model).
     let mut c = setup();
-    let pid = live_program(&mut c, 0, 60, 20 * NEAR);
-    submit(&mut c, pid, &Fx::load(SYN_GW));
+    let f = Fx::load(SYN_GW);
+    let pid = create(
+        &mut c,
+        tee::sha256_hex(b"x"),
+        &f.s("model"),
+        0,
+        60,
+        20 * NEAR,
+    );
+    submit(&mut c, pid, &f);
 }
 
 #[test]
@@ -455,14 +483,34 @@ fn submit_duplicate_uppercase_hash() {
     submit(&mut c, pid, &f);
 }
 
+/// v3 #5: an attacker copies a signed judgement into their own look-alike program B (never
+/// disputed). That must not burn the req_hash for the real program A.
 #[test]
-#[should_panic(expected = "already claimed")]
-fn submit_duplicate_across_programs() {
+fn cross_program_copy_does_not_burn_hash() {
     let mut c = setup();
     let a = live_program(&mut c, 0, 60, 20 * NEAR);
     let b = live_program(&mut c, 0, 60, 20 * NEAR);
-    submit(&mut c, a, &Fx::load(LIVE_ED));
+    let f = Fx::load(LIVE_ED);
+    let copied = submit_as(&mut c, stranger(), b, &f, NEAR, T0);
+    assert_eq!(c.get_claim(copied).unwrap().program_id, b);
+    let real = submit_as(&mut c, hunter(), a, &f, NEAR, T0);
+    let rc = c.get_claim(real).unwrap();
+    assert_eq!(
+        (rc.program_id, rc.hunter, rc.status),
+        (a, hunter(), ClaimStatus::Pending)
+    );
+}
+
+#[test]
+#[should_panic(expected = "already claimed")]
+fn submit_duplicate_within_program_after_cross_program() {
+    // Dedupe is per program: a second submission to the SAME program still fails.
+    let mut c = setup();
+    let a = live_program(&mut c, 0, 60, 20 * NEAR);
+    let b = live_program(&mut c, 0, 60, 20 * NEAR);
     submit(&mut c, b, &Fx::load(LIVE_ED));
+    submit(&mut c, a, &Fx::load(LIVE_ED));
+    submit(&mut c, a, &Fx::load(LIVE_EC));
 }
 
 #[test]
@@ -492,17 +540,21 @@ fn pending() -> (Contract, u64, u64, Fx) {
 }
 
 #[test]
-fn dispute_v1_body_is_code_mismatch() {
-    // Live fixture: right prompt + model, but v1 single-user-message format -> code mismatch.
+fn dispute_v1_body_is_params_tampered() {
+    // Live fixture: right prompt + model, but the v1 body has an extra `stream` key -> params
+    // tampered (v3 #1 strict shape; in v2 this was "code mismatch").
     let (mut c, pid, cid, f) = pending();
     ctx(owner(), 0, T0 + NANOS_PER_SEC);
     c.dispute(cid, f.request_body());
     let cl = c.get_claim(cid).unwrap();
     assert_eq!(cl.status, ClaimStatus::Rejected);
-    assert_eq!(cl.reject_reason.as_deref(), Some("code mismatch"));
+    assert_eq!(cl.reject_reason.as_deref(), Some("params tampered"));
     assert_eq!(c.get_program(pid).unwrap().reserved.0, 0);
     // Not a hunter mismatch: req_hash stays used.
-    assert!(c.used_req_hashes.contains(&f.s("req_hash")));
+    assert!(
+        c.used_req_hashes
+            .contains(&dedupe_key(pid, &f.s("req_hash")))
+    );
 }
 
 #[test]
@@ -747,10 +799,14 @@ fn create_v2(c: &mut Contract) -> u64 {
         MODEL.into(),
         tee::sha256_hex(SYS.as_bytes()),
         tee::sha256_hex(BUNDLE.as_bytes()).to_uppercase(),
+        v2_params_hash().to_uppercase(),
         payouts(),
         "b3duZXJwdWI=".into(),
         60,
         0,
+        U128(0),
+        CHALLENGE_SECS,
+        None,
     )
 }
 
@@ -772,9 +828,19 @@ fn v2_req(hunter: &str) -> Value {
 
 /// submit_claim args for `body`, TEE-signed (provider_tee) by the in-test key with a high verdict.
 fn signed(body: &str) -> (String, Base64VecU8, String) {
+    signed_with(&test_key(), body, "high")
+}
+
+/// submit_claim args for `body`, signed (provider_tee, program MODEL) by `key` with `severity`.
+fn signed_with(
+    key: &ed25519_dalek::SigningKey,
+    body: &str,
+    severity: &str,
+) -> (String, Base64VecU8, String) {
     use ed25519_dalek::Signer as _;
     let req_hash = tee::sha256_hex(body.as_bytes());
-    let content = r#"{"valid":true,"severity":"high","cwe":"CWE-89","confidence":90}"#;
+    let content =
+        format!(r#"{{"valid":true,"severity":"{severity}","cwe":"CWE-89","confidence":90}}"#);
     let resp = json!({
         "id": format!("chatcmpl-{}", &req_hash[..16]),
         "choices": [{"index": 0, "message": {"role": "assistant", "content": content}}],
@@ -786,7 +852,7 @@ fn signed(body: &str) -> (String, Base64VecU8, String) {
         &req_hash,
         &tee::sha256_hex(resp.as_bytes()),
     );
-    let sig = hex::encode(test_key().sign(text.as_bytes()).to_bytes());
+    let sig = hex::encode(key.sign(text.as_bytes()).to_bytes());
     (req_hash, resp.into_bytes().into(), sig)
 }
 
@@ -831,10 +897,14 @@ fn create_program_bad_code_hash() {
         MODEL.into(),
         tee::sha256_hex(SYS.as_bytes()),
         "zz".repeat(32),
+        v2_params_hash(),
         payouts(),
         "k".into(),
         60,
         0,
+        U128(0),
+        CHALLENGE_SECS,
+        None,
     );
 }
 
@@ -1069,7 +1139,7 @@ fn dispute_v2_rejects_each_reason() {
         assert_eq!((p.balance.0, p.reserved.0), (bal, 0));
         assert_eq!(events()[0]["data"][0]["reason"], want);
         assert!(
-            c.used_req_hashes.contains(&cl.req_hash),
+            c.used_req_hashes.contains(&dedupe_key(pid, &cl.req_hash)),
             "{want}: hash stays used"
         );
         // and it cannot be resubmitted
@@ -1104,7 +1174,7 @@ fn dispute_hunter_mismatch_releases_req_hash() {
     assert_eq!(cl.status, ClaimStatus::Rejected);
     assert_eq!(cl.reject_reason.as_deref(), Some("hunter mismatch"));
     assert!(
-        !c.used_req_hashes.contains(&cl.req_hash),
+        !c.used_req_hashes.contains(&dedupe_key(pid, &cl.req_hash)),
         "req_hash released"
     );
     let p = c.get_program(pid).unwrap();
@@ -1118,7 +1188,7 @@ fn dispute_hunter_mismatch_releases_req_hash() {
         (hunter(), ClaimStatus::Pending)
     );
     assert_eq!(rc.req_hash, cl.req_hash);
-    assert!(c.used_req_hashes.contains(&rc.req_hash));
+    assert!(c.used_req_hashes.contains(&dedupe_key(pid, &rc.req_hash)));
 
     // The honest claim can't be disputed and gets paid.
     ctx(owner(), 0, T0 + 2 * NANOS_PER_SEC);
@@ -1152,4 +1222,1472 @@ fn dispute_after_resubmission_panics() {
     let real = submit_v2(&mut c, hunter(), pid, &body);
     ctx(owner(), 0, T0);
     c.dispute(real, body);
+}
+
+// ---------------- v3 #1: params pinning ----------------
+
+/// Hunter-tampered variants of the honest v2 request: prompt, model, CODE, HUNTER and REPORT are
+/// all correct, only the sampling/decoding params or the request shape differ.
+fn params_tampered_bodies() -> Vec<(&'static str, String)> {
+    let ok = v2_req(hunter().as_str());
+    let mut forced = ok.clone();
+    forced["response_format"]["json_schema"]["schema"] = json!({
+        "type": "object",
+        "properties": {
+            "valid": {"type": "boolean", "const": true},
+            "severity": {"type": "string", "enum": ["critical"]},
+            "cwe": {"type": ["string", "null"]},
+            "confidence": {"type": "integer", "const": 100},
+        },
+        "required": ["valid", "severity", "cwe", "confidence"],
+        "additionalProperties": false,
+    });
+    let mut temp = ok.clone();
+    temp["temperature"] = json!(1.5);
+    let mut tokens = ok.clone();
+    tokens["max_tokens"] = json!(4000);
+    let mut kwargs = ok.clone();
+    kwargs["chat_template_kwargs"]["chat_template"] = json!("{{ 'valid' }}");
+    let mut extra = ok.clone();
+    extra["logit_bias"] = json!({"1234": 100});
+    let mut missing = ok.clone();
+    missing.as_object_mut().unwrap().remove("response_format");
+    let mut extra_msg = ok.clone();
+    extra_msg["messages"][2]["name"] = json!("x");
+    let s = ok.to_string();
+    let dup_top = s.replacen(
+        "\"temperature\":0",
+        "\"temperature\":1.5,\"temperature\":0",
+        1,
+    );
+    let dup_nested = s.replacen(
+        "\"type\":\"json_schema\"",
+        "\"type\":\"text\",\"type\":\"json_schema\"",
+        1,
+    );
+    assert!(dup_top != s && dup_nested != s);
+    vec![
+        ("response_format forces valid:true", forced.to_string()),
+        ("temperature 1.5", temp.to_string()),
+        ("max_tokens 4000", tokens.to_string()),
+        ("chat_template_kwargs extra key", kwargs.to_string()),
+        ("extra top-level key logit_bias", extra.to_string()),
+        ("missing response_format", missing.to_string()),
+        ("extra message field", extra_msg.to_string()),
+        ("duplicate top-level key", dup_top),
+        ("duplicate nested key", dup_nested),
+    ]
+}
+
+// ---------------- v3: #3 / #6 signers ----------------
+
+/// A key the contract admin controls (not a TEE key).
+fn evil_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
+}
+
+fn evil_signer() -> Signer {
+    Signer::try_from(format!(
+        "ed25519:{}",
+        hex::encode(evil_key().verifying_key().to_bytes())
+    ))
+    .unwrap()
+}
+
+fn panic_msg(e: Box<dyn std::any::Any + Send>) -> String {
+    e.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+/// Issue #1 exploit: the TEE honestly signs a verdict for a request with forced/resampled params.
+/// The owner's dispute must reject it ("params tampered"), not panic "request matches program".
+#[test]
+fn dispute_params_tampered_rejects() {
+    let mut failures = vec![];
+    for (name, body) in params_tampered_bodies() {
+        let (mut c, pid) = v2_program();
+        let bal = c.get_program(pid).unwrap().balance.0;
+        let cid = submit_v2(&mut c, hunter(), pid, &body);
+        ctx(owner(), 0, T0 + NANOS_PER_SEC);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.dispute(cid, body.clone())
+        }));
+        if let Err(e) = r {
+            failures.push(format!("{name}: dispute panicked {:?}", panic_msg(e)));
+            continue;
+        }
+        let cl = c.get_claim(cid).unwrap();
+        if cl.reject_reason.as_deref() != Some("params tampered") {
+            failures.push(format!("{name}: got {:?}", cl.reject_reason));
+            continue;
+        }
+        assert_eq!(cl.status, ClaimStatus::Rejected);
+        let p = c.get_program(pid).unwrap();
+        assert_eq!((p.balance.0, p.reserved.0), (bal, 0), "{name}: funds back");
+        assert_eq!(events()[0]["data"][0]["reason"], "params tampered");
+    }
+    assert!(
+        failures.is_empty(),
+        "tampered params accepted:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Reason order (v3): prompt -> model -> params -> code -> hunter -> report.
+#[test]
+fn tamper_reasons_params_order() {
+    let (c, pid) = v2_program();
+    let p = c.get_program(pid).unwrap();
+    let h = hunter();
+    let mut bad = v2_req(h.as_str());
+    bad["temperature"] = json!(1.5);
+    let reason = |v: &Value| tamper_reason(&p, &h, &v.to_string());
+    assert_eq!(reason(&bad), Some("params tampered"));
+    let mut m = bad.clone();
+    m["model"] = "openai/gpt-oss-120b".into();
+    assert_eq!(reason(&m), Some(MODEL_MISMATCH));
+    let pr = with_msg(bad.clone(), 0, "content", "lenient".into());
+    assert_eq!(reason(&pr), Some(TAMPERED));
+    let code = with_msg(
+        bad.clone(),
+        1,
+        "content",
+        user1(h.as_str(), &format!("{REPO}@{COMMIT}"), "fake\n"),
+    );
+    assert_eq!(reason(&code), Some("params tampered"));
+    // the front-runner check still comes after params
+    assert_eq!(
+        tamper_reason(&p, &stranger(), &bad.to_string()),
+        Some("params tampered")
+    );
+    // a duplicated `model` key is a parse failure, as in v2
+    let dup_model =
+        v2_req(h.as_str())
+            .to_string()
+            .replacen("\"model\":", "\"model\":\"x\",\"model\":", 1);
+    assert_eq!(tamper_reason(&p, &h, &dup_model), Some(TAMPERED));
+}
+
+/// params_hash of the in-test v2 request (`v2_req`; same for any hunter).
+fn v2_params_hash() -> String {
+    request_params_hash(&v2_req("anyone").to_string()).unwrap()
+}
+
+/// sha256hex(canonicalJson(params)) of the real demo request, as computed by shared/judge.mjs
+/// `paramsHash()` (pinned in shared/test/params.test.mjs too).
+const DEMO_PARAMS_HASH_JS: &str =
+    "61b52e7b87e42a2bc4b6f417d21ba0e9d44f3e1f4ff49fa9d2f3334e5aa0eda7";
+
+#[test]
+fn params_hash_matches_js_for_demo_fixtures() {
+    for f in [
+        include_str!("../tests/fixtures/demo.sqli.json"),
+        include_str!("../tests/fixtures/demo.sqli.ecdsa.json"),
+        include_str!("../tests/fixtures/demo.bogus.json"),
+        include_str!("../tests/fixtures/demo.fakecode.json"),
+    ] {
+        let body = Fx::load(f).request_body();
+        assert_eq!(
+            request_params_hash(&body).as_deref(),
+            Some(DEMO_PARAMS_HASH_JS)
+        );
+    }
+    // v1 live bodies carry an extra `stream` key: not the canonical shape
+    assert_eq!(request_params_hash(&Fx::load(LIVE_ED).request_body()), None);
+}
+
+#[test]
+fn canonical_json_sorts_despite_preserve_order() {
+    // near-sdk turns on serde_json/preserve_order, so Value keeps insertion order...
+    let v: Value =
+        serde_json::from_str(r#"{"b":1,"a":{"d":[{"z":0,"y":1.5}],"c":"q\"\n\u0001é"}}"#).unwrap();
+    // ...but canonical_json sorts every object.
+    assert_eq!(
+        canonical_json(&v),
+        r#"{"a":{"c":"q\"\n\u0001é","d":[{"y":1.5,"z":0}]},"b":1}"#
+    );
+    // byte order (as JS canonicalJson): U+FF5E (EF BD 9E) < U+1F600 (F0 9F 98 80)
+    let v: Value = serde_json::from_str("{\"\u{1F600}\":1,\"\u{FF5E}\":2}").unwrap();
+    assert_eq!(canonical_json(&v), "{\"\u{FF5E}\":2,\"\u{1F600}\":1}");
+    // key order and whitespace of the body don't change the hash
+    let body = Fx::load(include_str!("../tests/fixtures/demo.sqli.json")).request_body();
+    let pretty =
+        serde_json::to_string_pretty(&serde_json::from_str::<Value>(&body).unwrap()).unwrap();
+    assert_eq!(
+        request_params_hash(&pretty).as_deref(),
+        Some(DEMO_PARAMS_HASH_JS)
+    );
+}
+
+#[test]
+fn create_program_params_hash_stored_lowercase() {
+    let (c, pid) = v2_program();
+    let p = c.get_program(pid).unwrap();
+    assert_eq!(p.params_hash, v2_params_hash());
+    let j = serde_json::to_value(&p).unwrap();
+    assert_eq!(j["params_hash"], v2_params_hash());
+}
+
+#[test]
+#[should_panic(expected = "params_hash must be 64 hex chars")]
+fn create_program_bad_params_hash() {
+    let mut c = setup();
+    ctx(owner(), NEAR, T0);
+    c.create_program(
+        "x".into(),
+        REPO.into(),
+        COMMIT.into(),
+        MODEL.into(),
+        tee::sha256_hex(SYS.as_bytes()),
+        tee::sha256_hex(BUNDLE.as_bytes()),
+        "abc".into(),
+        payouts(),
+        "k".into(),
+        60,
+        0,
+        U128(0),
+        CHALLENGE_SECS,
+        None,
+    );
+}
+
+/// A program pinned to different params rejects the otherwise honest request.
+#[test]
+fn dispute_other_program_params_rejects() {
+    let mut c = setup();
+    ctx(owner(), 20 * NEAR, T0);
+    let pid = c.create_program(
+        "v2".into(),
+        REPO.into(),
+        COMMIT.into(),
+        MODEL.into(),
+        tee::sha256_hex(SYS.as_bytes()),
+        tee::sha256_hex(BUNDLE.as_bytes()),
+        DEMO_PARAMS_HASH_JS.into(),
+        payouts(),
+        "b3duZXJwdWI=".into(),
+        60,
+        0,
+        U128(0),
+        CHALLENGE_SECS,
+        None,
+    );
+    let body = v2_req(hunter().as_str()).to_string();
+    let cid = submit_v2(&mut c, hunter(), pid, &body);
+    ctx(owner(), 0, T0 + NANOS_PER_SEC);
+    c.dispute(cid, body);
+    assert_eq!(
+        c.get_claim(cid).unwrap().reject_reason.as_deref(),
+        Some(PARAMS_TAMPERED)
+    );
+}
+
+fn submit_signed(
+    c: &mut Contract,
+    who: AccountId,
+    pid: u64,
+    signer: Signer,
+    (req_hash, resp, sig): (String, Base64VecU8, String),
+) -> u64 {
+    ctx(who, NEAR, T0);
+    c.submit_claim(
+        pid,
+        req_hash,
+        resp,
+        sig,
+        signer,
+        SigKind::ProviderTee,
+        "Y2lwaGVy".into(),
+    )
+}
+
+/// #3: after a program exists, the admin allowlists their own key and signs a fake critical
+/// verdict for a request that matches the program (hunter = admin). It must not be claimable.
+#[test]
+fn admin_add_signer_cannot_drain_existing_program() {
+    let (mut c, pid) = v2_program();
+    ctx(admin(), 0, T0);
+    c.add_signer(
+        evil_signer(),
+        SignerMeta {
+            kind: SigKind::ProviderTee,
+            model: Some(MODEL.into()),
+        },
+    );
+    let body = v2_req(admin().as_str()).to_string();
+    let args = signed_with(&evil_key(), &body, "critical");
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        submit_signed(&mut c, admin(), pid, evil_signer(), args)
+    }));
+    match r {
+        Err(e) => assert!(
+            panic_msg(e).contains("signer not allowlisted"),
+            "blocked for the wrong reason"
+        ),
+        Ok(cid) => {
+            ctx(owner(), 0, T0 + NANOS_PER_SEC);
+            let d = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                c.dispute(cid, body.clone())
+            }))
+            .map_err(panic_msg);
+            ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+            drop(c.finalize(cid));
+            panic!(
+                "THEFT: admin-signed claim {cid} accepted; owner dispute -> {d:?}; \
+                 finalize status {:?}, transfers {:?}",
+                c.get_claim(cid).unwrap().status,
+                transfers()
+            );
+        }
+    }
+    assert!(c.list_claims(pid, None, None).is_empty());
+}
+
+/// #3: `SignerMeta.model` is enforced: a key allowlisted for another model can't sign for this one.
+#[test]
+#[should_panic(expected = "signer not allowlisted")]
+fn submit_rejects_signer_for_other_model() {
+    let mut c = setup();
+    ctx(admin(), 0, T0);
+    c.add_signer(
+        evil_signer(),
+        SignerMeta {
+            kind: SigKind::ProviderTee,
+            model: Some("openai/gpt-oss-120b".into()),
+        },
+    );
+    let pid = create_v2(&mut c);
+    let body = v2_req(hunter().as_str()).to_string();
+    let args = signed_with(&evil_key(), &body, "high");
+    submit_signed(&mut c, hunter(), pid, evil_signer(), args);
+}
+
+/// #6: a pending claim whose signer is revoked is rejected at finalize, funds back to the pool.
+#[test]
+fn revoked_signer_pending_claim_rejected_at_finalize() {
+    let (mut c, pid) = v2_program();
+    let bal = c.get_program(pid).unwrap().balance.0;
+    let cid = submit_v2(
+        &mut c,
+        hunter(),
+        pid,
+        &v2_req(hunter().as_str()).to_string(),
+    );
+    ctx(admin(), 0, T0 + NANOS_PER_SEC);
+    c.revoke_signer(test_signer());
+    ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+    drop(c.finalize(cid));
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(
+        (cl.status, cl.reject_reason.as_deref()),
+        (ClaimStatus::Rejected, Some("signer revoked"))
+    );
+    assert!(transfers().is_empty(), "no payout");
+    let p = c.get_program(pid).unwrap();
+    assert_eq!((p.balance.0, p.reserved.0), (bal, 0));
+    assert_eq!(events()[0]["event"], "claim_rejected");
+    assert_eq!(events()[0]["data"][0]["reason"], "signer revoked");
+}
+
+fn create_v2_with(c: &mut Contract, signers: Option<Vec<Signer>>) -> u64 {
+    ctx(owner(), 20 * NEAR, T0);
+    c.create_program(
+        "v2".into(),
+        REPO.into(),
+        COMMIT.into(),
+        MODEL.into(),
+        tee::sha256_hex(SYS.as_bytes()),
+        tee::sha256_hex(BUNDLE.as_bytes()),
+        v2_params_hash(),
+        payouts(),
+        "b3duZXJwdWI=".into(),
+        60,
+        0,
+        U128(0),
+        CHALLENGE_SECS,
+        signers,
+    )
+}
+
+fn add_evil(c: &mut Contract, model: &str) {
+    ctx(admin(), 0, T0);
+    c.add_signer(
+        evil_signer(),
+        SignerMeta {
+            kind: SigKind::ProviderTee,
+            model: Some(model.into()),
+        },
+    );
+}
+
+#[test]
+fn create_program_snapshots_model_matched_signers() {
+    let (c, pid) = v2_program();
+    let p = c.get_program(pid).unwrap();
+    // live ed + live ec + test key serve MODEL; the gateway fixture (DeepSeek) is excluded.
+    let want = vec![
+        Fx::load(LIVE_ED).signer(),
+        Fx::load(LIVE_EC).signer(),
+        test_signer(),
+    ];
+    assert_eq!(p.signers.len(), 3);
+    for s in &want {
+        assert!(p.signers.contains(s), "{s:?}");
+    }
+    assert!(!p.signers.contains(&Fx::load(SYN_GW).signer()));
+    let j = serde_json::to_value(&p).unwrap();
+    assert!(j["signers"][0].is_string());
+}
+
+#[test]
+fn create_program_explicit_subset() {
+    let mut c = setup();
+    let pid = create_v2_with(&mut c, Some(vec![test_signer(), test_signer()]));
+    assert_eq!(c.get_program(pid).unwrap().signers, vec![test_signer()]);
+    // A globally-allowlisted signer outside the program's set is refused.
+    let f = Fx::load(LIVE_ED);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| submit(&mut c, pid, &f)))
+        .map_err(panic_msg);
+    assert!(r.unwrap_err().contains("signer not allowlisted"));
+    submit_v2(
+        &mut c,
+        hunter(),
+        pid,
+        &v2_req(hunter().as_str()).to_string(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "signer not allowlisted")]
+fn create_program_subset_not_allowlisted() {
+    let mut c = setup();
+    create_v2_with(&mut c, Some(vec![evil_signer()]));
+}
+
+#[test]
+#[should_panic(expected = "signer not allowlisted")]
+fn create_program_subset_wrong_model() {
+    let mut c = setup();
+    create_v2_with(&mut c, Some(vec![Fx::load(SYN_GW).signer()]));
+}
+
+#[test]
+#[should_panic(expected = "no signers for model")]
+fn create_program_empty_subset() {
+    let mut c = setup();
+    create_v2_with(&mut c, Some(vec![]));
+}
+
+#[test]
+#[should_panic(expected = "no signers for model")]
+fn create_program_no_signers_for_model() {
+    let mut c = setup();
+    create(
+        &mut c,
+        tee::sha256_hex(b"x"),
+        "openai/gpt-oss-120b",
+        0,
+        60,
+        NEAR,
+    );
+}
+
+#[test]
+fn set_program_signers_rotates_future_submissions_only() {
+    let (mut c, pid) = v2_program();
+    let body = v2_req(hunter().as_str()).to_string();
+    let pending = submit_v2(&mut c, hunter(), pid, &body);
+
+    add_evil(&mut c, MODEL);
+    ctx(owner(), NEAR, T0);
+    c.set_program_signers(pid, vec![evil_signer()]);
+    assert_eq!(c.get_program(pid).unwrap().signers, vec![evil_signer()]);
+    assert_eq!(events().last().unwrap()["event"], "program_signers_set");
+    // Unused deposit refunded to the owner.
+    let t = transfers();
+    assert_eq!(t.len(), 1);
+    assert_eq!(t[0].0, owner());
+
+    // The old key can no longer submit; the new one can.
+    let other = v2_req(stranger().as_str()).to_string();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        submit_v2(&mut c, stranger(), pid, &other)
+    }))
+    .map_err(panic_msg);
+    assert!(r.unwrap_err().contains("signer not allowlisted"));
+    let args = signed_with(&evil_key(), &other, "low");
+    submit_signed(&mut c, stranger(), pid, evil_signer(), args);
+
+    // The claim signed before rotation still finalizes (rotation is not revocation).
+    ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+    drop(c.finalize(pending));
+    assert_eq!(c.get_claim(pending).unwrap().status, ClaimStatus::Paid);
+}
+
+#[test]
+#[should_panic(expected = "program owner only")]
+fn set_program_signers_owner_only() {
+    let (mut c, pid) = v2_program();
+    ctx(admin(), 0, T0);
+    c.set_program_signers(pid, vec![test_signer()]);
+}
+
+#[test]
+#[should_panic(expected = "signer not allowlisted")]
+fn set_program_signers_subset_rule() {
+    let (mut c, pid) = v2_program();
+    add_evil(&mut c, "openai/gpt-oss-120b");
+    ctx(owner(), 0, T0);
+    c.set_program_signers(pid, vec![evil_signer()]);
+}
+
+#[test]
+#[should_panic(expected = "no signers for model")]
+fn set_program_signers_empty() {
+    let (mut c, pid) = v2_program();
+    ctx(owner(), 0, T0);
+    c.set_program_signers(pid, vec![]);
+}
+
+#[test]
+#[should_panic(expected = "program not found")]
+fn set_program_signers_missing_program() {
+    let mut c = setup();
+    ctx(owner(), 0, T0);
+    c.set_program_signers(4, vec![test_signer()]);
+}
+
+#[test]
+fn revoke_signer_removes_and_marks() {
+    let (mut c, pid) = v2_program();
+    ctx(admin(), 0, T0);
+    assert!(c.revoke_signer(test_signer()));
+    assert!(!c.revoke_signer(test_signer()), "already revoked");
+    assert!(c.is_signer_revoked(test_signer()));
+    assert!(!c.is_signer_revoked(Fx::load(LIVE_ED).signer()));
+    assert!(!c.get_signers().iter().any(|(s, _)| *s == test_signer()));
+    assert_eq!(events()[0]["event"], "signer_revoked");
+    // New submissions with it fail (it's off the global allowlist).
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        submit_v2(
+            &mut c,
+            hunter(),
+            pid,
+            &v2_req(hunter().as_str()).to_string(),
+        )
+    }))
+    .map_err(panic_msg);
+    assert!(r.unwrap_err().contains("signer not allowlisted"));
+}
+
+#[test]
+#[should_panic(expected = "owner only")]
+fn revoke_signer_admin_only() {
+    let mut c = setup();
+    ctx(owner(), 0, T0);
+    c.revoke_signer(test_signer());
+}
+
+#[test]
+fn remove_signer_keeps_pending_claims() {
+    let (mut c, pid) = v2_program();
+    let cid = submit_v2(
+        &mut c,
+        hunter(),
+        pid,
+        &v2_req(hunter().as_str()).to_string(),
+    );
+    ctx(admin(), 0, T0);
+    assert!(c.remove_signer(test_signer()));
+    ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+    drop(c.finalize(cid));
+    assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Paid);
+    assert_eq!(transfers(), vec![(hunter(), 5 * NEAR)]);
+}
+
+#[test]
+fn revoked_then_readded_signer_still_blocks_old_claims() {
+    let (mut c, pid) = v2_program();
+    let cid = submit_v2(
+        &mut c,
+        hunter(),
+        pid,
+        &v2_req(hunter().as_str()).to_string(),
+    );
+    ctx(admin(), 0, T0);
+    c.revoke_signer(test_signer());
+    c.add_signer(
+        test_signer(),
+        SignerMeta {
+            kind: SigKind::ProviderTee,
+            model: Some(MODEL.into()),
+        },
+    );
+    ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+    drop(c.finalize(cid));
+    assert_eq!(
+        c.get_claim(cid).unwrap().reject_reason.as_deref(),
+        Some("signer revoked")
+    );
+}
+
+// ---------------- v3 #4: hunter bond ----------------
+
+const BOND: u128 = NEAR;
+
+/// Live-fixture program with `bond`, the real system prompt hash (finalizable) or `x` (disputable).
+fn bonded_program(c: &mut Contract, prompt_hash: String) -> u64 {
+    ctx(owner(), 20 * NEAR, T0);
+    c.create_program(
+        "bonded".into(),
+        REPO.into(),
+        COMMIT.into(),
+        Fx::load(LIVE_ED).s("model"),
+        prompt_hash,
+        CODE_HASH_PLACEHOLDER.into(),
+        v2_params_hash(),
+        payouts(),
+        "b3duZXJwdWI=".into(),
+        60,
+        0,
+        U128(BOND),
+        CHALLENGE_SECS,
+        None,
+    )
+}
+
+#[test]
+#[should_panic(expected = "insufficient bond")]
+fn submit_without_bond_panics() {
+    // Storage-only deposit used to be enough to reserve 5 NEAR of the pool.
+    let mut c = setup();
+    let pid = bonded_program(&mut c, Fx::load(LIVE_ED).system_prompt_hash());
+    assert_eq!(c.get_program(pid).unwrap().bond.0, BOND);
+    submit_as(&mut c, hunter(), pid, &Fx::load(LIVE_ED), NEAR / 2, T0);
+}
+
+#[test]
+fn bond_held_then_returned_on_paid() {
+    let mut c = setup();
+    let pid = bonded_program(&mut c, Fx::load(LIVE_ED).system_prompt_hash());
+    let bal = c.get_program(pid).unwrap().balance.0;
+    let cid = submit_as(&mut c, hunter(), pid, &Fx::load(LIVE_ED), 2 * NEAR, T0);
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(cl.bond.0, BOND);
+    // Refund = attached - storage - bond.
+    let t = transfers();
+    assert_eq!(t.len(), 1);
+    assert!(t[0].1 > NEAR / 2 && t[0].1 < NEAR, "refund {}", t[0].1);
+    let p = c.get_program(pid).unwrap();
+    assert_eq!((p.balance.0, p.reserved.0), (bal - 5 * NEAR, 5 * NEAR));
+    ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+    drop(c.finalize(cid));
+    assert_eq!(transfers(), vec![(hunter(), 5 * NEAR + BOND)]);
+    assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Paid);
+}
+
+#[test]
+fn bond_forfeited_to_pool_on_rejected() {
+    let mut c = setup();
+    let pid = bonded_program(&mut c, tee::sha256_hex(b"x"));
+    let bal = c.get_program(pid).unwrap().balance.0;
+    let f = Fx::load(LIVE_ED);
+    let cid = submit_as(&mut c, hunter(), pid, &f, 2 * NEAR, T0);
+    ctx(owner(), 0, T0 + NANOS_PER_SEC);
+    c.dispute(cid, f.request_body());
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(cl.status, ClaimStatus::Rejected);
+    let p = c.get_program(pid).unwrap();
+    assert_eq!(p.reserved.0, 0);
+    assert_eq!(p.balance.0, bal + BOND, "bond forfeited to the pool");
+    assert!(transfers().is_empty());
+}
+
+#[test]
+fn bond_json_shape() {
+    let mut c = setup();
+    let pid = bonded_program(&mut c, Fx::load(LIVE_ED).system_prompt_hash());
+    let cid = submit_as(&mut c, hunter(), pid, &Fx::load(LIVE_ED), 2 * NEAR, T0);
+    let p = serde_json::to_value(c.get_program(pid).unwrap()).unwrap();
+    assert_eq!(p["bond"], BOND.to_string());
+    let cl = serde_json::to_value(c.get_claim(cid).unwrap()).unwrap();
+    assert_eq!(cl["bond"], BOND.to_string());
+}
+
+// ---------------- v3 #7: list_claims per-program index ----------------
+
+/// Contract with v2 programs 0 and 1, and `n` claims on program 1 (distinct reports).
+fn claims_on_program_1(n: usize) -> Contract {
+    let mut c = setup();
+    assert_eq!(create_v2(&mut c), 0);
+    assert_eq!(create_v2(&mut c), 1);
+    ctx(owner(), 5 * NEAR * n as u128, T0);
+    c.fund_program(1);
+    for i in 0..n {
+        let body = with_msg(
+            v2_req(hunter().as_str()),
+            2,
+            "content",
+            format!("REPORT\nfinding #{i}").into(),
+        );
+        submit_v2(&mut c, hunter(), 1, &body.to_string());
+    }
+    c
+}
+
+/// Gas of a fresh `list_claims` call: state is written out and read back so no collection cache
+/// hides the storage reads a real view call pays for.
+fn list_claims_gas(
+    c: Contract,
+    program_id: u64,
+    from: Option<u64>,
+    limit: Option<u64>,
+) -> (u64, Vec<Claim>) {
+    env::state_write(&c);
+    drop(c); // flushes collections
+    ctx(stranger(), 0, T0);
+    let c: Contract = env::state_read().unwrap();
+    let before = env::used_gas().as_gas();
+    let out = c.list_claims(program_id, from, limit);
+    (env::used_gas().as_gas() - before, out)
+}
+
+/// `list_claims_gas` over `claims_on_program_1(n)`, on its own thread so each run gets a fresh
+/// mocked blockchain (testing_env! keeps storage across calls within a thread).
+fn measure(n: usize, program_id: u64, from: Option<u64>, limit: Option<u64>) -> (u64, Vec<Claim>) {
+    std::thread::spawn(move || list_claims_gas(claims_on_program_1(n), program_id, from, limit))
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn list_claims_does_not_scan_other_programs() {
+    let (small, empty) = measure(2, 0, None, None);
+    let (big, empty2) = measure(30, 0, None, None);
+    assert!(empty.is_empty() && empty2.is_empty());
+    println!("list_claims(0) gas: 2 other claims {small}, 30 other claims {big}");
+    assert_eq!(
+        small, big,
+        "list_claims(0) gas must not grow with program 1's claims: 2 claims -> {small}, 30 -> {big}"
+    );
+}
+
+#[test]
+fn list_claims_late_page_costs_like_first_page() {
+    let (first, a) = measure(30, 1, None, Some(1));
+    let (late, b) = measure(30, 1, Some(29), Some(1));
+    assert_eq!((a.len(), b.len()), (1, 1));
+    println!("list_claims(1, _, 1) gas: from 0 {first}, from 29 {late}");
+    assert_eq!((a[0].id, b[0].id), (0, 29));
+    assert_eq!(
+        first, late,
+        "page cost must not depend on from_index: first {first}, from 29 -> {late}"
+    );
+}
+
+#[test]
+fn list_claims_pagination_order() {
+    let mut c = claims_on_program_1(5);
+    submit(&mut c, 0, &Fx::load(LIVE_EC)); // program 0 is v2; live sig still verifies
+    let ids = |v: Vec<Claim>| v.into_iter().map(|c| c.id).collect::<Vec<_>>();
+    assert_eq!(ids(c.list_claims(1, None, None)), vec![0, 1, 2, 3, 4]);
+    assert_eq!(ids(c.list_claims(1, Some(1), Some(2))), vec![1, 2]);
+    assert_eq!(ids(c.list_claims(1, Some(4), Some(9))), vec![4]);
+    assert!(c.list_claims(1, Some(5), None).is_empty());
+    assert!(c.list_claims(1, Some(u64::MAX), None).is_empty());
+    assert_eq!(ids(c.list_claims(0, None, None)), vec![5]);
+    assert!(c.list_claims(7, None, None).is_empty());
+}
+
+// ---------------- v3 #8: on_payout callback ----------------
+
+/// Context of the `on_payout` callback: the contract calls itself with one promise result.
+fn callback_ctx(result: near_sdk::PromiseResult) {
+    let me = accounts(5);
+    testing_env!(
+        VMContextBuilder::new()
+            .current_account_id(me.clone())
+            .predecessor_account_id(me)
+            .block_timestamp(T0 + 60 * NANOS_PER_SEC)
+            .build(),
+        near_sdk::test_vm_config(),
+        near_sdk::RuntimeFeesConfig::test(),
+        Default::default(),
+        vec![result],
+    );
+}
+
+/// Bonded, finalized (Paid) claim; returns (contract, program id, claim id, balance after submit).
+fn finalized() -> (Contract, u64, u64, u128) {
+    let mut c = setup();
+    let pid = bonded_program(&mut c, Fx::load(LIVE_ED).system_prompt_hash());
+    let cid = submit_as(&mut c, hunter(), pid, &Fx::load(LIVE_ED), 2 * NEAR, T0);
+    let bal = c.get_program(pid).unwrap().balance.0;
+    ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+    drop(c.finalize(cid));
+    assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Paid);
+    (c, pid, cid, bal)
+}
+
+#[test]
+fn finalize_chains_on_payout_callback() {
+    let (_, _, cid, _) = finalized();
+    let calls: Vec<(String, Vec<u8>)> = get_created_receipts()
+        .into_iter()
+        .flat_map(|r| r.actions)
+        .filter_map(|a| match a {
+            MockAction::FunctionCallWeight {
+                method_name, args, ..
+            } => Some((String::from_utf8(method_name).unwrap(), args)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "on_payout");
+    let args: Value = serde_json::from_slice(&calls[0].1).unwrap();
+    assert_eq!(args, json!({"claim_id": cid}));
+}
+
+#[test]
+fn on_payout_success_keeps_paid() {
+    let (mut c, pid, cid, bal) = finalized();
+    callback_ctx(near_sdk::PromiseResult::Successful(vec![]));
+    assert!(c.on_payout(cid));
+    assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Paid);
+    let p = c.get_program(pid).unwrap();
+    assert_eq!((p.balance.0, p.reserved.0), (bal, 0));
+}
+
+#[test]
+fn on_payout_failure_credits_program() {
+    let (mut c, pid, cid, bal) = finalized();
+    callback_ctx(near_sdk::PromiseResult::Failed);
+    assert!(!c.on_payout(cid));
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(cl.status, ClaimStatus::PayoutFailed);
+    let p = c.get_program(pid).unwrap();
+    assert_eq!((p.balance.0, p.reserved.0), (bal + 5 * NEAR + BOND, 0));
+    let ev = events();
+    assert_eq!(ev[0]["event"], "payout_failed");
+    assert_eq!(ev[0]["data"][0]["amount"], (5 * NEAR + BOND).to_string());
+    assert_eq!(serde_json::to_value(&cl).unwrap()["status"], "PayoutFailed");
+    // Not finalizable or disputable again.
+    ctx(stranger(), 0, T0 + 61 * NANOS_PER_SEC);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(c.finalize(cid))));
+    assert!(r.is_err());
+}
+
+#[test]
+#[should_panic(expected = "claim not paid")]
+fn on_payout_failure_only_once() {
+    let (mut c, _, cid, _) = finalized();
+    callback_ctx(near_sdk::PromiseResult::Failed);
+    c.on_payout(cid);
+    c.on_payout(cid);
+}
+
+// ---------------- integration: #6 revocation x #4 bond ----------------
+
+/// A revoked-signer claim is Rejected at finalize: no transfer, payout and bond go to the pool.
+#[test]
+fn revoked_signer_forfeits_bond() {
+    let mut c = setup();
+    let f = Fx::load(LIVE_ED);
+    let pid = bonded_program(&mut c, f.system_prompt_hash());
+    let bal = c.get_program(pid).unwrap().balance.0;
+    let cid = submit_as(&mut c, hunter(), pid, &f, 2 * NEAR, T0);
+    ctx(admin(), 0, T0 + NANOS_PER_SEC);
+    c.revoke_signer(f.signer());
+    ctx(stranger(), 0, T0 + 60 * NANOS_PER_SEC);
+    assert!(matches!(c.finalize(cid), PromiseOrValue::Value(())));
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(
+        (cl.status, cl.reject_reason.as_deref()),
+        (ClaimStatus::Rejected, Some("signer revoked"))
+    );
+    assert!(transfers().is_empty(), "no payout, no bond refund");
+    let p = c.get_program(pid).unwrap();
+    assert_eq!((p.balance.0, p.reserved.0), (bal + BOND, 0));
+}
+
+// ---------------- v3 #2: decryption challenge ----------------
+
+/// Base64 junk that is not `ephPub || nonce || box` for any secret.
+const JUNK_CT: &str = "Y2lwaGVy";
+
+fn submit_ct(c: &mut Contract, pid: u64, body: &str, ciphertext: &str) -> u64 {
+    let (req_hash, resp, sig) = signed(body);
+    ctx(hunter(), NEAR, T0);
+    c.submit_claim(
+        pid,
+        req_hash,
+        resp,
+        sig,
+        test_signer(),
+        SigKind::ProviderTee,
+        ciphertext.into(),
+    )
+}
+
+/// Issue #2: a payable claim with junk ciphertext. The owner can't recover the body so can't
+/// dispute; they flag it, the hunter never proves, and finalize rejects instead of paying.
+#[test]
+fn junk_ciphertext_flagged_then_rejected() {
+    let (mut c, pid) = v2_program();
+    let bal = c.get_program(pid).unwrap().balance.0;
+    let body = v2_req(hunter().as_str()).to_string();
+    let cid = submit_ct(&mut c, pid, &body, JUNK_CT);
+
+    // The owner can't produce the body, so dispute is impossible.
+    ctx(owner(), 0, T0 + NANOS_PER_SEC);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c.dispute(cid, "unknown".into())
+    }));
+    assert!(r.is_err(), "body mismatch");
+
+    ctx(owner(), 0, T0 + NANOS_PER_SEC);
+    c.flag_undecryptable(cid);
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(cl.status, ClaimStatus::Challenged);
+    let deadline = T0 + NANOS_PER_SEC + CHALLENGE_SECS * NANOS_PER_SEC;
+    assert_eq!(cl.challenge_deadline, Some(U64(deadline)));
+    assert_eq!(serde_json::to_value(&cl).unwrap()["status"], "Challenged");
+
+    // Hunter stays silent; after the deadline finalize rejects and pays nothing.
+    ctx(stranger(), 0, deadline);
+    drop(c.finalize(cid));
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(cl.status, ClaimStatus::Rejected);
+    assert_eq!(cl.reject_reason.as_deref(), Some("undecryptable report"));
+    assert!(transfers().is_empty(), "no payout");
+    let p = c.get_program(pid).unwrap();
+    assert_eq!((p.balance.0, p.reserved.0), (bal, 0));
+}
+
+/// JS -> Rust compat: tests/fixtures/box.tweetnacl.json from shared/judge.mjs
+/// encryptForOwnerWithSecret (tweetnacl), regenerated by tests/fixtures/gen-box.mjs.
+const BOX_JS: &str = include_str!("../tests/fixtures/box.tweetnacl.json");
+
+fn b64e(b: &[u8]) -> String {
+    use near_sdk::base64::Engine as _;
+    near_sdk::base64::engine::general_purpose::STANDARD.encode(b)
+}
+fn b64d(s: &str) -> Vec<u8> {
+    use near_sdk::base64::Engine as _;
+    near_sdk::base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .unwrap()
+}
+fn arr32(hex_s: &str) -> [u8; 32] {
+    hex::decode(hex_s).unwrap().try_into().unwrap()
+}
+
+/// Owner keypair and hunter ephemeral secret for Rust-sealed ciphertexts.
+const OWNER_SK: [u8; 32] = [0x11; 32];
+const EPH_SK: [u8; 32] = [0x22; 32];
+const NONCE: [u8; 24] = [0x33; 24];
+
+fn seal(body: &str) -> String {
+    b64e(&report_box::seal_with_ephemeral(
+        body.as_bytes(),
+        report_box::x25519_base(OWNER_SK),
+        EPH_SK,
+        NONCE,
+    ))
+}
+
+/// v2 program whose owner_enc_pubkey is `owner_pub_b64`.
+fn v2_program_keyed(owner_pub_b64: &str) -> (Contract, u64) {
+    let mut c = setup();
+    ctx(owner(), 20 * NEAR, T0);
+    let pid = c.create_program(
+        "v2".into(),
+        REPO.into(),
+        COMMIT.into(),
+        MODEL.into(),
+        tee::sha256_hex(SYS.as_bytes()),
+        tee::sha256_hex(BUNDLE.as_bytes()),
+        v2_params_hash(),
+        payouts(),
+        owner_pub_b64.into(),
+        60,
+        0,
+        U128(0),
+        CHALLENGE_SECS,
+        None,
+    );
+    (c, pid)
+}
+
+/// Rust-keyed program + claim (submitted at T0) with `ciphertext` for `body`, flagged at T0+1s.
+fn challenged(body: &str, ciphertext: &str) -> (Contract, u64, u64) {
+    let (mut c, pid) = v2_program_keyed(&b64e(&report_box::x25519_base(OWNER_SK)));
+    let cid = submit_ct(&mut c, pid, body, ciphertext);
+    ctx(owner(), 0, T0 + NANOS_PER_SEC);
+    c.flag_undecryptable(cid);
+    (c, pid, cid)
+}
+const DEADLINE: u64 = T0 + NANOS_PER_SEC + CHALLENGE_SECS * NANOS_PER_SEC;
+
+fn prove_as(c: &mut Contract, who: AccountId, ts: u64, cid: u64, secret: &str) {
+    ctx(who, 0, ts);
+    c.prove_ciphertext(cid, secret.into());
+}
+
+fn assert_rejected(c: &Contract, pid: u64, cid: u64, reason: &str) {
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(cl.status, ClaimStatus::Rejected);
+    assert_eq!(cl.reject_reason.as_deref(), Some(reason));
+    let p = c.get_program(pid).unwrap();
+    assert_eq!(p.reserved.0, 0, "payout back to the pool");
+}
+
+#[test]
+fn tweetnacl_fixture_opens() {
+    let f: Value = serde_json::from_str(BOX_JS).unwrap();
+    let body = f["request_body"].as_str().unwrap();
+    let ct = b64d(f["ciphertext"].as_str().unwrap());
+    let owner_pub: [u8; 32] = b64d(f["owner_enc_pubkey"].as_str().unwrap())
+        .try_into()
+        .unwrap();
+    let owner_sk = arr32(f["owner_secret_hex"].as_str().unwrap());
+    let eph = arr32(f["ephemeral_secret_hex"].as_str().unwrap());
+    assert_eq!(report_box::x25519_base(owner_sk), owner_pub);
+
+    // hunter side (prove_ciphertext): ephemeral secret + owner pubkey
+    let plain = report_box::open_with_ephemeral(&ct, owner_pub, eph).unwrap();
+    assert_eq!(plain, body.as_bytes());
+    // Rust seals the same bytes as tweetnacl for the same secret + nonce
+    let nonce: [u8; 24] = ct[32..56].try_into().unwrap();
+    assert_eq!(
+        report_box::seal_with_ephemeral(body.as_bytes(), owner_pub, eph, nonce),
+        ct
+    );
+    // owner side (decryptAsOwner): owner secret + ephemeral pubkey
+    use crypto_box::aead::Aead;
+    let eph_pub: [u8; 32] = ct[..32].try_into().unwrap();
+    let ob = crypto_box::SalsaBox::new(&eph_pub.into(), &owner_sk.into());
+    assert_eq!(
+        ob.decrypt(&crypto_box::Nonce::from(nonce), &ct[56..])
+            .unwrap(),
+        body.as_bytes()
+    );
+    // wrong secret / flipped byte fail
+    assert!(report_box::open_with_ephemeral(&ct, owner_pub, EPH_SK).is_err());
+    let mut bad = ct.clone();
+    *bad.last_mut().unwrap() ^= 1;
+    assert!(report_box::open_with_ephemeral(&bad, owner_pub, eph).is_err());
+    assert!(report_box::open_with_ephemeral(&ct[..60], owner_pub, eph).is_err());
+}
+
+/// Honest JS (tweetnacl) ciphertext + correct secret -> back to Pending, finalizable now, paid.
+#[test]
+fn honest_ciphertext_proven_then_paid() {
+    let f: Value = serde_json::from_str(BOX_JS).unwrap();
+    let body = f["request_body"].as_str().unwrap();
+    let (mut c, pid) = v2_program_keyed(f["owner_enc_pubkey"].as_str().unwrap());
+    let cid = submit_ct(&mut c, pid, body, f["ciphertext"].as_str().unwrap());
+    // a griefing owner flags an honest claim
+    ctx(owner(), 0, T0 + NANOS_PER_SEC);
+    c.flag_undecryptable(cid);
+    assert_eq!(events()[0]["event"], "claim_challenged");
+
+    let t = T0 + 5 * NANOS_PER_SEC;
+    prove_as(
+        &mut c,
+        hunter(),
+        t,
+        cid,
+        f["ephemeral_secret_hex"].as_str().unwrap(),
+    );
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(cl.status, ClaimStatus::Pending);
+    assert_eq!(cl.finalize_after, U64(t));
+    assert_eq!(events()[0]["event"], "claim_proven");
+    // the owner can no longer flag or dispute it
+    for r in [
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx(owner(), 0, t);
+            c.flag_undecryptable(cid)
+        })),
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx(owner(), 0, t);
+            c.dispute(cid, body.into())
+        })),
+    ] {
+        assert!(r.is_err());
+    }
+
+    ctx(stranger(), 0, t);
+    drop(c.finalize(cid));
+    assert_eq!(transfers(), vec![(hunter(), 5 * NEAR)]);
+    assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Paid);
+    assert_eq!(c.get_program(pid).unwrap().reserved.0, 0);
+}
+
+#[test]
+fn junk_with_bogus_secret_rejected() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (mut c, pid, cid) = challenged(&body, JUNK_CT);
+    prove_as(
+        &mut c,
+        hunter(),
+        T0 + 2 * NANOS_PER_SEC,
+        cid,
+        &hex::encode(EPH_SK),
+    );
+    assert_rejected(&c, pid, cid, UNDECRYPTABLE);
+    assert_eq!(events()[0]["data"][0]["reason"], UNDECRYPTABLE);
+}
+
+/// Well-formed ciphertext, but wrong secret / of a different body / for another owner key.
+#[test]
+fn prove_failures_are_undecryptable() {
+    let other_owner = |body: &str| {
+        b64e(&report_box::seal_with_ephemeral(
+            body.as_bytes(),
+            report_box::x25519_base([0x44; 32]),
+            EPH_SK,
+            NONCE,
+        ))
+    };
+    type Sealer = fn(&str) -> String;
+    let cases: [(&str, Sealer, [u8; 32]); 3] = [
+        ("wrong secret", seal, [0x55; 32]),
+        ("other body", |b| seal(&format!("{b} ")), EPH_SK),
+        ("other owner key", other_owner, EPH_SK),
+    ];
+    for (name, ct, secret) in cases {
+        // distinct req_hash per case (mock storage persists across contracts)
+        let body = with_msg(
+            v2_req(hunter().as_str()),
+            2,
+            "content",
+            format!("REPORT\n{name}").into(),
+        )
+        .to_string();
+        let (mut c, pid, cid) = challenged(&body, &ct(&body));
+        prove_as(
+            &mut c,
+            hunter(),
+            T0 + 2 * NANOS_PER_SEC,
+            cid,
+            &hex::encode(secret),
+        );
+        assert_rejected(&c, pid, cid, UNDECRYPTABLE);
+    }
+}
+
+/// Honest ciphertext of a request that fails the dispute checks -> Rejected with that reason.
+#[test]
+fn proven_code_mismatch_rejected() {
+    let body = with_msg(
+        v2_req(hunter().as_str()),
+        1,
+        "content",
+        user1(hunter().as_str(), &format!("{REPO}@{COMMIT}"), "fake\n"),
+    )
+    .to_string();
+    let (mut c, pid, cid) = challenged(&body, &seal(&body));
+    prove_as(
+        &mut c,
+        hunter(),
+        T0 + 2 * NANOS_PER_SEC,
+        cid,
+        &hex::encode(EPH_SK),
+    );
+    assert_rejected(&c, pid, cid, CODE_MISMATCH);
+}
+
+/// Front-run claim, proven: "hunter mismatch" also releases the req_hash (same as dispute).
+#[test]
+fn proven_hunter_mismatch_releases_req_hash() {
+    let body = v2_req(stranger().as_str()).to_string();
+    let (mut c, pid, cid) = challenged(&body, &seal(&body));
+    prove_as(
+        &mut c,
+        hunter(),
+        T0 + 2 * NANOS_PER_SEC,
+        cid,
+        &hex::encode(EPH_SK),
+    );
+    assert_rejected(&c, pid, cid, HUNTER_MISMATCH);
+    // #5: the dedupe key is per program
+    let key = dedupe_key(pid, &c.get_claim(cid).unwrap().req_hash);
+    assert!(!c.used_req_hashes.contains(&key));
+}
+
+#[test]
+#[should_panic(expected = "claim hunter only")]
+fn prove_hunter_only() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (mut c, _, cid) = challenged(&body, &seal(&body));
+    prove_as(
+        &mut c,
+        stranger(),
+        T0 + 2 * NANOS_PER_SEC,
+        cid,
+        &hex::encode(EPH_SK),
+    );
+}
+
+#[test]
+#[should_panic(expected = "program owner only")]
+fn flag_owner_only() {
+    let (mut c, pid) = v2_program();
+    let cid = submit_ct(&mut c, pid, &v2_req(hunter().as_str()).to_string(), JUNK_CT);
+    ctx(hunter(), 0, T0 + NANOS_PER_SEC);
+    c.flag_undecryptable(cid);
+}
+
+#[test]
+#[should_panic(expected = "dispute window closed")]
+fn flag_after_dispute_window() {
+    let (mut c, pid) = v2_program();
+    let cid = submit_ct(&mut c, pid, &v2_req(hunter().as_str()).to_string(), JUNK_CT);
+    ctx(owner(), 0, T0 + 60 * NANOS_PER_SEC);
+    c.flag_undecryptable(cid);
+}
+
+#[test]
+#[should_panic(expected = "claim not pending")]
+fn flag_twice() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (mut c, _, cid) = challenged(&body, JUNK_CT);
+    ctx(owner(), 0, T0 + 2 * NANOS_PER_SEC);
+    c.flag_undecryptable(cid);
+}
+
+#[test]
+#[should_panic(expected = "challenge closed")]
+fn prove_at_deadline() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (mut c, _, cid) = challenged(&body, &seal(&body));
+    prove_as(&mut c, hunter(), DEADLINE, cid, &hex::encode(EPH_SK));
+}
+
+#[test]
+fn prove_just_before_deadline_ok() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (mut c, _, cid) = challenged(&body, &seal(&body));
+    prove_as(&mut c, hunter(), DEADLINE - 1, cid, &hex::encode(EPH_SK));
+    assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Pending);
+}
+
+#[test]
+#[should_panic(expected = "claim not challenged")]
+fn prove_on_pending() {
+    let (mut c, pid) = v2_program();
+    let body = v2_req(hunter().as_str()).to_string();
+    let cid = submit_ct(&mut c, pid, &body, &seal(&body));
+    prove_as(
+        &mut c,
+        hunter(),
+        T0 + NANOS_PER_SEC,
+        cid,
+        &hex::encode(EPH_SK),
+    );
+}
+
+#[test]
+#[should_panic(expected = "ephemeral_secret must be 64 hex chars")]
+fn prove_bad_hex() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (mut c, _, cid) = challenged(&body, &seal(&body));
+    prove_as(&mut c, hunter(), T0 + 2 * NANOS_PER_SEC, cid, "abcd");
+}
+
+#[test]
+#[should_panic(expected = "challenge open")]
+fn finalize_challenged_before_deadline() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (mut c, _, cid) = challenged(&body, JUNK_CT);
+    // even after the dispute window, a Challenged claim waits for the challenge deadline
+    ctx(stranger(), 0, DEADLINE - 1);
+    drop(c.finalize(cid));
+}
+
+#[test]
+#[should_panic(expected = "claim not pending")]
+fn dispute_on_challenged() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (mut c, _, cid) = challenged(&body, JUNK_CT);
+    ctx(owner(), 0, T0 + 2 * NANOS_PER_SEC);
+    c.dispute(cid, body);
+}
+
+#[test]
+#[should_panic(expected = "claim not pending")]
+fn finalize_after_undecryptable_reject() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (mut c, _, cid) = challenged(&body, JUNK_CT);
+    ctx(stranger(), 0, DEADLINE);
+    drop(c.finalize(cid));
+    drop(c.finalize(cid));
+}
+
+#[test]
+#[should_panic(expected = "challenge_secs too large")]
+fn create_program_challenge_secs_overflow() {
+    let mut c = setup();
+    ctx(owner(), NEAR, T0);
+    c.create_program(
+        "x".into(),
+        REPO.into(),
+        COMMIT.into(),
+        MODEL.into(),
+        tee::sha256_hex(SYS.as_bytes()),
+        tee::sha256_hex(BUNDLE.as_bytes()),
+        v2_params_hash(),
+        payouts(),
+        "k".into(),
+        60,
+        0,
+        U128(0),
+        u64::MAX,
+        None,
+    );
+}
+
+#[test]
+fn json_shapes_challenge() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (c, pid, cid) = challenged(&body, JUNK_CT);
+    let p = serde_json::to_value(c.get_program(pid).unwrap()).unwrap();
+    assert_eq!(p["challenge_secs"], CHALLENGE_SECS);
+    let cl = serde_json::to_value(c.get_claim(cid).unwrap()).unwrap();
+    assert_eq!(cl["status"], "Challenged");
+    assert_eq!(cl["challenge_deadline"], DEADLINE.to_string());
+    let (c2, _, cid2, _) = pending();
+    let cl2 = serde_json::to_value(c2.get_claim(cid2).unwrap()).unwrap();
+    assert!(cl2["challenge_deadline"].is_null());
+}
+
+// ---------------- integration: #2 challenge x #1 params x #4 bond ----------------
+
+/// #2 x #1: prove_ciphertext runs the shared tamper check, so a correctly sealed and correctly
+/// proven body with tampered params is Rejected "params tampered" (not back to Pending).
+#[test]
+fn proven_params_tampered_rejected() {
+    for (name, body) in params_tampered_bodies() {
+        let (mut c, pid, cid) = challenged(&body, &seal(&body));
+        prove_as(
+            &mut c,
+            hunter(),
+            T0 + 2 * NANOS_PER_SEC,
+            cid,
+            &hex::encode(EPH_SK),
+        );
+        let cl = c.get_claim(cid).unwrap();
+        assert_eq!(
+            (cl.status, cl.reject_reason.as_deref()),
+            (ClaimStatus::Rejected, Some(PARAMS_TAMPERED)),
+            "{name}"
+        );
+        assert_rejected(&c, pid, cid, PARAMS_TAMPERED);
+        assert!(transfers().is_empty(), "{name}: no payout");
+    }
+}
+
+/// Rust-keyed program with a hunter bond, and a claim for `body` (sealed as `ciphertext`)
+/// submitted at T0 with storage + bond, flagged at T0+1s. Returns the balance after submit.
+fn challenged_bonded(body: &str, ciphertext: &str) -> (Contract, u64, u64, u128) {
+    let mut c = setup();
+    ctx(owner(), 20 * NEAR, T0);
+    let pid = c.create_program(
+        "v2".into(),
+        REPO.into(),
+        COMMIT.into(),
+        MODEL.into(),
+        tee::sha256_hex(SYS.as_bytes()),
+        tee::sha256_hex(BUNDLE.as_bytes()),
+        v2_params_hash(),
+        payouts(),
+        b64e(&report_box::x25519_base(OWNER_SK)),
+        60,
+        0,
+        U128(BOND),
+        CHALLENGE_SECS,
+        None,
+    );
+    let (req_hash, resp, sig) = signed(body);
+    ctx(hunter(), NEAR + BOND, T0);
+    let cid = c.submit_claim(
+        pid,
+        req_hash,
+        resp,
+        sig,
+        test_signer(),
+        SigKind::ProviderTee,
+        ciphertext.into(),
+    );
+    assert_eq!(c.get_claim(cid).unwrap().bond.0, BOND);
+    let bal = c.get_program(pid).unwrap().balance.0;
+    ctx(owner(), 0, T0 + NANOS_PER_SEC);
+    c.flag_undecryptable(cid);
+    (c, pid, cid, bal)
+}
+
+/// #2 x #4: an undecryptable claim (hunter never proves) forfeits its bond to the pool.
+#[test]
+fn undecryptable_forfeits_bond() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (mut c, pid, cid, bal) = challenged_bonded(&body, JUNK_CT);
+    ctx(stranger(), 0, DEADLINE);
+    assert!(matches!(c.finalize(cid), PromiseOrValue::Value(())));
+    assert_rejected(&c, pid, cid, UNDECRYPTABLE);
+    assert!(transfers().is_empty(), "no payout, no bond refund");
+    let p = c.get_program(pid).unwrap();
+    assert_eq!(
+        p.balance.0,
+        bal + 5 * NEAR + BOND,
+        "payout + bond to the pool"
+    );
+}
+
+/// #2 x #4: a claim rejected by prove_ciphertext (bogus secret, or a proven but tampered body)
+/// forfeits its bond too.
+#[test]
+fn prove_rejection_forfeits_bond() {
+    let junk = v2_req(hunter().as_str()).to_string();
+    let mut tampered = v2_req(hunter().as_str());
+    tampered["temperature"] = json!(1.5);
+    let tampered = tampered.to_string();
+    for (body, ct, reason) in [
+        (junk.clone(), JUNK_CT.to_string(), UNDECRYPTABLE),
+        (tampered.clone(), seal(&tampered), PARAMS_TAMPERED),
+    ] {
+        let (mut c, pid, cid, bal) = challenged_bonded(&body, &ct);
+        prove_as(
+            &mut c,
+            hunter(),
+            T0 + 2 * NANOS_PER_SEC,
+            cid,
+            &hex::encode(EPH_SK),
+        );
+        assert_rejected(&c, pid, cid, reason);
+        assert!(transfers().is_empty());
+        let p = c.get_program(pid).unwrap();
+        assert_eq!(
+            p.balance.0,
+            bal + 5 * NEAR + BOND,
+            "{reason}: bond forfeited"
+        );
+    }
+}
+
+/// #2 x #4 x #8: an honest proven claim is paid payout + bond, with the on_payout callback.
+#[test]
+fn proven_bonded_claim_paid_with_bond() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (mut c, _, cid, _) = challenged_bonded(&body, &seal(&body));
+    let t = T0 + 2 * NANOS_PER_SEC;
+    prove_as(&mut c, hunter(), t, cid, &hex::encode(EPH_SK));
+    assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Pending);
+    ctx(stranger(), 0, t);
+    assert!(matches!(c.finalize(cid), PromiseOrValue::Promise(_)));
+    assert_eq!(transfers(), vec![(hunter(), 5 * NEAR + BOND)]);
+    assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Paid);
 }

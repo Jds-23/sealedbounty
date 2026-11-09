@@ -1,7 +1,11 @@
 // Pure builders for contract call args (no network). Unit-tested in test/args.test.ts.
 import { shared, type ProgramBinding, type RequestCheck } from './shared.js';
-import type { CheckRow, JudgeRecord, Payouts, Program, SigKind, Signer, Verdict } from './types.js';
-import { formatNear, nearToYocto } from './util.js';
+import type { CheckRow, Claim, ClaimStatus, JudgeRecord, Payouts, Program, SigKind, Signer, Verdict } from './types.js';
+import { formatNear, nearToYocto, nsToIso } from './util.js';
+
+/** v3 defaults for create-program. */
+export const DEFAULT_BOND_NEAR = '0.05';
+export const DEFAULT_CHALLENGE_SECS = 600;
 
 /** NEAR storage price: 1e19 yoctoNEAR per byte (10 kB = 0.1 NEAR). */
 export const STORAGE_PRICE_PER_BYTE = 10n ** 19n;
@@ -17,8 +21,30 @@ export const GAS = {
   createProgram: 50n * 10n ** 12n,
   submitClaim: 150n * 10n ** 12n,
   dispute: 100n * 10n ** 12n,
-  finalize: 50n * 10n ** 12n,
+  // finalize -> transfer -> on_payout (10 Tgas static) callback
+  finalize: 80n * 10n ** 12n,
+  flagUndecryptable: 30n * 10n ** 12n,
+  // opens the nacl box + full dispute checks on the plaintext
+  proveCiphertext: 150n * 10n ** 12n,
+  setProgramSigners: 30n * 10n ** 12n,
+  revokeSigner: 30n * 10n ** 12n,
 };
+
+// ---------- signers ----------
+const SIGNER_RE = /^(ed25519:[0-9a-f]{64}|eth:0x[0-9a-f]{40})$/;
+
+/** Normalizes + validates one contract Signer string. */
+export function normalizeSigner(s: string): Signer {
+  const v = s.trim().toLowerCase();
+  if (!SIGNER_RE.test(v)) throw new Error(`bad signer "${s}": expected ed25519:<64 hex> or eth:0x<40 hex>`);
+  return v;
+}
+
+/** `--signers a,b c` -> deduped, validated list (order kept). */
+export function parseSigners(list: string[] | string): Signer[] {
+  const parts = (Array.isArray(list) ? list : [list]).flatMap((x) => x.split(/[\s,]+/)).filter(Boolean);
+  return [...new Set(parts.map(normalizeSigner))];
+}
 
 // ---------- add_signer ----------
 export function addSignerArgs(algo: 'ed25519' | 'ecdsa', signingAddress: string, kind: SigKind, model: string | null) {
@@ -34,16 +60,29 @@ export interface CreateProgramInput {
   systemPromptHash: string;
   /** sha256hex of the published code bundle (shared.codeHash). */
   codeHash: string;
+  /** v3 #1: shared.paramsHash(). */
+  paramsHash: string;
   payoutsNear: { low: string; medium: string; high: string; critical: string };
   ownerEncPubkey: string;
   disputeSecs: number;
   minConfidence: number;
   fundNear: string;
+  /** v3 #4: hunter bond in NEAR (default DEFAULT_BOND_NEAR). */
+  bondNear?: string;
+  /** v3 #2: prove_ciphertext window (default DEFAULT_CHALLENGE_SECS). */
+  challengeSecs?: number;
+  /** v3 #3: explicit program signers; undefined/empty -> null = contract snapshots the model-matched allowlist. */
+  signers?: Signer[];
 }
 
 export function createProgramArgs(i: CreateProgramInput) {
   if (!/^[0-9a-f]{64}$/.test(i.systemPromptHash)) throw new Error('system_prompt_hash must be 64 lowercase hex');
   if (!/^[0-9a-f]{64}$/.test(i.codeHash)) throw new Error('code_hash must be 64 lowercase hex');
+  if (!/^[0-9a-f]{64}$/.test(i.paramsHash)) throw new Error('params_hash must be 64 lowercase hex');
+  const challengeSecs = i.challengeSecs ?? DEFAULT_CHALLENGE_SECS;
+  if (!Number.isInteger(challengeSecs) || challengeSecs < 0) throw new Error('challenge-secs must be a non-negative integer');
+  const bond = nearToYocto(i.bondNear ?? DEFAULT_BOND_NEAR);
+  const signers = i.signers?.length ? i.signers.map(normalizeSigner) : null;
   if (!Number.isInteger(i.minConfidence) || i.minConfidence < 0 || i.minConfidence > 100)
     throw new Error('min-confidence must be an integer 0..100');
   if (!Number.isInteger(i.disputeSecs) || i.disputeSecs < 0) throw new Error('dispute-secs must be a non-negative integer');
@@ -61,10 +100,14 @@ export function createProgramArgs(i: CreateProgramInput) {
     model_id: i.modelId,
     system_prompt_hash: i.systemPromptHash,
     code_hash: i.codeHash, // v2: right after system_prompt_hash
+    params_hash: i.paramsHash, // v3 #1
     payouts,
     owner_enc_pubkey: i.ownerEncPubkey,
     dispute_secs: i.disputeSecs,
     min_confidence: i.minConfidence,
+    bond: bond.toString(), // v3 #4
+    challenge_secs: challengeSecs, // v3 #2
+    signers, // v3 #3: null = snapshot of the model-matched global allowlist
   };
   const deposit = nearToYocto(i.fundNear) + PROGRAM_STORAGE_ALLOWANCE;
   return { args, deposit };
@@ -90,9 +133,104 @@ export function estimateClaimStorageDeposit(ciphertext: string): { bytes: bigint
   return { bytes, deposit: bytes * STORAGE_PRICE_PER_BYTE + CLAIM_DEPOSIT_MARGIN };
 }
 
-// ---------- dispute / finalize ----------
+/** v3 #4: submit_claim attaches storage + program.bond (else "insufficient bond"). Unused storage is refunded. */
+export function submitDeposit(ciphertext: string, programBond: string | bigint | undefined) {
+  const { bytes, deposit: storage } = estimateClaimStorageDeposit(ciphertext);
+  const bond = BigInt(programBond ?? 0);
+  return { bytes, storage, bond, deposit: storage + bond };
+}
+
+// ---------- dispute / finalize / v3 methods ----------
 export const disputeArgs = (claimId: number, requestBody: string) => ({ claim_id: claimId, request_body: requestBody });
 export const finalizeArgs = (claimId: number) => ({ claim_id: claimId });
+export const flagUndecryptableArgs = (claimId: number) => ({ claim_id: claimId });
+export function proveCiphertextArgs(claimId: number, ephemeralSecretHex: string) {
+  if (!/^[0-9a-f]{64}$/.test(ephemeralSecretHex)) throw new Error('ephemeral_secret must be 64 hex chars (lowercase)');
+  return { claim_id: claimId, ephemeral_secret: ephemeralSecretHex };
+}
+export function setProgramSignersArgs(programId: number, signers: Signer[]) {
+  if (!signers.length) throw new Error('set_program_signers needs at least one signer');
+  return { program_id: programId, signers: signers.map(normalizeSigner) };
+}
+export const revokeSignerArgs = (signer: Signer) => ({ signer: normalizeSigner(signer) });
+
+/** Printed after `attest --register`: programs snapshot their signers, so rotation is per program. */
+export const attestRotationHint = () =>
+  'NOTE: programs snapshot their signer set at creation (v3 #3); a newly registered signer does NOT apply to existing programs.\n' +
+  '  each program owner must run: sealedbounty set-program-signers --program <id> --signers <signer>[,<signer>...]';
+
+// ---------- status display ----------
+const NS = 1_000_000_000n;
+export function fmtDuration(secs: bigint): string {
+  const s = secs < 0n ? 0n : secs;
+  const h = s / 3600n;
+  const m = (s % 3600n) / 60n;
+  const r = s % 60n;
+  return h ? `${h}h ${m}m` : `${m}m ${r}s`;
+}
+
+/** One-line status incl. the v3 Challenged deadline countdown and PayoutFailed. */
+export function claimStatusLabel(c: Claim, nowNs: bigint = BigInt(Date.now()) * 1_000_000n): string {
+  switch (c.status) {
+    case 'Challenged': {
+      if (!c.challenge_deadline) return 'Challenged';
+      const d = BigInt(c.challenge_deadline);
+      if (d <= nowNs) return 'Challenged (deadline passed: finalize rejects "undecryptable report")';
+      return `Challenged (hunter must prove by ${nsToIso(c.challenge_deadline)}, ${fmtDuration((d - nowNs) / NS)} left)`;
+    }
+    case 'PayoutFailed':
+      return 'PayoutFailed (transfer failed; payout + bond credited back to the pool)';
+    case 'Pending':
+      return BigInt(c.finalize_after) <= nowNs ? 'Pending (finalizable)' : 'Pending';
+    default:
+      return c.status + (c.reject_reason ? ` (${c.reject_reason})` : '');
+  }
+}
+
+// ---------- finalize outcome ----------
+export interface FinalizeOutcome {
+  status: ClaimStatus | 'unknown';
+  reason?: string;
+  text: string;
+}
+
+/** NEP-297 events in tx logs (EVENT_JSON:{...}); malformed lines are skipped. */
+export function parseEvents(logs: string[]): { event: string; data: any }[] {
+  const out: { event: string; data: any }[] = [];
+  for (const l of logs) {
+    if (!l.startsWith('EVENT_JSON:')) continue;
+    try {
+      const e = JSON.parse(l.slice('EVENT_JSON:'.length));
+      if (e && typeof e.event === 'string') out.push({ event: e.event, data: e.data });
+    } catch {
+      /* not an event */
+    }
+  }
+  return out;
+}
+
+/** What finalize did, from its tx logs (payout_failed > claim_rejected > claim_paid), else from the claim after the tx. */
+export function finalizeOutcome(logs: string[], after?: Claim | null): FinalizeOutcome {
+  const ev = parseEvents(logs);
+  const has = (n: string) => ev.find((e) => e.event === n);
+  const failed = has('payout_failed');
+  if (failed || after?.status === 'PayoutFailed') {
+    const amt = failed?.data?.amount;
+    return { status: 'PayoutFailed', text: `PayoutFailed: transfer to the hunter failed; ${amt ? formatNear(amt) + ' ' : ''}(payout + bond) credited back to the pool` };
+  }
+  const rej = has('claim_rejected');
+  if (rej || after?.status === 'Rejected') {
+    const reason: string = rej?.data?.reason ?? after?.reject_reason ?? '?';
+    return { status: 'Rejected', reason, text: `Rejected (${reason}); payout + bond go to the pool` };
+  }
+  const paid = has('claim_paid');
+  if (paid || after?.status === 'Paid') {
+    const amt = paid?.data?.payout ? ` ${formatNear(paid.data.payout)}${paid.data.bond ? ` + bond ${formatNear(paid.data.bond)}` : ''}` : '';
+    return { status: 'Paid', text: `Paid${amt} to the hunter` };
+  }
+  if (after) return { status: after.status, text: after.status };
+  return { status: 'unknown', text: 'unknown (no claim_paid / claim_rejected / payout_failed event in the logs)' };
+}
 
 // ---------- local pre-checks mirroring the contract ----------
 /** Mirrors submit_claim's payability checks so hunters don't burn gas on a doomed claim. */

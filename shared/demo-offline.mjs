@@ -1,12 +1,12 @@
-// Offline demo: re-verifies every fixtures/demo.*.json (no key, no network), runs the v2 dispute
-// pre-check (checkRequestAgainstProgram) against the demo program, simulates a front-run, and checks
-// the owner encrypt -> decrypt roundtrip. Exit code 1 on any failure.
+// Offline demo: re-verifies every fixtures/demo.*.json (no key, no network), runs the dispute
+// pre-check (checkRequestAgainstProgram, v3: incl. params_hash) against the demo program, simulates
+// a front-run, and checks the owner encrypt -> decrypt roundtrip. Exit code 1 on any failure.
 import { readFileSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
   verifyFixture, systemPromptHash, SYSTEM_PROMPT, DEFAULT_MODEL,
-  buildCodeBundle, codeHash, checkRequestAgainstProgram,
+  buildCodeBundle, codeHash, checkRequestAgainstProgram, paramsHash,
   encryptForOwner, decryptAsOwner, generateOwnerKeypair,
 } from './judge.mjs';
 import { DEMO_TARGET, DEMO_HUNTER, DEMO_FRONTRUNNER } from './demo-data.mjs';
@@ -33,8 +33,9 @@ if (!bundleOk) fail++;
 // Demo program as the contract stores it (Program view, snake_case).
 const program = {
   repo_url: DEMO_TARGET.repoUrl, commit: DEMO_TARGET.commit, model_id: DEFAULT_MODEL,
-  system_prompt_hash: systemPromptHash(), code_hash: bundleHash,
+  system_prompt_hash: systemPromptHash(), code_hash: bundleHash, params_hash: paramsHash(),
 };
+console.log(`params sha256        ${program.params_hash}  (canonical request params, v3 #1)`);
 // Expected dispute outcome per fixture: null = dispute fails ("request matches program").
 const EXPECT_DISPUTE = { fakecode: 'code mismatch' };
 

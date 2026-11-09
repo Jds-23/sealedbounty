@@ -128,7 +128,7 @@ Each issue is fixed with TDD on its own branch: a RED test commit (proves the bu
 
 ## #1 params pinning
 - `params_hash` = sha256hex(canonical JSON of `{chat_template_kwargs, max_tokens, response_format, temperature}`). Canonical = recursively sorted object keys, no whitespace, standard JSON escapes. JS: `canonicalJson(v)` in shared/judge.mjs. Rust: `serde_json::Value` (BTreeMap → sorted); assert `preserve_order` is NOT enabled.
-- The dispute request must parse with `deny_unknown_fields`: top-level keys exactly `model, messages, response_format, chat_template_kwargs, temperature, max_tokens`, and each message exactly `{role, content}`. Any parse failure → `"system prompt tampered"` (as in v2).
+- The dispute request must parse with `deny_unknown_fields`: top-level keys exactly `model, messages, response_format, chat_template_kwargs, temperature, max_tokens`, and each message exactly `{role, content}`. A basic parse failure (invalid JSON, wrong types, missing `model`/`messages`, a duplicated top-level `model`/`messages` key) → `"system prompt tampered"` (as in v2). A shape failure under the strict parse (an extra or missing top-level key, an extra message field, a duplicate key in a nested value or a duplicated params key) → `"params tampered"`. (Accepted deviation from the original v3 draft, merged with #1.)
 - Reason order: prompt → model → **`"params tampered"`** → code → hunter → report.
 
 ## #2 decryption challenge
@@ -146,4 +146,4 @@ Each issue is fixed with TDD on its own branch: a RED test commit (proves the bu
 - `submit_claim` requires `attached >= storage_cost + program.bond` (else panic `"insufficient bond"`); stores `claim.bond`. On Paid → transfer `payout + bond` to the hunter. On any Rejected → the bond is added to `program.balance`.
 - Dedupe key is per program: `format!("{program_id}:{req_hash}")`. Releasing the hash on `hunter mismatch` uses the same key.
 - `claims_by_program: LookupMap<u64, Vector<u64>>`. `list_claims` paginates over it (no full scan). The views stay the same shape.
-- `finalize` returns `Promise::transfer(...).then(on_payout(claim_id))`. On failure → status `"PayoutFailed"`, and `payout + bond` is credited back to `program.balance`.
+- `finalize` returns `PromiseOrValue<()>`: on Paid, `Promise::transfer(payout + bond).then(on_payout(claim_id))` (10 Tgas, `#[private]`); on a rejection (`"signer revoked"`, `"undecryptable report"`) `Value(())`, no transfer, payout + bond to `program.balance`. On failure → status `"PayoutFailed"`, and `payout + bond` is credited back to `program.balance`.

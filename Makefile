@@ -5,7 +5,7 @@
 CONTRACT := contracts/sealed-bounty
 NODE_DIRS := shared cli web $(CONTRACT)/tests/fixtures
 # v2 escrow (code_hash + hunter binding). v1 history: escrow.baldingsucks7993.testnet (`make live-v1`).
-ESCROW ?= sealedbounty-v2.testnet
+ESCROW ?= sealedbounty-v3.testnet
 # The CLI and web already default to https://test.rpc.fastnear.com; set RPC=... only to override it.
 RPC ?=
 SB_ENV := ESCROW_CONTRACT_ID=$(ESCROW) $(if $(RPC),NEAR_RPC_URL=$(RPC))

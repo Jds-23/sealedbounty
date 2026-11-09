@@ -8,7 +8,7 @@ loadEnv();
 const program = new Command()
   .name('sealedbounty')
   .description('SealedBounty CLI: TEE-judged, encrypted bug bounties on NEAR')
-  .option('--contract <id>', 'escrow contract id (default $ESCROW_CONTRACT_ID or sealedbounty-v2.testnet)')
+  .option('--contract <id>', 'escrow contract id (default $ESCROW_CONTRACT_ID or sealedbounty-v3.testnet)')
   .hook('preAction', (cmd) => {
     const contract = cmd.opts().contract;
     if (contract) process.env.ESCROW_CONTRACT_ID = contract;
@@ -48,6 +48,9 @@ program
   .requiredOption('--fund <NEAR>', 'initial pool (attached deposit; a 0.05 NEAR storage allowance is added)')
   .option('--dispute-secs <n>', 'dispute window in seconds', '86400')
   .option('--min-confidence <n>', 'minimum judge confidence 0-100', '70')
+  .option('--bond <NEAR>', 'hunter bond per claim (returned on Paid, forfeited on Rejected)', '0.05')
+  .option('--challenge-secs <n>', 'seconds the hunter has to prove_ciphertext after flag-undecryptable', '600')
+  .option('--signers <list...>', 'program signers (comma/space separated); default: contract snapshots every allowlisted signer for the model')
   .option('--code <file>', 'published code bundle file (e.g. fixtures/vuln-app/bundle.txt); code_hash = sha256(file)')
   .option('--code-files <paths...>', 'build the bundle from these files/globs (relative to --code-root) and write <code-root>/bundle.txt')
   .option('--code-root <dir>', 'base dir for --code-files; bundle paths are relative to it', '.')
@@ -79,7 +82,7 @@ program
 
 program
   .command('submit')
-  .description('Judge a report on NEAR AI (TEE), verify it locally, encrypt it to the program owner and submit_claim')
+  .description('Judge a report on NEAR AI (TEE), verify it locally, encrypt it to the program owner and submit_claim (attaches storage + program.bond; saves the ephemeral secret to ~/.sealedbounty/hunter-<contract>-<claim>.json)')
   .requiredOption('--program <id>', 'program id')
   .option('--code <file>', "the program's code bundle (bundle.txt); must hash to program.code_hash")
   .option('--report <file>', 'exploit report file')
@@ -89,14 +92,14 @@ program
   .option('--account <id>', 'hunter account = submit_claim signer, bound into the request (default $NEAR_TESTNET_ACCOUNT_ID)')
   .option('--dry-run', 'print verdict + args, do not send (with --fixture: no network at all; checks against the demo program)')
   .option('--full', 'print args without eliding long strings')
-  .option('--force', 'send even if local pre-checks fail (code/request mismatch, payability)')
+  .option('--force', 'send even if local pre-checks fail (code/params/request mismatch, payability, signer)')
   .action(run((o) => c.cmdSubmit(o)));
 
 program
   .command('inbox')
   .description('Program owner: decrypt every claim, check sha256(body) == req_hash and the request against the program (prompt, model, code, hunter, report)')
   .requiredOption('--program <id>', 'program id')
-  .option('--status <s>', 'only Pending | Rejected | Paid')
+  .option('--status <s>', 'only Pending | Challenged | Rejected | Paid | PayoutFailed')
   .action(run((o) => c.cmdInbox(o)));
 
 program
@@ -110,11 +113,48 @@ program
 
 program
   .command('finalize')
-  .description('Pay out a Pending claim after its dispute window (anyone can call)')
+  .description('Settle a claim (anyone): pays a Pending claim after its window, rejects a revoked signer or an expired challenge; prints Paid / Rejected / PayoutFailed')
   .requiredOption('--claim <id>', 'claim id')
   .option('--account <id>', 'caller account (default $NEAR_TESTNET_ACCOUNT_ID)')
   .option('--dry-run', 'print args, do not send')
+  .option('--force', 'send even if the claim does not look finalizable')
   .action(run((o) => c.cmdFinalize(o)));
+
+program
+  .command('flag-undecryptable')
+  .description('Program owner: challenge a Pending claim whose ciphertext does not decrypt to req_hash (hunter must prove_ciphertext within challenge_secs)')
+  .requiredOption('--claim <id>', 'claim id')
+  .option('--account <id>', 'owner account (default $NEAR_TESTNET_ACCOUNT_ID)')
+  .option('--dry-run', 'print checks + args, do not send')
+  .option('--force', 'send even if the local checks fail')
+  .action(run((o) => c.cmdFlagUndecryptable(o)));
+
+program
+  .command('prove-ciphertext')
+  .description('Hunter: answer a challenge with the saved ephemeral secret (~/.sealedbounty/hunter-<contract>-<claim>.json); --dry-run shows the local decryption check')
+  .requiredOption('--claim <id>', 'claim id')
+  .option('--account <id>', 'hunter account (default $NEAR_TESTNET_ACCOUNT_ID)')
+  .option('--dry-run', 'run the local decryption check, do not send')
+  .option('--force', 'send even if the local check predicts a rejection')
+  .action(run((o) => c.cmdProveCiphertext(o)));
+
+program
+  .command('set-program-signers')
+  .description("Program owner: replace the program's signer set (e.g. after attest --register rotated signers); future claims only")
+  .requiredOption('--program <id>', 'program id')
+  .requiredOption('--signers <list...>', 'signers (comma/space separated), each allowlisted for the program model')
+  .option('--account <id>', 'owner account (default $NEAR_TESTNET_ACCOUNT_ID)')
+  .option('--dry-run', 'print checks + args, do not send')
+  .option('--force', 'send even if a signer is not allowlisted for the model')
+  .action(run((o) => c.cmdSetProgramSigners(o)));
+
+program
+  .command('revoke-signer')
+  .description('Admin: remove a signer from the allowlist and mark it revoked (its pending claims are Rejected "signer revoked" at finalize)')
+  .argument('<signer>', 'ed25519:<64 hex> | eth:0x<40 hex>')
+  .option('--account <id>', 'admin account (default $NEAR_TESTNET_ACCOUNT_ID)')
+  .option('--dry-run', 'print args, do not send')
+  .action(run((s, o) => c.cmdRevokeSigner(s, o)));
 
 program
   .command('verify-claim')

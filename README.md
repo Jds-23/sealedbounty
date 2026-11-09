@@ -285,7 +285,10 @@ is [`docs/INTERFACE.md`](./docs/INTERFACE.md) (v1, then the "v2" section, which 
 
 ## Security model and limits
 
-The model guarantees that a payout requires a response signed by an attested TEE key for the program's model. A forged
+Onchain, a payout requires a response signed by a key in the program's own signer set. That set is snapshotted at
+`create_program` from the admin's allowlist (only keys whose `model` equals the program's `model_id`), and only the
+program owner can change it (`set_program_signers`). The admin's attestation (`sb attest`) is what ties those keys to
+a TEE; the contract itself can't verify attestation. A forged
 or modified verdict fails signature verification. A replayed response fails with `already claimed` (one claim per
 `req_hash`). A swapped system prompt or model, code that isn't the published bundle, or a copied judgement submitted
 by someone other than the `HUNTER` named in it, is rejected through `dispute`. The owner can't withhold payment after
@@ -308,10 +311,14 @@ Limits:
 - Ciphertext validity isn't checked onchain. A hunter could submit garbage, so the owner can't read the report,
   although `req_hash` still binds what was judged.
 - On duplicate bugs, the first claim wins. There is no semantic deduplication across different reports.
-- **The admin is a single account** (`baldingsucks7993.testnet`), which maintains the signer allowlist. A DAO or
-  multisig would be the next step.
+- **The admin is a single account** (`baldingsucks7993.testnet`), which maintains the signer allowlist. A key the
+  admin adds later doesn't reach existing programs, so the admin can't sign fake verdicts against them. The admin
+  can still `revoke_signer` a key, which rejects that key's pending claims at `finalize` (`signer revoked`): the admin
+  can block payouts but can't steal them. `remove_signer` only stops new claims. A DAO or multisig with a timelock
+  would be the next step.
 - **Signer rotation needs a re-attest.** NEAR AI rotates signer keys when it redeploys. The admin then re-attests and
-  re-registers (`sb attest --register`). Until then, new claims fail with `signer not allowlisted`.
+  re-registers (`sb attest --register`), and each program owner adopts the new keys with `set_program_signers`. Until
+  then, new claims fail with `signer not allowlisted`.
 - **The contract accounts still hold full-access keys on testnet** (`sealedbounty-v2.testnet` and the v1 escrow),
   so their deployer could redeploy the code. Before mainnet, delete those keys (or hand upgrades to a DAO) so the
   code is locked.

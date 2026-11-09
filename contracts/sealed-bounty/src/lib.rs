@@ -1,14 +1,16 @@
 //! SealedBounty escrow: bug-bounty programs paid out on NEAR AI Cloud TEE-signed judge verdicts.
 //! Spec: docs/INTERFACE.md (binding).
 
+pub mod report_box;
 pub mod tee;
 
 use near_sdk::json_types::{Base64VecU8, U64, U128};
 use near_sdk::serde::Deserialize;
 use near_sdk::serde_json::{self, json};
-use near_sdk::store::{IterableMap, LookupSet};
+use near_sdk::store::{IterableMap, LookupMap, LookupSet, Vector};
 use near_sdk::{
-    AccountId, BorshStorageKey, NearToken, PanicOnDefault, Promise, env, near, require,
+    AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promise, PromiseError,
+    PromiseOrValue, env, near, require,
 };
 
 use tee::Severity;
@@ -16,12 +18,15 @@ pub use tee::{SigKind, Signer, Verdict};
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 const DEFAULT_LIMIT: u64 = 50;
+/// Static gas for the `on_payout` callback (reads/writes one claim + one program).
+const GAS_ON_PAYOUT: Gas = Gas::from_tgas(10);
 
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignerMeta {
     pub kind: SigKind,
-    /// Informational: which model this provider key serves (not enforced; the signed text binds the model).
+    /// Which model this key serves. v3 (#3): a program only snapshots signers whose model equals
+    /// its `model_id`; `None` matches no program.
     pub model: Option<String>,
 }
 
@@ -58,6 +63,17 @@ pub struct Program {
     pub system_prompt_hash: String,
     /// sha256hex of the canonical code bundle (64 lowercase hex). v2.
     pub code_hash: String,
+    /// sha256hex of the canonical JSON of the request params
+    /// `{chat_template_kwargs, max_tokens, response_format, temperature}`. v3 (#1).
+    pub params_hash: String,
+    /// v3 (#3): signers accepted for this program, snapshotted from the global allowlist at
+    /// creation (model-matched). Later `add_signer` calls don't affect it; the owner rotates it
+    /// with `set_program_signers`.
+    pub signers: Vec<Signer>,
+    /// Hunter stake (yocto) attached on top of storage to `submit_claim`. v3 #4.
+    pub bond: U128,
+    /// Seconds the hunter has to `prove_ciphertext` after the owner flags a claim. v3 (#2).
+    pub challenge_secs: u64,
     pub payouts: Payouts,
     pub owner_enc_pubkey: String,
     pub dispute_secs: u64,
@@ -76,6 +92,12 @@ pub enum ClaimStatus {
     Pending,
     Rejected,
     Paid,
+    /// The payout transfer failed (e.g. the hunter account was deleted); payout + bond went back
+    /// to the program balance. v3 #8.
+    PayoutFailed,
+    /// The owner flagged the ciphertext as undecryptable; the hunter must `prove_ciphertext`
+    /// before `challenge_deadline`. v3 (#2).
+    Challenged,
 }
 
 #[near(serializers = [borsh, json])]
@@ -97,6 +119,10 @@ pub struct Claim {
     pub submitted_at: U64,
     pub finalize_after: U64,
     pub reject_reason: Option<String>,
+    /// Hunter bond held by this claim: returned on Paid, forfeited to the pool on Rejected. v3 #4.
+    pub bond: U128,
+    /// Set while/after `Challenged`: the hunter must prove the ciphertext before this. v3 (#2).
+    pub challenge_deadline: Option<U64>,
 }
 
 #[near]
@@ -106,6 +132,9 @@ enum StorageKey {
     Programs,
     Claims,
     UsedReqHashes,
+    Revoked,
+    ClaimsByProgram,
+    ProgramClaims { program_id: u64 },
 }
 
 #[near(contract_state)]
@@ -115,9 +144,14 @@ pub struct Contract {
     signers: IterableMap<Signer, SignerMeta>,
     programs: IterableMap<u64, Program>,
     claims: IterableMap<u64, Claim>,
+    /// Per-program claim ids in submission order, so `list_claims` never scans other programs (#7).
+    claims_by_program: LookupMap<u64, Vector<u64>>,
+    /// Keys are `dedupe_key(program_id, req_hash)` = `"<program_id>:<req_hash>"`.
     used_req_hashes: LookupSet<String>,
     next_program_id: u64,
     next_claim_id: u64,
+    /// v3 (#6): signers revoked by the admin; their pending claims are rejected at finalize.
+    revoked: LookupSet<Signer>,
 }
 
 /// NEP-297 event: `EVENT_JSON:{"standard":"sealedbounty","version":"1.0.0","event":..,"data":[..]}`.
@@ -136,7 +170,14 @@ fn charge_storage(before: u64, attached: NearToken) -> NearToken {
     cost
 }
 
-/// Minimal shape of the canonical judge request (unknown fields ignored).
+/// `used_req_hashes` key: duplicates are per program (v3 #5), so a judgement copied into another
+/// program can't burn the hash for the real one.
+pub(crate) fn dedupe_key(program_id: u64, req_hash: &str) -> String {
+    format!("{program_id}:{req_hash}")
+}
+
+/// Lenient shape of the judge request (unknown fields ignored) for the prompt/model/code checks;
+/// the exact shape is enforced by [`StrictRequest`] at the params step.
 #[derive(Deserialize)]
 #[serde(crate = "near_sdk::serde")]
 struct JudgeRequest {
@@ -150,19 +191,157 @@ struct JudgeMessage {
     content: serde_json::Value,
 }
 
+/// Strict shape of the canonical judge request (v3 #1): exactly these top-level keys and exactly
+/// `{role, content}` per message. Values are parsed with [`NoDupValue`], so no object anywhere may
+/// repeat a key (a provider could read the first copy where we read the last).
+#[derive(Deserialize)]
+#[serde(crate = "near_sdk::serde", deny_unknown_fields)]
+struct StrictRequest {
+    #[allow(dead_code)]
+    model: NoDupValue,
+    #[allow(dead_code)]
+    messages: Vec<StrictMessage>,
+    response_format: NoDupValue,
+    chat_template_kwargs: NoDupValue,
+    temperature: NoDupValue,
+    max_tokens: NoDupValue,
+}
+#[derive(Deserialize)]
+#[serde(crate = "near_sdk::serde", deny_unknown_fields)]
+struct StrictMessage {
+    #[allow(dead_code)]
+    role: NoDupValue,
+    #[allow(dead_code)]
+    content: NoDupValue,
+}
+
+/// A `serde_json::Value` whose objects must not contain duplicate keys.
+struct NoDupValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for NoDupValue {
+    fn deserialize<D: near_sdk::serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use near_sdk::serde::de::{Error, MapAccess, SeqAccess, Visitor};
+        use serde_json::Value;
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Value;
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                f.write_str("JSON value")
+            }
+            fn visit_bool<E>(self, b: bool) -> Result<Value, E> {
+                Ok(Value::Bool(b))
+            }
+            fn visit_i64<E>(self, n: i64) -> Result<Value, E> {
+                Ok(n.into())
+            }
+            fn visit_u64<E>(self, n: u64) -> Result<Value, E> {
+                Ok(n.into())
+            }
+            fn visit_f64<E>(self, n: f64) -> Result<Value, E> {
+                Ok(n.into())
+            }
+            fn visit_str<E>(self, s: &str) -> Result<Value, E> {
+                Ok(s.into())
+            }
+            fn visit_string<E>(self, s: String) -> Result<Value, E> {
+                Ok(s.into())
+            }
+            fn visit_unit<E>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+                let mut v = Vec::new();
+                while let Some(NoDupValue(x)) = seq.next_element()? {
+                    v.push(x);
+                }
+                Ok(Value::Array(v))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+                let mut m = serde_json::Map::new();
+                while let Some(k) = map.next_key::<String>()? {
+                    if m.contains_key(&k) {
+                        return Err(A::Error::custom(format!("duplicate key {k}")));
+                    }
+                    let NoDupValue(v) = map.next_value()?;
+                    m.insert(k, v);
+                }
+                Ok(Value::Object(m))
+            }
+        }
+        d.deserialize_any(V).map(NoDupValue)
+    }
+}
+
+/// Canonical JSON (v3 #1): object keys sorted recursively (byte order), no whitespace, serde_json
+/// escapes. Sorts explicitly: near-sdk enables serde_json `preserve_order`, so `Value` maps keep
+/// insertion order and plain `to_string` would NOT be canonical.
+pub(crate) fn canonical_json(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    fn write(v: &Value, out: &mut String) {
+        match v {
+            Value::Array(a) => {
+                out.push('[');
+                for (i, x) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write(x, out);
+                }
+                out.push(']');
+            }
+            Value::Object(m) => {
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort();
+                out.push('{');
+                for (i, k) in keys.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&Value::String(k.clone()).to_string());
+                    out.push(':');
+                    write(&m[k], out);
+                }
+                out.push('}');
+            }
+            scalar => out.push_str(&scalar.to_string()),
+        }
+    }
+    let mut out = String::new();
+    write(v, &mut out);
+    out
+}
+
+/// `Some(params_hash)` if `request_body` has exactly the canonical request shape (no unknown or
+/// missing keys, no duplicate keys anywhere), else `None`.
+/// params_hash = sha256hex(canonical_json({chat_template_kwargs, max_tokens, response_format, temperature})).
+pub(crate) fn request_params_hash(request_body: &str) -> Option<String> {
+    let r = serde_json::from_str::<StrictRequest>(request_body).ok()?;
+    let params = json!({
+        "chat_template_kwargs": r.chat_template_kwargs.0,
+        "max_tokens": r.max_tokens.0,
+        "response_format": r.response_format.0,
+        "temperature": r.temperature.0,
+    });
+    Some(tee::sha256_hex(canonical_json(&params).as_bytes()))
+}
+
 pub(crate) const TAMPERED: &str = "system prompt tampered";
 pub(crate) const MODEL_MISMATCH: &str = "model mismatch";
+pub(crate) const PARAMS_TAMPERED: &str = "params tampered";
 pub(crate) const CODE_MISMATCH: &str = "code mismatch";
 pub(crate) const HUNTER_MISMATCH: &str = "hunter mismatch";
 pub(crate) const REPORT_MISSING: &str = "report missing";
+pub(crate) const SIGNER_REVOKED: &str = "signer revoked";
+pub(crate) const UNDECRYPTABLE: &str = "undecryptable report";
 
 /// `None` if the revealed request matches the program and the claim's hunter, else the FIRST
-/// failing reject reason (INTERFACE.md v2 order):
+/// failing reject reason (INTERFACE.md v3 order):
 /// 1. system prompt tampered (also: not JSON, or more than 3 messages)
 /// 2. model mismatch
-/// 3. code mismatch (messages[1] role/TARGET line/CODE framing/code hash)
-/// 4. hunter mismatch (only the HUNTER line differs from `hunter`)
-/// 5. report missing
+/// 3. params tampered (not exactly the canonical keys, duplicate keys, or params hash != params_hash)
+/// 4. code mismatch (messages[1] role/TARGET line/CODE framing/code hash)
+/// 5. hunter mismatch (only the HUNTER line differs from `hunter`)
+/// 6. report missing
 fn tamper_reason(
     program: &Program,
     hunter: &AccountId,
@@ -184,6 +363,9 @@ fn tamper_reason(
     }
     if req.model != program.model_id {
         return Some(MODEL_MISMATCH);
+    }
+    if request_params_hash(request_body).as_deref() != Some(program.params_hash.as_str()) {
+        return Some(PARAMS_TAMPERED);
     }
     if let Err(r) = code_check(program, hunter, req.messages.get(1)) {
         return Some(r);
@@ -238,9 +420,11 @@ impl Contract {
             signers: IterableMap::new(StorageKey::Signers),
             programs: IterableMap::new(StorageKey::Programs),
             claims: IterableMap::new(StorageKey::Claims),
+            claims_by_program: LookupMap::new(StorageKey::ClaimsByProgram),
             used_req_hashes: LookupSet::new(StorageKey::UsedReqHashes),
             next_program_id: 0,
             next_claim_id: 0,
+            revoked: LookupSet::new(StorageKey::Revoked),
         }
     }
 
@@ -281,6 +465,53 @@ impl Contract {
         removed
     }
 
+    /// v3 (#6): admin only. Removes `signer` from the allowlist AND marks it revoked: its pending
+    /// claims are rejected at finalize ("signer revoked"). The admin can block payouts this way
+    /// but can't redirect them. Returns true if it was newly revoked.
+    pub fn revoke_signer(&mut self, signer: Signer) -> bool {
+        self.assert_owner();
+        self.signers.remove(&signer);
+        let newly = self.revoked.insert(signer.clone());
+        if newly {
+            emit("signer_revoked", json!({"signer": signer}));
+        }
+        newly
+    }
+
+    pub fn is_signer_revoked(&self, signer: Signer) -> bool {
+        self.revoked.contains(&signer)
+    }
+
+    /// `requested` None → every allowlisted signer whose `meta.model == model_id`. Some(list) →
+    /// each entry must be allowlisted with that model ("signer not allowlisted"); duplicates are
+    /// dropped. Panics "no signers for model" if the result is empty.
+    fn program_signers(&self, model_id: &str, requested: Option<Vec<Signer>>) -> Vec<Signer> {
+        let matches = |m: &SignerMeta| m.model.as_deref() == Some(model_id);
+        let out: Vec<Signer> = match requested {
+            None => self
+                .signers
+                .iter()
+                .filter(|(_, m)| matches(m))
+                .map(|(s, _)| s.clone())
+                .collect(),
+            Some(list) => {
+                let mut out: Vec<Signer> = Vec::with_capacity(list.len());
+                for s in list {
+                    require!(
+                        self.signers.get(&s).is_some_and(matches),
+                        "signer not allowlisted"
+                    );
+                    if !out.contains(&s) {
+                        out.push(s);
+                    }
+                }
+                out
+            }
+        };
+        require!(!out.is_empty(), "no signers for model");
+        out
+    }
+
     pub fn get_signers(&self) -> Vec<(Signer, SignerMeta)> {
         self.signers
             .iter()
@@ -305,20 +536,31 @@ impl Contract {
         model_id: String,
         system_prompt_hash: String,
         code_hash: String,
+        params_hash: String,
         payouts: Payouts,
         owner_enc_pubkey: String,
         dispute_secs: u64,
         min_confidence: u8,
+        bond: U128,
+        challenge_secs: u64,
+        signers: Option<Vec<Signer>>,
     ) -> u64 {
         let system_prompt_hash = tee::normalize_hash_hex(&system_prompt_hash)
             .unwrap_or_else(|_| env::panic_str("system_prompt_hash must be 64 hex chars"));
         let code_hash = tee::normalize_hash_hex(&code_hash)
             .unwrap_or_else(|_| env::panic_str("code_hash must be 64 hex chars"));
+        let params_hash = tee::normalize_hash_hex(&params_hash)
+            .unwrap_or_else(|_| env::panic_str("params_hash must be 64 hex chars"));
         require!(min_confidence <= 100, "min_confidence must be <= 100");
         require!(
             dispute_secs.checked_mul(NANOS_PER_SEC).is_some(),
             "dispute_secs too large"
         );
+        require!(
+            challenge_secs.checked_mul(NANOS_PER_SEC).is_some(),
+            "challenge_secs too large"
+        );
+        let signers = self.program_signers(&model_id, signers);
 
         let before = env::storage_usage();
         let attached = env::attached_deposit();
@@ -336,6 +578,10 @@ impl Contract {
                 model_id: model_id.clone(),
                 system_prompt_hash,
                 code_hash,
+                params_hash,
+                signers,
+                bond,
+                challenge_secs,
                 payouts,
                 owner_enc_pubkey,
                 dispute_secs,
@@ -356,6 +602,35 @@ impl Contract {
             json!({"program_id": id, "owner": owner, "model_id": model_id, "balance": U128(balance)}),
         );
         id
+    }
+
+    /// v3 (#3): program owner only. Replaces the program's signer set (e.g. after re-attesting
+    /// with `sb attest`); same subset rule as `create_program`. Affects future submissions only.
+    /// Payable for any storage growth; unused deposit is refunded.
+    #[payable]
+    pub fn set_program_signers(&mut self, program_id: u64, signers: Vec<Signer>) {
+        let p = self
+            .programs
+            .get(&program_id)
+            .unwrap_or_else(|| env::panic_str("program not found"));
+        Self::assert_program_owner(p);
+        let model_id = p.model_id.clone();
+        let signers = self.program_signers(&model_id, Some(signers));
+        let before = env::storage_usage();
+        let attached = env::attached_deposit();
+        self.program_mut(program_id).signers = signers.clone();
+        self.programs.flush();
+        let cost = charge_storage(before, attached);
+        let refund = attached.saturating_sub(cost);
+        if !refund.is_zero() {
+            Promise::new(env::predecessor_account_id())
+                .transfer(refund)
+                .detach();
+        }
+        emit(
+            "program_signers_set",
+            json!({"program_id": program_id, "signers": signers}),
+        );
     }
 
     /// Payable. Adds the attached deposit to the program's unreserved balance.
@@ -394,7 +669,7 @@ impl Contract {
 
     // ---------------- claims ----------------
 
-    /// Payable for storage; unused deposit is refunded to the caller.
+    /// Payable: storage + `program.bond` (else "insufficient bond"); the rest is refunded.
     #[payable]
     #[allow(clippy::too_many_arguments)]
     pub fn submit_claim(
@@ -415,6 +690,8 @@ impl Contract {
             .unwrap_or_else(|| env::panic_str("program not found"));
         require!(program.open, "program closed");
 
+        // v3 (#3): the signer must be in the program's own set (and still globally allowlisted).
+        require!(program.signers.contains(&signer), "signer not allowlisted");
         let meta = self
             .signers
             .get(&signer)
@@ -441,7 +718,8 @@ impl Contract {
 
         // verify_tee_signature already validated it; normalise so case variants can't replay.
         let req_hash = tee::normalize_hash_hex(&req_hash).unwrap_or_else(|e| env::panic_str(&e));
-        require!(!self.used_req_hashes.contains(&req_hash), "already claimed");
+        let key = dedupe_key(program_id, &req_hash);
+        require!(!self.used_req_hashes.contains(&key), "already claimed");
 
         let payout = program.payouts.for_severity(verdict.severity);
         require!(payout <= program.balance.0, "insufficient pool");
@@ -449,6 +727,7 @@ impl Contract {
         let now = env::block_timestamp();
         let finalize_after = now + program.dispute_secs * NANOS_PER_SEC;
         let model = program.model_id.clone();
+        let bond = program.bond.0;
 
         let p = self.program_mut(program_id);
         p.balance = U128(p.balance.0 - payout);
@@ -459,7 +738,7 @@ impl Contract {
         let hunter = env::predecessor_account_id();
         let resp_hash = tee::sha256_hex(&resp_body.0);
         let severity = verdict.severity;
-        self.used_req_hashes.insert(req_hash.clone());
+        self.used_req_hashes.insert(key);
         self.claims.insert(
             id,
             Claim {
@@ -479,13 +758,28 @@ impl Contract {
                 submitted_at: U64(now),
                 finalize_after: U64(finalize_after),
                 reject_reason: None,
+                bond: U128(bond),
+                challenge_deadline: None,
             },
         );
+        let ids = self
+            .claims_by_program
+            .entry(program_id)
+            .or_insert_with(|| Vector::new(StorageKey::ProgramClaims { program_id }));
+        ids.push(id);
+        ids.flush();
+        self.claims_by_program.flush();
         self.programs.flush();
         self.claims.flush();
 
         let cost = charge_storage(before, attached);
-        let refund = attached.saturating_sub(cost);
+        require!(
+            attached.as_yoctonear() >= cost.as_yoctonear() + bond,
+            "insufficient bond"
+        );
+        let refund = attached
+            .saturating_sub(cost)
+            .saturating_sub(NearToken::from_yoctonear(bond));
         if !refund.is_zero() {
             Promise::new(hunter.clone()).transfer(refund).detach();
         }
@@ -493,7 +787,8 @@ impl Contract {
             "claim_submitted",
             json!({
                 "claim_id": id, "program_id": program_id, "hunter": hunter, "req_hash": req_hash,
-                "severity": severity, "payout": U128(payout), "finalize_after": U64(finalize_after),
+                "severity": severity, "payout": U128(payout), "bond": U128(bond),
+                "finalize_after": U64(finalize_after),
             }),
         );
         id
@@ -526,43 +821,197 @@ impl Contract {
         let reason = tamper_reason(program, &claim.hunter, &request_body)
             .unwrap_or_else(|| env::panic_str("dispute invalid: request matches program"));
 
-        let (program_id, payout) = (claim.program_id, claim.payout.0);
-        if reason == HUNTER_MISMATCH {
-            let req_hash = claim.req_hash.clone();
-            self.used_req_hashes.remove(&req_hash);
-        }
-        let c = self.claims.get_mut(&claim_id).unwrap();
+        self.reject_claim(claim_id, reason);
+    }
+
+    /// Reject a Pending/Challenged claim: its payout and the hunter's bond (#4) go to the program
+    /// balance. On "hunter mismatch" (front-run) the req_hash is released so the real hunter can resubmit.
+    fn reject_claim(&mut self, claim_id: u64, reason: &str) {
+        let c = self.claims.get_mut(&claim_id).expect("claim exists");
         c.status = ClaimStatus::Rejected;
         c.reject_reason = Some(reason.to_string());
+        let (program_id, payout, bond) = (c.program_id, c.payout.0, c.bond.0);
+        if reason == HUNTER_MISMATCH {
+            let key = dedupe_key(program_id, &c.req_hash);
+            self.used_req_hashes.remove(&key);
+        }
         let p = self.program_mut(program_id);
         p.reserved = U128(p.reserved.0 - payout);
-        p.balance = U128(p.balance.0 + payout);
+        // Payout back to the pool; the hunter's bond (#4) is forfeited to it too.
+        p.balance = U128(p.balance.0 + payout + bond);
         emit(
             "claim_rejected",
             json!({"claim_id": claim_id, "program_id": program_id, "reason": reason}),
         );
     }
 
-    /// Anyone, once the dispute window has passed. Pays the hunter.
-    pub fn finalize(&mut self, claim_id: u64) -> Promise {
+    /// Program owner only, while the claim is Pending and the dispute window is open: the
+    /// ciphertext does not decrypt to the judged request, so the owner cannot dispute. The claim
+    /// becomes Challenged; the hunter has `challenge_secs` to `prove_ciphertext`, else
+    /// `finalize` rejects it ("undecryptable report").
+    pub fn flag_undecryptable(&mut self, claim_id: u64) {
+        let claim = self
+            .claims
+            .get(&claim_id)
+            .unwrap_or_else(|| env::panic_str("claim not found"));
+        let program = self
+            .programs
+            .get(&claim.program_id)
+            .expect("program exists");
+        Self::assert_program_owner(program);
+        require!(claim.status == ClaimStatus::Pending, "claim not pending");
+        let now = env::block_timestamp();
+        require!(now < claim.finalize_after.0, "dispute window closed");
+        let deadline = now + program.challenge_secs * NANOS_PER_SEC;
+        let program_id = claim.program_id;
+        let c = self.claims.get_mut(&claim_id).unwrap();
+        c.status = ClaimStatus::Challenged;
+        c.challenge_deadline = Some(U64(deadline));
+        emit(
+            "claim_challenged",
+            json!({"claim_id": claim_id, "program_id": program_id, "challenge_deadline": U64(deadline)}),
+        );
+    }
+
+    /// Claim hunter only, while Challenged and before `challenge_deadline`. Reveals the nacl-box
+    /// ephemeral secret (64 hex) so anyone can decrypt the report. If the ciphertext does not
+    /// open to the body hashed as `req_hash` (wrong secret, junk, wrong owner key) → Rejected
+    /// "undecryptable report". Otherwise the now-public body goes through the full dispute
+    /// checks: a failing reason → Rejected with it; all pass → back to Pending, finalizable now.
+    pub fn prove_ciphertext(&mut self, claim_id: u64, ephemeral_secret: String) {
+        let claim = self
+            .claims
+            .get(&claim_id)
+            .unwrap_or_else(|| env::panic_str("claim not found"));
+        require!(
+            env::predecessor_account_id() == claim.hunter,
+            "claim hunter only"
+        );
+        require!(
+            claim.status == ClaimStatus::Challenged,
+            "claim not challenged"
+        );
+        let now = env::block_timestamp();
+        require!(
+            claim.challenge_deadline.is_some_and(|d| now < d.0),
+            "challenge closed"
+        );
+        let secret: [u8; 32] = hex::decode(&ephemeral_secret)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .unwrap_or_else(|| env::panic_str("ephemeral_secret must be 64 hex chars"));
+        let program = self
+            .programs
+            .get(&claim.program_id)
+            .expect("program exists");
+
+        let reason = match Self::open_report(program, claim, secret) {
+            None => Some(UNDECRYPTABLE),
+            Some(body) => tamper_reason(program, &claim.hunter, &body),
+        };
+        match reason {
+            Some(r) => self.reject_claim(claim_id, r),
+            None => {
+                let program_id = claim.program_id;
+                let c = self.claims.get_mut(&claim_id).unwrap();
+                c.status = ClaimStatus::Pending;
+                c.finalize_after = U64(now);
+                emit(
+                    "claim_proven",
+                    json!({"claim_id": claim_id, "program_id": program_id, "finalize_after": U64(now)}),
+                );
+            }
+        }
+    }
+
+    /// The request body, if `claim.ciphertext` opens with the ephemeral `secret` for the
+    /// program's owner key and hashes to `claim.req_hash`.
+    fn open_report(program: &Program, claim: &Claim, secret: [u8; 32]) -> Option<String> {
+        use near_sdk::base64::Engine as _;
+        let b64 = near_sdk::base64::engine::general_purpose::STANDARD;
+        let ct = b64.decode(&claim.ciphertext).ok()?;
+        let owner_pub: [u8; 32] = b64
+            .decode(&program.owner_enc_pubkey)
+            .ok()?
+            .try_into()
+            .ok()?;
+        let plain = report_box::open_with_ephemeral(&ct, owner_pub, secret).ok()?;
+        if tee::sha256_hex(&plain) != claim.req_hash {
+            return None;
+        }
+        String::from_utf8(plain).ok()
+    }
+
+    /// Anyone, once the dispute window has passed. Pays the hunter `payout + bond`, then
+    /// `on_payout` credits it back to the program if the transfer failed. Rejects the claim with
+    /// "signer revoked" if its signer was revoked meanwhile (#6), or, on a Challenged claim whose
+    /// hunter did not prove the ciphertext by the deadline, "undecryptable report" (#2). Every
+    /// rejection forfeits the bond to the pool (#4).
+    pub fn finalize(&mut self, claim_id: u64) -> PromiseOrValue<()> {
         let c = self
             .claims
             .get_mut(&claim_id)
             .unwrap_or_else(|| env::panic_str("claim not found"));
+        if c.status == ClaimStatus::Challenged {
+            require!(
+                c.challenge_deadline
+                    .is_some_and(|d| env::block_timestamp() >= d.0),
+                "challenge open"
+            );
+            self.reject_claim(claim_id, UNDECRYPTABLE);
+            return PromiseOrValue::Value(());
+        }
         require!(c.status == ClaimStatus::Pending, "claim not pending");
         require!(
             env::block_timestamp() >= c.finalize_after.0,
             "dispute window open"
         );
+        if self.revoked.contains(&c.signer) {
+            self.reject_claim(claim_id, SIGNER_REVOKED);
+            return PromiseOrValue::Value(());
+        }
         c.status = ClaimStatus::Paid;
-        let (program_id, payout, hunter) = (c.program_id, c.payout.0, c.hunter.clone());
+        let (program_id, payout, bond, hunter) =
+            (c.program_id, c.payout.0, c.bond.0, c.hunter.clone());
         let p = self.program_mut(program_id);
         p.reserved = U128(p.reserved.0 - payout);
         emit(
             "claim_paid",
-            json!({"claim_id": claim_id, "program_id": program_id, "hunter": hunter, "payout": U128(payout)}),
+            json!({"claim_id": claim_id, "program_id": program_id, "hunter": hunter, "payout": U128(payout), "bond": U128(bond)}),
         );
-        Promise::new(hunter).transfer(NearToken::from_yoctonear(payout))
+        Promise::new(hunter)
+            .transfer(NearToken::from_yoctonear(payout + bond))
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_ON_PAYOUT)
+                    .on_payout(claim_id),
+            )
+            .into()
+    }
+
+    /// Callback of `finalize`'s transfer. On failure the transfer was refunded to this contract:
+    /// mark the claim PayoutFailed and credit payout + bond back to the program balance, so the
+    /// funds are not stranded. Returns whether the payout succeeded.
+    #[private]
+    pub fn on_payout(&mut self, claim_id: u64) -> bool {
+        // A transfer has no return data; any non-empty result is still a success.
+        if !matches!(env::promise_result_checked(0, 0), Err(PromiseError::Failed)) {
+            return true;
+        }
+        let c = self
+            .claims
+            .get_mut(&claim_id)
+            .unwrap_or_else(|| env::panic_str("claim not found"));
+        require!(c.status == ClaimStatus::Paid, "claim not paid");
+        c.status = ClaimStatus::PayoutFailed;
+        let (program_id, amount, hunter) = (c.program_id, c.payout.0 + c.bond.0, c.hunter.clone());
+        let p = self.program_mut(program_id);
+        p.balance = U128(p.balance.0 + amount);
+        emit(
+            "payout_failed",
+            json!({"claim_id": claim_id, "program_id": program_id, "hunter": hunter, "amount": U128(amount)}),
+        );
+        false
     }
 
     // ---------------- views ----------------
@@ -585,19 +1034,23 @@ impl Contract {
         self.claims.get(&id).cloned()
     }
 
-    /// Claims of `program_id`, skipping the first `from_index` of them, up to `limit` (default 50).
+    /// Claims of `program_id` in submission order, skipping the first `from_index` of them, up to
+    /// `limit` (default 50). Paginates the per-program index: cost is O(page), not O(all claims).
     pub fn list_claims(
         &self,
         program_id: u64,
         from_index: Option<u64>,
         limit: Option<u64>,
     ) -> Vec<Claim> {
-        self.claims
-            .values()
-            .filter(|c| c.program_id == program_id)
-            .skip(from_index.unwrap_or(0) as usize)
-            .take(limit.unwrap_or(DEFAULT_LIMIT) as usize)
-            .cloned()
+        let Some(ids) = self.claims_by_program.get(&program_id) else {
+            return vec![];
+        };
+        let len = u64::from(ids.len());
+        let from = from_index.unwrap_or(0).min(len);
+        let end = from.saturating_add(limit.unwrap_or(DEFAULT_LIMIT)).min(len);
+        (from..end)
+            .filter_map(|i| ids.get(i as u32))
+            .filter_map(|id| self.claims.get(id).cloned())
             .collect()
     }
 

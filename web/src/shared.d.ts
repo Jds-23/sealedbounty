@@ -12,15 +12,36 @@ declare module '@sealedbounty/shared' {
   export function decryptAsOwner(ciphertextB64: string, ownerSecretB64: string): string;
   export function generateOwnerKeypair(): { publicKey: string; secretKey: string };
   // v2: code bundle + hunter binding
-  export type DisputeReason = 'system prompt tampered' | 'model mismatch' | 'code mismatch' | 'hunter mismatch' | 'report missing';
+  export type DisputeReason =
+    | 'system prompt tampered'
+    | 'model mismatch'
+    | 'params tampered'
+    | 'code mismatch'
+    | 'hunter mismatch'
+    | 'report missing';
   export function buildCodeBundle(files: { path: string; content: string }[]): string;
   export function codeHash(bundle: string): string;
   export function codeMessagePrefix(p: { repoUrl: string; commit: string; hunter: string }): string;
   export function checkRequestAgainstProgram(
     requestBody: string,
-    program: { repo_url: string; commit: string; model_id: string; system_prompt_hash: string; code_hash: string },
+    program: { repo_url: string; commit: string; model_id: string; system_prompt_hash: string; code_hash: string; params_hash?: string | null },
     hunter: string,
   ): { ok: true; reason: null } | { ok: false; reason: DisputeReason };
+  // v3 #1 params pinning, #2 decryption challenge
+  export interface JudgeParams {
+    response_format?: unknown;
+    chat_template_kwargs?: unknown;
+    temperature?: unknown;
+    max_tokens?: unknown;
+  }
+  export function canonicalJson(v: unknown): string;
+  export const JUDGE_PARAMS: Readonly<Required<JudgeParams>>;
+  export function paramsHash(req?: JudgeParams): string;
+  export function encryptForOwnerWithSecret(
+    requestBody: string,
+    ownerPubB64: string,
+    opts?: { ephemeralSecret?: Uint8Array; nonce?: Uint8Array },
+  ): { ciphertext: string; ephemeralSecretHex: string };
 }
 
 declare module '@sealedbounty/shared/demo-data.mjs' {

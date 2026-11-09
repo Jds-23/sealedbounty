@@ -18,9 +18,19 @@ export interface JudgeInputs {
   report: string;
 }
 
-export type DisputeReason = 'system prompt tampered' | 'model mismatch' | 'code mismatch' | 'hunter mismatch' | 'report missing';
+export type DisputeReason =
+  | 'system prompt tampered'
+  | 'model mismatch'
+  | 'params tampered'
+  | 'code mismatch'
+  | 'hunter mismatch'
+  | 'report missing';
 export type RequestCheck = { ok: true; reason: null } | { ok: false; reason: DisputeReason };
-export type ProgramBinding = Pick<Program, 'repo_url' | 'commit' | 'model_id' | 'system_prompt_hash' | 'code_hash'>;
+/** v3: params_hash is pinned. A program without it (v2 contract) skips the params step, as the v2 contract does. */
+export type ProgramBinding = Pick<Program, 'repo_url' | 'commit' | 'model_id' | 'system_prompt_hash' | 'code_hash'> & {
+  params_hash?: string;
+};
+export type JudgeParams = { chat_template_kwargs?: unknown; max_tokens?: unknown; response_format?: unknown; temperature?: unknown };
 
 export interface FixtureVerification {
   ok: boolean;
@@ -38,7 +48,11 @@ export interface SharedJudge {
   buildCodeBundle(files: { path: string; content: string }[]): string;
   codeHash(bundle: string): string;
   codeMessagePrefix(p: { repoUrl: string; commit: string; hunter: string }): string;
-  /** Mirrors the v2 contract's dispute checks (first failing reason, contract order). */
+  /** v3 #1: object keys sorted recursively (utf8 byte order), no whitespace. */
+  canonicalJson(v: unknown): string;
+  /** v3 #1: sha256hex(canonicalJson({chat_template_kwargs, max_tokens, response_format, temperature})); default = the canonical params. */
+  paramsHash(req?: JudgeParams): string;
+  /** Mirrors the v3 contract's dispute checks (first failing reason, contract order: prompt, model, params, code, hunter, report). */
   checkRequestAgainstProgram(requestBody: string, program: ProgramBinding, hunter: string): RequestCheck;
   parseVerdict(responseBody: string | Uint8Array): Verdict;
   verifySig(s: { text: string; signature: string; signing_address: string; signing_algo: 'ed25519' | 'ecdsa' }): boolean;
@@ -49,6 +63,8 @@ export interface SharedJudge {
   ): Promise<JudgeRecord & { verdict: Verdict; signer: string }>;
   verifyFixture(obj: JudgeRecord, opts?: { systemPromptHash?: string; codeBundle?: string; codeHash?: string }): FixtureVerification;
   encryptForOwner(requestBody: string, ownerPubB64: string): string;
+  /** v3 #2: also returns the ephemeral x25519 secret (64 hex) the hunter needs for prove_ciphertext. */
+  encryptForOwnerWithSecret(requestBody: string, ownerPubB64: string): { ciphertext: string; ephemeralSecretHex: string };
   decryptAsOwner(ciphertextB64: string, ownerSecretB64: string): string;
   generateOwnerKeypair(): { publicKey: string; secretKey: string };
 }
