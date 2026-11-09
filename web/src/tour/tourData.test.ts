@@ -81,9 +81,14 @@ describe('gauntlet recompute from snapshot data', () => {
     const claim = d.claims.find((c) => c.id === 3)!;
     expect(claim.hunter).toBe('frontrun.baldingsucks7993.testnet');
     const txs = claimTxs(d.txs, claim);
-    expect(txs.dispute!.args!.request_body).toContain('HUNTER hunter.baldingsucks7993.testnet\n');
-    // the honest hunter's own submit of the same req_hash panicked "already claimed"
-    expect(txs.attempts.some((a) => /already claimed/.test(a.failure ?? ''))).toBe(true);
+    expect(JSON.parse(txs.dispute!.args!.request_body).messages[1].content).toContain('\nHUNTER hunter.baldingsucks7993.testnet\n');
+    expect(txs.attempts).toEqual([]);
+  });
+
+  it('a replayed submit of claim #1 (same req_hash) panicked "already claimed"', () => {
+    // 6FHmjCg6…: README lists it under the front-run row, but its args carry claim #1's req_hash.
+    const txs = claimTxs(d.txs, d.claims.find((c) => c.id === 1)!);
+    expect(txs.attempts.map((a) => [a.hash.slice(0, 8), /already claimed/.test(a.failure ?? '')])).toEqual([['6FHmjCg6', true]]);
   });
 
   it('#4: flagged, never proved, deadline passed', () => {

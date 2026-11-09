@@ -37,6 +37,8 @@ declare module '@sealedbounty/shared' {
   export function canonicalJson(v: unknown): string;
   export const JUDGE_PARAMS: Readonly<Required<JudgeParams>>;
   export function paramsHash(req?: JudgeParams): string;
+  /** The contract's params hash of a request body (exact number tokens); null if the body is not a strict judge request. */
+  export function requestParamsHash(requestBody: string, opts?: { strictNumbers?: boolean }): string | null;
   export function encryptForOwnerWithSecret(
     requestBody: string,
     ownerPubB64: string,
