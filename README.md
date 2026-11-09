@@ -24,6 +24,7 @@ automatically, with the exact command to run.
 Tracks: `privacy`, `security`, `agents`.
 
 - **Repo:** https://github.com/Jds-23/sealedbounty
+- **Live demo:** https://jds-23.github.io/sealedbounty/#/tour
 - **Demo video / X post:** TODO(user): demo video / X post link
 - **Live contract:** [`sealedbounty-v3.testnet`](https://testnet.nearblocks.io/address/sealedbounty-v3.testnet), program 1
 - **Other projects:** This is the team's only hackathon project.
