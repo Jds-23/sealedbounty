@@ -17,7 +17,8 @@ Demo mode (v3 cases program: params tampered, junk ciphertext challenged then re
 ```bash
 pnpm install
 pnpm dev            # http://localhost:5173
-pnpm test           # vitest (129 tests): signature verify, decrypt, v2/v3 request checks, v3 fields, recorded live view shapes, payout-tx links
+pnpm test           # vitest (147 tests): signature verify, decrypt, v2/v3 request checks, v3 fields, recorded live view shapes, payout-tx links, tour data layer
+pnpm record-tour-snapshot  # re-record src/fixtures/tour-v3-snapshot.json (read-only RPC + nearblocks; the tour's offline fallback)
 pnpm build          # tsc + vite build -> dist/ (static, base './', hash routing)
 pnpm sync-fixtures  # re-copy ../fixtures into src/fixtures and derive the v3 demo cases offline (no NEAR AI calls)
 ```
@@ -35,7 +36,8 @@ Auto mode uses live data when the contract has at least one program. If RPC fail
 
 ## Pages
 
-- **Programs** (`#/`): name, repo@commit, pool balance/reserved, payout table, model, code_hash (v2+), bond (v3), open/closed.
+- **Guided tour** (`#/tour/1` … `#/tour/8`; `#/` redirects here): the 8-step keyless demo (docs/demo-app-spec.md). Live testnet with a per-datum fallback to `src/fixtures/tour-v3-snapshot.json` (`LIVE ●` / `SNAPSHOT <date>` badge). `?autoplay=1` plays a ~2 min timeline (`src/tour/autoplay.ts`; Space pause, Esc exit); `&live=1` also fires the local `demo-helper` lanes when `localhost:8787/health` answers. Setting `VITE_NEAR_RPC` makes the tour use only that RPC, so a bad URL exercises the snapshot fallback.
+- **Programs** (`#/programs`): name, repo@commit, pool balance/reserved, payout table, model, code_hash (v2+), bond (v3), open/closed.
 - **Program detail** (`#/program/:id`): the program's `code_hash` (copyable) with a link to the code bundle (`fixtures/vuln-app`; in demo mode the bundled `bundle.txt` is re-hashed in the browser), `params_hash`, the program's signer set, the bond and the challenge window, then the claims timeline. Pending claims show a live dispute countdown, Challenged claims a countdown to the `prove_ciphertext` deadline, Rejected claims their reason, and Paid claims the payout and the returned bond. Each claim has a **Verified** panel:
   - ✓ (checked in the browser): the signed model equals the program model; the ed25519 (tweetnacl) or secp256k1 EIP-191 (ethers) signature over `model:req_hash:resp_hash`; the signer is in `program.signers` (v3) and in the contract's `get_signers` with a matching kind, and not revoked (`is_signer_revoked`); the TDX quote `report_data` = signer ‖ nonce (parsed from the bundled quote); and, in demo mode only, that the response body hashes to `resp_hash` and contains the verdict.
   - ◷ (checked offline): the Intel DCAP and NVIDIA NRAS verdicts from the `attest` tool, labelled with the attestation date. The certificate chains are not re-run in the browser.

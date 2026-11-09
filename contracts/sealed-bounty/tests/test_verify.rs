@@ -102,6 +102,20 @@ async fn verify_tee_response_on_sandbox() -> testresult::TestResult<()> {
         }
     };
 
+    // --- free view call (the guided tour's "Ask the contract") ---
+    // verify_tee_response must be callable through RPC `call_function` as a view: no gas, no signer.
+    // Views on NEAR prohibit env::used_gas() and other runtime-context host fns.
+    for (label, f) in [("ed25519", &ed), ("ecdsa", &ec)] {
+        let v: near_api::Data<Verdict> = contract
+            .call_function("verify_tee_response", f.args())
+            .read_only()
+            .fetch_from(&net)
+            .await
+            .unwrap_or_else(|e| panic!("view verify_tee_response ({label}) failed: {e:?}"));
+        println!("[OK] view verify_tee_response {label}: verdict = {:?}", v.data);
+        assert!(v.data.valid, "{label}: view verdict should be valid");
+    }
+
     // --- success paths ---
     for (label, args) in [
         ("ed25519/provider_tee", ed.args()),

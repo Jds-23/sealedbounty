@@ -1,0 +1,15 @@
+{
+  "name": "sealedbounty-demo-helper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-only helper for the guided demo's live lane: TEE judging + helper-signed testnet writes (reuses cli/).",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=23"
+  },
+  "scripts": {
+    "start": "node src/main.mjs",
+    "test": "node --test 'test/*.test.mjs'"
+  }
+}

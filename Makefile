@@ -20,7 +20,7 @@ RPC_URL := $(if $(RPC),$(RPC),https://test.rpc.fastnear.com)
 setup: ## pnpm install in every JS package (lockfiles are committed)
 	@for d in $(NODE_DIRS); do echo "==> pnpm install ($$d)"; (cd $$d && pnpm install --frozen-lockfile) || exit 1; done
 
-test: test-contract test-cli test-web ## all test suites
+test: test-contract test-cli test-web test-helper ## all test suites
 
 test-contract: ## unit tests + near-sandbox E2E with real TEE fixtures (first run downloads near-sandbox)
 	cd $(CONTRACT) && cargo test
@@ -30,6 +30,9 @@ test-cli:
 
 test-web:
 	cd web && pnpm test
+
+test-helper: ## demo-helper unit tests (node --test, no deps, no network)
+	cd demo-helper && pnpm test
 
 demo: ## re-verify every recorded TEE judgement offline (no key, no network)
 	cd shared && pnpm demo:offline

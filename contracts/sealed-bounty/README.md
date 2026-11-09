@@ -105,7 +105,7 @@ Challenged claim after the deadline) and `signer revoked` (from `finalize`).
 | `list_programs(from_index?, limit?)` | programs with id ≥ `from_index`, up to `limit` (default 50) |
 | `get_claim(id)` | `Option<Claim>` |
 | `list_claims(program_id, from_index?, limit?)` | claims of that program in submission order. Skips the first `from_index` and returns up to `limit` (default 50). The cost is O(page) |
-| `verify_tee_response(model, req_hash, resp_body, signature, signer, kind)` | `Verdict`. Debug method with no state change. Panics `signer not allowlisted`, `signer kind mismatch`, `bad signature`, or a verdict parse error. Logs `used_gas` |
+| `verify_tee_response(model, req_hash, resp_body, signature, signer, kind)` | `Verdict`. No state change; callable as a free RPC view (used by the guided tour's "Ask the contract"). Panics `signer not allowlisted`, `signer kind mismatch`, `bad signature`, or a verdict parse error |
 
 ## Events
 NEP-297 log `EVENT_JSON:{"standard":"sealedbounty","version":"1.0.0","event":E,"data":[{...}]}`:
