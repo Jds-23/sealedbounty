@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, it } from 'node:test';
+import { makeCliDeps } from '../src/cli.mjs';
 import { createHelperServer } from '../src/server.mjs';
-import { FAKE_API_KEY, FAKE_PRIVATE_KEY, ORIGIN, fakeChain, http, jsonHeaders, listen, makeJudgement, parseSse, sha256hex } from './helpers.mjs';
+import { FAKE_API_KEY, FAKE_PRIVATE_KEY, ORIGIN, fakeChain, http, jsonHeaders, judgementFor, listen, makeJudgement, parseSse, sha256hex } from './helpers.mjs';
 
 const baseConfig = {
   programId: 2,

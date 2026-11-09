@@ -32,6 +32,18 @@ export function makeJudgement(over = {}) {
   };
 }
 
+/** Deterministic mock judge output (like the real TEE at temperature 0): same report -> same req_hash. */
+export function judgementFor(report) {
+  const request_body = JSON.stringify({
+    model: 'Qwen/Qwen3.8-27B',
+    messages: [
+      { role: 'system', content: 'judge' },
+      { role: 'user', content: `TARGET x@y\nHUNTER hunter.baldingsucks7993.testnet\n\nCODE\n...\n\nREPORT\n${report}` },
+    ],
+  });
+  return makeJudgement({ request_body, req_hash: sha256hex(request_body) });
+}
+
 /** Plain node:http request (fetch can't be trusted to send an Origin header verbatim). */
 export function http(base, { method = 'GET', path = '/', headers = {}, body } = {}) {
   const u = new URL(path, base);
