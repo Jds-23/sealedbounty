@@ -2,7 +2,6 @@
 // Failures show inline in red mono; the recorded program-1 result above stays visible.
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { getClaim } from '../lib/near';
-import { claimStatusInfo } from '../lib/status';
 import { countdown, nsToMs } from '../lib/format';
 import type { Claim } from '../lib/types';
 import { streamHelper, type HelperEvent } from './helper';
@@ -119,7 +118,6 @@ export function StreamView({ st, labels }: { st: StreamState; labels: Record<str
           {claim.reject_reason ? ` "${claim.reject_reason}"` : ''}
           {claim.status === 'Pending' && ` · ${countdown(nsToMs(claim.finalize_after) - now)}`}
           {claim.status === 'Challenged' && claim.challenge_deadline && ` · ${countdown(nsToMs(claim.challenge_deadline) - now, 'challenge')}`}
-          <span className="muted"> · {claimStatusInfo(claim, now).headline}</span>
         </div>
       )}
       {st.outcome && <div className={`stream-out ${/reject/i.test(st.outcome) ? 'stream-out-bad' : ''}`}>outcome: {st.outcome}</div>}
