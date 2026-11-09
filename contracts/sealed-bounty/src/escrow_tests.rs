@@ -1153,3 +1153,133 @@ fn dispute_after_resubmission_panics() {
     ctx(owner(), 0, T0);
     c.dispute(real, body);
 }
+
+// ---------------- v3 #1: params pinning ----------------
+
+/// Hunter-tampered variants of the honest v2 request: prompt, model, CODE, HUNTER and REPORT are
+/// all correct, only the sampling/decoding params or the request shape differ.
+fn params_tampered_bodies() -> Vec<(&'static str, String)> {
+    let ok = v2_req(hunter().as_str());
+    let mut forced = ok.clone();
+    forced["response_format"]["json_schema"]["schema"] = json!({
+        "type": "object",
+        "properties": {
+            "valid": {"type": "boolean", "const": true},
+            "severity": {"type": "string", "enum": ["critical"]},
+            "cwe": {"type": ["string", "null"]},
+            "confidence": {"type": "integer", "const": 100},
+        },
+        "required": ["valid", "severity", "cwe", "confidence"],
+        "additionalProperties": false,
+    });
+    let mut temp = ok.clone();
+    temp["temperature"] = json!(1.5);
+    let mut tokens = ok.clone();
+    tokens["max_tokens"] = json!(4000);
+    let mut kwargs = ok.clone();
+    kwargs["chat_template_kwargs"]["chat_template"] = json!("{{ 'valid' }}");
+    let mut extra = ok.clone();
+    extra["logit_bias"] = json!({"1234": 100});
+    let mut missing = ok.clone();
+    missing.as_object_mut().unwrap().remove("response_format");
+    let mut extra_msg = ok.clone();
+    extra_msg["messages"][2]["name"] = json!("x");
+    let s = ok.to_string();
+    let dup_top = s.replacen(
+        "\"temperature\":0",
+        "\"temperature\":1.5,\"temperature\":0",
+        1,
+    );
+    let dup_nested = s.replacen(
+        "\"type\":\"json_schema\"",
+        "\"type\":\"text\",\"type\":\"json_schema\"",
+        1,
+    );
+    assert!(dup_top != s && dup_nested != s);
+    vec![
+        ("response_format forces valid:true", forced.to_string()),
+        ("temperature 1.5", temp.to_string()),
+        ("max_tokens 4000", tokens.to_string()),
+        ("chat_template_kwargs extra key", kwargs.to_string()),
+        ("extra top-level key logit_bias", extra.to_string()),
+        ("missing response_format", missing.to_string()),
+        ("extra message field", extra_msg.to_string()),
+        ("duplicate top-level key", dup_top),
+        ("duplicate nested key", dup_nested),
+    ]
+}
+
+fn panic_msg(e: &(dyn std::any::Any + Send)) -> String {
+    e.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+/// Issue #1 exploit: the TEE honestly signs a verdict for a request with forced/resampled params.
+/// The owner's dispute must reject it ("params tampered"), not panic "request matches program".
+#[test]
+fn dispute_params_tampered_rejects() {
+    let mut failures = vec![];
+    for (name, body) in params_tampered_bodies() {
+        let (mut c, pid) = v2_program();
+        let bal = c.get_program(pid).unwrap().balance.0;
+        let cid = submit_v2(&mut c, hunter(), pid, &body);
+        ctx(owner(), 0, T0 + NANOS_PER_SEC);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.dispute(cid, body.clone())
+        }));
+        if let Err(e) = r {
+            failures.push(format!("{name}: dispute panicked {:?}", panic_msg(&*e)));
+            continue;
+        }
+        let cl = c.get_claim(cid).unwrap();
+        if cl.reject_reason.as_deref() != Some("params tampered") {
+            failures.push(format!("{name}: got {:?}", cl.reject_reason));
+            continue;
+        }
+        assert_eq!(cl.status, ClaimStatus::Rejected);
+        let p = c.get_program(pid).unwrap();
+        assert_eq!((p.balance.0, p.reserved.0), (bal, 0), "{name}: funds back");
+        assert_eq!(events()[0]["data"][0]["reason"], "params tampered");
+    }
+    assert!(
+        failures.is_empty(),
+        "tampered params accepted:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Reason order (v3): prompt -> model -> params -> code -> hunter -> report.
+#[test]
+fn tamper_reasons_params_order() {
+    let (c, pid) = v2_program();
+    let p = c.get_program(pid).unwrap();
+    let h = hunter();
+    let mut bad = v2_req(h.as_str());
+    bad["temperature"] = json!(1.5);
+    let reason = |v: &Value| tamper_reason(&p, &h, &v.to_string());
+    assert_eq!(reason(&bad), Some("params tampered"));
+    let mut m = bad.clone();
+    m["model"] = "openai/gpt-oss-120b".into();
+    assert_eq!(reason(&m), Some(MODEL_MISMATCH));
+    let pr = with_msg(bad.clone(), 0, "content", "lenient".into());
+    assert_eq!(reason(&pr), Some(TAMPERED));
+    let code = with_msg(
+        bad.clone(),
+        1,
+        "content",
+        user1(h.as_str(), &format!("{REPO}@{COMMIT}"), "fake\n"),
+    );
+    assert_eq!(reason(&code), Some("params tampered"));
+    // the front-runner check still comes after params
+    assert_eq!(
+        tamper_reason(&p, &stranger(), &bad.to_string()),
+        Some("params tampered")
+    );
+    // a duplicated `model` key is a parse failure, as in v2
+    let dup_model = v2_req(h.as_str())
+        .to_string()
+        .replacen("\"model\":", "\"model\":\"x\",\"model\":", 1);
+    assert_eq!(tamper_reason(&p, &h, &dup_model), Some(TAMPERED));
+}
