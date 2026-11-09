@@ -1,0 +1,223 @@
+{
+  "_source": "Recorded read-only 2026-11-09 from sealedbounty-v3.testnet. nearblocks: api-testnet.nearblocks.io/v3 accounts/{c}/txns and txns/{hash}; rpc: test.rpc.fastnear.com method tx. Claim 0 finalize emitted claim_paid; claim 4 finalize succeeded but emitted claim_rejected (undecryptable report). A29oj... is a failed finalize.",
+  "nearblocks": {
+    "list": {
+      "data": [
+        {
+          "transaction_hash": "2Cfo4ueWH6udU8oKw7jAYnJxmYSGAGYvBFszCdcwwvCt",
+          "signer_account_id": "baldingsucks7993.testnet",
+          "receiver_account_id": "sealedbounty-v3.testnet",
+          "outcomes": {
+            "status": true
+          },
+          "actions": [
+            {
+              "action": "FUNCTION_CALL",
+              "method": "finalize"
+            }
+          ]
+        },
+        {
+          "transaction_hash": "A29ojHgJLsL3as9QJFq6W1vrkhGzFF7Ui8334JqUx7Mh",
+          "signer_account_id": "baldingsucks7993.testnet",
+          "receiver_account_id": "sealedbounty-v3.testnet",
+          "outcomes": {
+            "status": false
+          },
+          "actions": [
+            {
+              "action": "FUNCTION_CALL",
+              "method": "finalize"
+            }
+          ]
+        },
+        {
+          "transaction_hash": "ATvCo4xULdHdpGBJp1NErtptgB9RjrgGHNrBUaUic6Kz",
+          "signer_account_id": "baldingsucks7993.testnet",
+          "receiver_account_id": "sealedbounty-v3.testnet",
+          "outcomes": {
+            "status": true
+          },
+          "actions": [
+            {
+              "action": "FUNCTION_CALL",
+              "method": "finalize"
+            }
+          ]
+        }
+      ]
+    },
+    "txns": {
+      "2Cfo4ueWH6udU8oKw7jAYnJxmYSGAGYvBFszCdcwwvCt": {
+        "data": {
+          "transaction_hash": "2Cfo4ueWH6udU8oKw7jAYnJxmYSGAGYvBFszCdcwwvCt",
+          "outcomes": {
+            "status": true
+          },
+          "actions": [
+            {
+              "method": "finalize",
+              "args": {
+                "args_json": {
+                  "claim_id": 4
+                }
+              }
+            }
+          ]
+        }
+      },
+      "ATvCo4xULdHdpGBJp1NErtptgB9RjrgGHNrBUaUic6Kz": {
+        "data": {
+          "transaction_hash": "ATvCo4xULdHdpGBJp1NErtptgB9RjrgGHNrBUaUic6Kz",
+          "outcomes": {
+            "status": true
+          },
+          "actions": [
+            {
+              "method": "finalize",
+              "args": {
+                "args_json": {
+                  "claim_id": 0
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "rpc_tx": {
+    "2Cfo4ueWH6udU8oKw7jAYnJxmYSGAGYvBFszCdcwwvCt": {
+      "result": {
+        "status": {
+          "SuccessValue": "bnVsbA=="
+        },
+        "transaction": {
+          "hash": "2Cfo4ueWH6udU8oKw7jAYnJxmYSGAGYvBFszCdcwwvCt",
+          "signer_id": "baldingsucks7993.testnet",
+          "receiver_id": "sealedbounty-v3.testnet",
+          "actions": [
+            {
+              "FunctionCall": {
+                "args": "eyJjbGFpbV9pZCI6NH0=",
+                "deposit": "0",
+                "gas": 80000000000000,
+                "method_name": "finalize"
+              }
+            }
+          ]
+        },
+        "receipts_outcome": [
+          {
+            "id": "6CNdt2WroVFxYTstkNYBcky5619WRso2R48VpshkKWHC",
+            "outcome": {
+              "executor_id": "sealedbounty-v3.testnet",
+              "logs": [
+                "EVENT_JSON:{\"standard\":\"sealedbounty\",\"version\":\"1.0.0\",\"event\":\"claim_rejected\",\"data\":[{\"claim_id\":4,\"program_id\":1,\"reason\":\"undecryptable report\"}]}"
+              ],
+              "status": {
+                "SuccessValue": "bnVsbA=="
+              }
+            }
+          },
+          {
+            "id": "A7oEVJkrJN3oyhMaArVEdpM3x2Xh44UjS1dgDHrEYSWG",
+            "outcome": {
+              "executor_id": "baldingsucks7993.testnet",
+              "logs": [],
+              "status": {
+                "SuccessValue": ""
+              }
+            }
+          }
+        ]
+      }
+    },
+    "ATvCo4xULdHdpGBJp1NErtptgB9RjrgGHNrBUaUic6Kz": {
+      "result": {
+        "status": {
+          "SuccessValue": "dHJ1ZQ=="
+        },
+        "transaction": {
+          "hash": "ATvCo4xULdHdpGBJp1NErtptgB9RjrgGHNrBUaUic6Kz",
+          "signer_id": "baldingsucks7993.testnet",
+          "receiver_id": "sealedbounty-v3.testnet",
+          "actions": [
+            {
+              "FunctionCall": {
+                "args": "eyJjbGFpbV9pZCI6MH0=",
+                "deposit": "0",
+                "gas": 80000000000000,
+                "method_name": "finalize"
+              }
+            }
+          ]
+        },
+        "receipts_outcome": [
+          {
+            "id": "4V3q3ydt6HNonEfrZvPv3eGkkGtycwmJF516vK9QkGhg",
+            "outcome": {
+              "executor_id": "sealedbounty-v3.testnet",
+              "logs": [
+                "EVENT_JSON:{\"standard\":\"sealedbounty\",\"version\":\"1.0.0\",\"event\":\"claim_paid\",\"data\":[{\"claim_id\":0,\"program_id\":1,\"hunter\":\"hunter.baldingsucks7993.testnet\",\"payout\":\"300000000000000000000000\",\"bond\":\"50000000000000000000000\"}]}"
+              ],
+              "status": {
+                "SuccessReceiptId": "CF1V3gE6Yqxjvw1jXJFXaRURb3juqmCgKAxybHgK6bt1"
+              }
+            }
+          },
+          {
+            "id": "4arWe3E6dXG9Ssktx4LQ4qW1CoFYGE2THz1sLUMFPoAL",
+            "outcome": {
+              "executor_id": "hunter.baldingsucks7993.testnet",
+              "logs": [],
+              "status": {
+                "SuccessValue": ""
+              }
+            }
+          },
+          {
+            "id": "95hDCfB7PDCAiry93LpW8KJaUhjU2YybRxmi8n3kaT7F",
+            "outcome": {
+              "executor_id": "baldingsucks7993.testnet",
+              "logs": [],
+              "status": {
+                "SuccessValue": ""
+              }
+            }
+          },
+          {
+            "id": "CF1V3gE6Yqxjvw1jXJFXaRURb3juqmCgKAxybHgK6bt1",
+            "outcome": {
+              "executor_id": "sealedbounty-v3.testnet",
+              "logs": [],
+              "status": {
+                "SuccessValue": "dHJ1ZQ=="
+              }
+            }
+          },
+          {
+            "id": "36uEjaizR4bZmtiLJqtneSaBfCmXvHfVAbLZPRpBSdD9",
+            "outcome": {
+              "executor_id": "baldingsucks7993.testnet",
+              "logs": [],
+              "status": {
+                "SuccessValue": ""
+              }
+            }
+          },
+          {
+            "id": "9a89vCddoZzACcvVoLw36s8ThvTAaWZfViegY6KmxAes",
+            "outcome": {
+              "executor_id": "baldingsucks7993.testnet",
+              "logs": [],
+              "status": {
+                "SuccessValue": ""
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
