@@ -523,7 +523,10 @@ fn dispute_v1_body_is_code_mismatch() {
     assert_eq!(cl.reject_reason.as_deref(), Some("code mismatch"));
     assert_eq!(c.get_program(pid).unwrap().reserved.0, 0);
     // Not a hunter mismatch: req_hash stays used.
-    assert!(c.used_req_hashes.contains(&f.s("req_hash")));
+    assert!(
+        c.used_req_hashes
+            .contains(&dedupe_key(pid, &f.s("req_hash")))
+    );
 }
 
 #[test]
@@ -1092,7 +1095,7 @@ fn dispute_v2_rejects_each_reason() {
         assert_eq!((p.balance.0, p.reserved.0), (bal, 0));
         assert_eq!(events()[0]["data"][0]["reason"], want);
         assert!(
-            c.used_req_hashes.contains(&cl.req_hash),
+            c.used_req_hashes.contains(&dedupe_key(pid, &cl.req_hash)),
             "{want}: hash stays used"
         );
         // and it cannot be resubmitted
@@ -1127,7 +1130,7 @@ fn dispute_hunter_mismatch_releases_req_hash() {
     assert_eq!(cl.status, ClaimStatus::Rejected);
     assert_eq!(cl.reject_reason.as_deref(), Some("hunter mismatch"));
     assert!(
-        !c.used_req_hashes.contains(&cl.req_hash),
+        !c.used_req_hashes.contains(&dedupe_key(pid, &cl.req_hash)),
         "req_hash released"
     );
     let p = c.get_program(pid).unwrap();
@@ -1141,7 +1144,7 @@ fn dispute_hunter_mismatch_releases_req_hash() {
         (hunter(), ClaimStatus::Pending)
     );
     assert_eq!(rc.req_hash, cl.req_hash);
-    assert!(c.used_req_hashes.contains(&rc.req_hash));
+    assert!(c.used_req_hashes.contains(&dedupe_key(pid, &rc.req_hash)));
 
     // The honest claim can't be disputed and gets paid.
     ctx(owner(), 0, T0 + 2 * NANOS_PER_SEC);

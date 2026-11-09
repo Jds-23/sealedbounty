@@ -119,6 +119,7 @@ pub struct Contract {
     signers: IterableMap<Signer, SignerMeta>,
     programs: IterableMap<u64, Program>,
     claims: IterableMap<u64, Claim>,
+    /// Keys are `dedupe_key(program_id, req_hash)` = `"<program_id>:<req_hash>"`.
     used_req_hashes: LookupSet<String>,
     next_program_id: u64,
     next_claim_id: u64,
@@ -138,6 +139,12 @@ fn charge_storage(before: u64, attached: NearToken) -> NearToken {
     let cost = env::storage_byte_cost().saturating_mul(used as u128);
     require!(attached >= cost, "insufficient storage deposit");
     cost
+}
+
+/// `used_req_hashes` key: duplicates are per program (v3 #5), so a judgement copied into another
+/// program can't burn the hash for the real one.
+pub(crate) fn dedupe_key(program_id: u64, req_hash: &str) -> String {
+    format!("{program_id}:{req_hash}")
 }
 
 /// Minimal shape of the canonical judge request (unknown fields ignored).
@@ -447,7 +454,8 @@ impl Contract {
 
         // verify_tee_signature already validated it; normalise so case variants can't replay.
         let req_hash = tee::normalize_hash_hex(&req_hash).unwrap_or_else(|e| env::panic_str(&e));
-        require!(!self.used_req_hashes.contains(&req_hash), "already claimed");
+        let key = dedupe_key(program_id, &req_hash);
+        require!(!self.used_req_hashes.contains(&key), "already claimed");
 
         let payout = program.payouts.for_severity(verdict.severity);
         require!(payout <= program.balance.0, "insufficient pool");
@@ -466,7 +474,7 @@ impl Contract {
         let hunter = env::predecessor_account_id();
         let resp_hash = tee::sha256_hex(&resp_body.0);
         let severity = verdict.severity;
-        self.used_req_hashes.insert(req_hash.clone());
+        self.used_req_hashes.insert(key);
         self.claims.insert(
             id,
             Claim {
@@ -543,8 +551,8 @@ impl Contract {
 
         let (program_id, payout, bond) = (claim.program_id, claim.payout.0, claim.bond.0);
         if reason == HUNTER_MISMATCH {
-            let req_hash = claim.req_hash.clone();
-            self.used_req_hashes.remove(&req_hash);
+            let key = dedupe_key(program_id, &claim.req_hash);
+            self.used_req_hashes.remove(&key);
         }
         let c = self.claims.get_mut(&claim_id).unwrap();
         c.status = ClaimStatus::Rejected;

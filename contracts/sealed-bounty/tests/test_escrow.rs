@@ -621,13 +621,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
 
     // ---- front-running: stranger copies the hunter's signed sqli claim ----
     let front: u64 = e
-        .ok(
-            &c,
-            &e.stranger,
-            "submit_claim",
-            sqli.claim_args(pid),
-            dep,
-        )
+        .ok(&c, &e.stranger, "submit_claim", sqli.claim_args(pid), dep)
         .await
         .json()?;
     e.fail(
@@ -650,18 +644,16 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
     assert_eq!(claim["reject_reason"], "hunter mismatch");
     assert_eq!(u128_of(&claim["bond"]), BOND);
     let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
-    assert_eq!(u128_of(&p["balance"]), bal0 + BOND, "front-runner's bond forfeited");
+    assert_eq!(
+        u128_of(&p["balance"]),
+        bal0 + BOND,
+        "front-runner's bond forfeited"
+    );
     assert_eq!(u128_of(&p["reserved"]), 0);
 
     // ---- real hunter resubmits the same signed verdict ----
     let cid: u64 = e
-        .ok(
-            &c,
-            &e.hunter,
-            "submit_claim",
-            sqli.claim_args(pid),
-            dep,
-        )
+        .ok(&c, &e.hunter, "submit_claim", sqli.claim_args(pid), dep)
         .await
         .json()?;
     let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
@@ -692,13 +684,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
     // ---- fakecode: TEE judged invented code valid/critical; owner proves code mismatch ----
     assert_eq!(fake.0["verdict"]["severity"], "critical");
     let fid: u64 = e
-        .ok(
-            &c,
-            &e.hunter,
-            "submit_claim",
-            fake.claim_args(pid),
-            dep,
-        )
+        .ok(&c, &e.hunter, "submit_claim", fake.claim_args(pid), dep)
         .await
         .json()?;
     let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
