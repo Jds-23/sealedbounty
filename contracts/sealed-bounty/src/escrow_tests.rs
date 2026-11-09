@@ -1259,3 +1259,86 @@ fn bond_json_shape() {
     let cl = serde_json::to_value(c.get_claim(cid).unwrap()).unwrap();
     assert_eq!(cl["bond"], BOND.to_string());
 }
+
+// ---------------- v3 #7: list_claims per-program index ----------------
+
+/// Contract with v2 programs 0 and 1, and `n` claims on program 1 (distinct reports).
+fn claims_on_program_1(n: usize) -> Contract {
+    let mut c = setup();
+    assert_eq!(create_v2(&mut c), 0);
+    assert_eq!(create_v2(&mut c), 1);
+    ctx(owner(), 5 * NEAR * n as u128, T0);
+    c.fund_program(1);
+    for i in 0..n {
+        let body = with_msg(
+            v2_req(hunter().as_str()),
+            2,
+            "content",
+            format!("REPORT\nfinding #{i}").into(),
+        );
+        submit_v2(&mut c, hunter(), 1, &body.to_string());
+    }
+    c
+}
+
+/// Gas of a fresh `list_claims` call: state is written out and read back so no collection cache
+/// hides the storage reads a real view call pays for.
+fn list_claims_gas(
+    c: Contract,
+    program_id: u64,
+    from: Option<u64>,
+    limit: Option<u64>,
+) -> (u64, Vec<Claim>) {
+    env::state_write(&c);
+    drop(c); // flushes collections
+    ctx(stranger(), 0, T0);
+    let c: Contract = env::state_read().unwrap();
+    let before = env::used_gas().as_gas();
+    let out = c.list_claims(program_id, from, limit);
+    (env::used_gas().as_gas() - before, out)
+}
+
+/// `list_claims_gas` over `claims_on_program_1(n)`, on its own thread so each run gets a fresh
+/// mocked blockchain (testing_env! keeps storage across calls within a thread).
+fn measure(n: usize, program_id: u64, from: Option<u64>, limit: Option<u64>) -> (u64, Vec<Claim>) {
+    std::thread::spawn(move || list_claims_gas(claims_on_program_1(n), program_id, from, limit))
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn list_claims_does_not_scan_other_programs() {
+    let (small, empty) = measure(2, 0, None, None);
+    let (big, empty2) = measure(30, 0, None, None);
+    assert!(empty.is_empty() && empty2.is_empty());
+    assert_eq!(
+        small, big,
+        "list_claims(0) gas must not grow with program 1's claims: 2 claims -> {small}, 30 -> {big}"
+    );
+}
+
+#[test]
+fn list_claims_late_page_costs_like_first_page() {
+    let (first, a) = measure(30, 1, None, Some(1));
+    let (late, b) = measure(30, 1, Some(29), Some(1));
+    assert_eq!((a.len(), b.len()), (1, 1));
+    assert_eq!((a[0].id, b[0].id), (0, 29));
+    assert_eq!(
+        first, late,
+        "page cost must not depend on from_index: first {first}, from 29 -> {late}"
+    );
+}
+
+#[test]
+fn list_claims_pagination_order() {
+    let mut c = claims_on_program_1(5);
+    submit(&mut c, 0, &Fx::load(LIVE_EC)); // program 0 is v2; live sig still verifies
+    let ids = |v: Vec<Claim>| v.into_iter().map(|c| c.id).collect::<Vec<_>>();
+    assert_eq!(ids(c.list_claims(1, None, None)), vec![0, 1, 2, 3, 4]);
+    assert_eq!(ids(c.list_claims(1, Some(1), Some(2))), vec![1, 2]);
+    assert_eq!(ids(c.list_claims(1, Some(4), Some(9))), vec![4]);
+    assert!(c.list_claims(1, Some(5), None).is_empty());
+    assert!(c.list_claims(1, Some(u64::MAX), None).is_empty());
+    assert_eq!(ids(c.list_claims(0, None, None)), vec![5]);
+    assert!(c.list_claims(7, None, None).is_empty());
+}
