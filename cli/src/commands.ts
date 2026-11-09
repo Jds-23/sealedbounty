@@ -9,6 +9,8 @@ import {
   claimStatusLabel,
   createProgramArgs,
   DISPUTE_INVALID_PANIC,
+  checkRequestForProgram,
+  disputeRules,
   codeHashRow,
   disputeArgs,
   disputeOutcome,
@@ -39,6 +41,7 @@ import {
   tryLoadOwnerKey,
 } from './crypto.js';
 import { shared as api, demo, verifySignerSig, type ProgramBinding, type RequestCheck } from './shared.js';
+import type { VersionedCheck } from './args.js';
 import { callContract, getSigners, isSignerRevoked, listClaims, listPrograms, loadAccount, mustGetClaim, mustGetProgram } from './near.js';
 import type { CheckRow, Claim, JudgeRecord, Program } from './types.js';
 import { formatNear, nearToYocto, nsToIso, printChecks, printKv, printTable, short } from './util.js';
@@ -371,7 +374,7 @@ export async function cmdSubmit(o: {
 
   // 4. request vs program (exactly what the owner's dispute checks, incl. v3 params_hash)
   const pre = submitPrecheck(record.request_body, binding, hunter, !!o.fixture);
-  printChecks(`Request vs program (v3 dispute rules, hunter ${hunter})`, [
+  printChecks(`Request vs program (${disputeRules(binding)}; hunter ${hunter})`, [
     ['checkRequestAgainstProgram', pre.check.ok, pre.check.ok ? 'ok: a dispute would fail' : pre.check.reason],
   ]);
   if (pre.warn) console.warn(`WARNING: ${pre.warn}`);
@@ -456,7 +459,9 @@ function decryptClaim(c: Claim, secret: string) {
   return { body, hashOk: api.sha256hex(body) === c.req_hash };
 }
 
-export type InboxDecrypt = { ok: true; body: string; check: RequestCheck; error?: undefined; hint?: undefined } | { ok: false; error: string; hint: string };
+export type InboxDecrypt =
+  | { ok: true; body: string; check: RequestCheck; vc: VersionedCheck; error?: undefined; hint?: undefined }
+  | { ok: false; error: string; hint: string };
 
 /** Owner-side decrypt of one claim. A ciphertext that fails to open, or opens to a body whose hash != req_hash, is UNDECRYPTABLE (v3 #2). */
 export function inboxDecrypt(c: Claim, program: ProgramBinding, ownerSecret: string): InboxDecrypt {
@@ -468,7 +473,8 @@ export function inboxDecrypt(c: Claim, program: ProgramBinding, ownerSecret: str
     return { ok: false, error: `decrypt failed: ${(e as Error).message}`, hint };
   }
   if (!d.hashOk) return { ok: false, error: 'decrypts, but sha256(body) != req_hash', hint };
-  return { ok: true, body: d.body, check: api.checkRequestAgainstProgram(d.body, program, c.hunter) };
+  const vc = checkRequestForProgram(d.body, program, c.hunter, '[owner] ');
+  return { ok: true, body: d.body, check: vc.check, vc };
 }
 
 export async function cmdInbox(o: { program: string; status?: string }) {
@@ -496,7 +502,7 @@ export async function cmdInbox(o: { program: string; status?: string }) {
     console.log('sha256(request_body) == req_hash: PASS');
     const { body, check } = d;
     if (check.ok) {
-      console.log('request vs program: OK (prompt, model, params, code bundle, hunter, report all match; a dispute would fail)');
+      console.log(`request vs program: OK (${d.vc.rules} all match; a dispute would fail)`);
     } else {
       console.log(`request vs program: MISMATCH -> ${check.reason}`);
       console.log(
@@ -506,7 +512,7 @@ export async function cmdInbox(o: { program: string; status?: string }) {
       );
     }
     const u = splitRequest(body);
-    if (u.target) {
+    if (u.target && program.code_hash != null) {
       const codeOk = api.codeHash(u.code!) === program.code_hash;
       console.log(`\n-- TARGET ${u.target}\n-- HUNTER ${u.hunter}`);
       console.log(`-- CODE ${Buffer.byteLength(u.code!)} B, sha256 ${short(api.codeHash(u.code!))} ${codeOk ? '(== program.code_hash; not shown)' : 'DIFFERS from program.code_hash:'}`);
@@ -529,10 +535,9 @@ export async function cmdDispute(o: { claim: string; account?: string; dryRun?: 
     ['sha256(decrypted body) == req_hash', hashOk, hashOk ? short(c.req_hash) : `${short(c.req_hash)} (use flag-undecryptable instead)`],
   ];
   printChecks('Dispute preconditions', rows);
-  const check = api.checkRequestAgainstProgram(body, program, c.hunter);
-  printChecks(`Request vs program (a dispute succeeds only if this FAILS; hunter ${c.hunter})`, [
-    ['checkRequestAgainstProgram', check.ok, check.ok ? 'ok' : check.reason],
-  ]);
+  const vc = checkRequestForProgram(body, program, c.hunter);
+  const { check } = vc;
+  printChecks(`Request vs program (${vc.rules}; a dispute succeeds only if this FAILS; hunter ${c.hunter})`, vc.rows);
   console.log(`\nexpected: ${disputeOutcome(check)}`);
   const args = disputeArgs(c.id, body);
   showArgs('dispute', args);
@@ -647,7 +652,7 @@ export function proveCheck(c: Claim, program: ProgramBinding & { owner_enc_pubke
     rows.push(['sha256(plaintext) == req_hash', h === c.req_hash, short(h)]);
     if (h !== c.req_hash) reason = 'undecryptable report';
     else {
-      const check = api.checkRequestAgainstProgram(body, program, c.hunter);
+      const { check } = checkRequestForProgram(body, program, c.hunter);
       rows.push(['request matches program (dispute rules)', check.ok, check.ok ? 'ok' : check.reason]);
       if (!check.ok) reason = check.reason;
     }
@@ -760,17 +765,15 @@ export async function cmdVerifyClaim(o: { claim: string }) {
   const allow = new Map(await getSigners());
   console.log(`claim ${c.id} (program ${c.program_id}, ${claimStatusLabel(c)}) verdict ${JSON.stringify(c.verdict)}`);
   const rows = await verifyClaimChecks(c, program, allow);
+  let ok = printChecks(`verify-claim ${c.id} (offline signature check from on-chain fields)`, rows);
   const key = tryLoadOwnerKey(c.program_id);
   if (key) {
     const d = inboxDecrypt(c, program, key.secretKey);
-    if (d.ok) {
-      rows.push(['[owner] sha256(decrypted body) == req_hash', true, '']);
-      rows.push(['[owner] request matches program (v3 dispute rules)', d.check.ok, d.check.ok ? 'ok' : `${d.check.reason}: dispute it`]);
-    } else {
-      rows.push(['[owner] decrypt ciphertext', false, `${d.error}; ${d.hint}`]);
-    }
+    const ownerRows: CheckRow[] = d.ok
+      ? [['[owner] sha256(decrypted body) == req_hash', true, short(c.req_hash)], ...d.vc.rows.map(([n, k, det]): CheckRow => [n, k, k ? det : `${det}: dispute it`])]
+      : [['[owner] decrypt ciphertext', false, `${d.error}; ${d.hint}`]];
+    ok = printChecks(`[owner] request vs program (${disputeRules(program)})`, ownerRows) && ok;
   }
-  const ok = printChecks(`verify-claim ${c.id} (offline signature check from on-chain fields)`, rows);
   if (!ok) process.exitCode = 1;
 }
 

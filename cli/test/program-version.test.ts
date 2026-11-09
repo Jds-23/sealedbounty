@@ -71,7 +71,7 @@ const hotBody = () => {
   r.temperature = 1.5;
   return JSON.stringify(r);
 };
-const ownerRows = () => logs.filter((l) => l.includes('[owner]'));
+const ownerRows = () => logs.filter((l) => /^\s+(PASS|FAIL)\s+\[owner\]/.test(l));
 
 beforeEach(() => {
   process.env.HOME = mkdtempSync(join(tmpdir(), 'sb-home-'));
@@ -105,6 +105,7 @@ describe('verify-claim: owner checks gated by program version (#14)', () => {
     expect(s).toMatch(/PASS\s+\[owner\] system prompt/);
     expect(s).toMatch(/PASS\s+\[owner\] model/);
     expect(s).not.toMatch(/\[owner\] (params|code|hunter|report)/);
+    expect(ownerRows().length).toBe(3); // hash + prompt + model
     expect(ownerRows().every((l) => l.includes('PASS'))).toBe(true);
     expect(process.exitCode).toBeUndefined();
   });
