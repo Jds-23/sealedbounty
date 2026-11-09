@@ -311,10 +311,26 @@ pub(crate) fn canonical_json(v: &serde_json::Value) -> String {
     out
 }
 
+/// #15 hardening, NOT DEPLOYED: `sealedbounty-v3.testnet` runs the equivalent of `false`.
+/// When true, any non-integer number in the params (a serde_json f64: `0.0`, `-0`, `1e2`, `0.5`,
+/// beyond u64/i64) makes the request "params tampered". Integer tokens are canonicalized exactly
+/// (`0` -> `0`), but f64s go through serde_json's fast, not always correctly rounded parse and its
+/// float printer (zmij in 1.0.154; ryu before, `1e16` vs `1e+16`), so a float params_hash would
+/// silently change with a serde_json upgrade or feature (`float_roundtrip`). The canonical
+/// request only has integer params. shared/judge.mjs mirrors both: `{strictNumbers: true}`.
+pub(crate) const STRICT_PARAM_NUMBERS: bool = true;
+
 /// `Some(params_hash)` if `request_body` has exactly the canonical request shape (no unknown or
-/// missing keys, no duplicate keys anywhere), else `None`.
+/// missing keys, no duplicate keys anywhere; with [`STRICT_PARAM_NUMBERS`], no non-integer number
+/// in the params), else `None`.
 /// params_hash = sha256hex(canonical_json({chat_template_kwargs, max_tokens, response_format, temperature})).
+#[cfg(test)]
 pub(crate) fn request_params_hash(request_body: &str) -> Option<String> {
+    request_params_hash_with(request_body, STRICT_PARAM_NUMBERS)
+}
+
+/// [`request_params_hash`] with an explicit number policy (`false` = deployed v3 behaviour).
+pub(crate) fn request_params_hash_with(request_body: &str, strict_numbers: bool) -> Option<String> {
     let r = serde_json::from_str::<StrictRequest>(request_body).ok()?;
     let params = json!({
         "chat_template_kwargs": r.chat_template_kwargs.0,
@@ -322,7 +338,21 @@ pub(crate) fn request_params_hash(request_body: &str) -> Option<String> {
         "response_format": r.response_format.0,
         "temperature": r.temperature.0,
     });
+    if strict_numbers && has_float(&params) {
+        return None;
+    }
     Some(tee::sha256_hex(canonical_json(&params).as_bytes()))
+}
+
+/// Whether any number in `v` is a serde_json f64 (i.e. not an exact u64/i64 integer).
+fn has_float(v: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match v {
+        Value::Number(n) => n.is_f64(),
+        Value::Array(a) => a.iter().any(has_float),
+        Value::Object(m) => m.values().any(has_float),
+        _ => false,
+    }
 }
 
 pub(crate) const TAMPERED: &str = "system prompt tampered";
@@ -347,6 +377,16 @@ fn tamper_reason(
     hunter: &AccountId,
     request_body: &str,
 ) -> Option<&'static str> {
+    tamper_reason_with(program, hunter, request_body, STRICT_PARAM_NUMBERS)
+}
+
+/// [`tamper_reason`] with an explicit params number policy (`false` = deployed v3 behaviour).
+fn tamper_reason_with(
+    program: &Program,
+    hunter: &AccountId,
+    request_body: &str,
+    strict_numbers: bool,
+) -> Option<&'static str> {
     let Ok(req) = serde_json::from_str::<JudgeRequest>(request_body) else {
         return Some(TAMPERED);
     };
@@ -364,7 +404,9 @@ fn tamper_reason(
     if req.model != program.model_id {
         return Some(MODEL_MISMATCH);
     }
-    if request_params_hash(request_body).as_deref() != Some(program.params_hash.as_str()) {
+    if request_params_hash_with(request_body, strict_numbers).as_deref()
+        != Some(program.params_hash.as_str())
+    {
         return Some(PARAMS_TAMPERED);
     }
     if let Err(r) = code_check(program, hunter, req.messages.get(1)) {
