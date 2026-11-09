@@ -38,5 +38,21 @@ for (const v of V.vectors) {
       if (!(e instanceof RangeError || e instanceof SyntaxError)) throw e;
     }
     assert.equal(canon, v.canonical_token, 'canonical_token');
+    // 4. a program that pins this body's own params hash (floats included, as deployed)
+    const verdict = (reason) => ({ ok: reason === null, reason });
+    if (v.params_hash !== null) {
+      const self = { ...V.program, params_hash: v.params_hash };
+      assert.deepEqual(judge.checkRequestAgainstProgram(body, self, V.hunter), verdict(v.self_pinned), 'self_pinned');
+      assert.deepEqual(judge.checkRequestAgainstProgram(body, self, V.hunter, { strictNumbers: true }),
+        verdict(v.self_pinned_strict), 'self_pinned_strict');
+    }
+  });
+
+  test(`contract (STRICT_PARAM_NUMBERS hardening) == JS {strictNumbers: true}: ${v.name}`, () => {
+    const body = bodyOf(v);
+    assert.ok('params_hash_strict' in v && 'tamper_reason_strict' in v, 'strict columns present');
+    assert.equal(judge.requestParamsHash(body, { strictNumbers: true }), v.params_hash_strict, 'params_hash_strict');
+    assert.deepEqual(judge.checkRequestAgainstProgram(body, V.program, V.hunter, { strictNumbers: true }),
+      { ok: v.tamper_reason_strict === null, reason: v.tamper_reason_strict }, 'tamper_reason_strict');
   });
 }
