@@ -32,10 +32,10 @@ for (const v of V.vectors) {
     assert.deepEqual(got, { ok: v.tamper_reason === null, reason: v.tamper_reason }, 'tamper_reason');
     // 2. the contract's request_params_hash (null = rejected by the strict parse)
     assert.equal(judge.requestParamsHash(body), v.params_hash, 'params_hash');
-    // 3. the canonical form of the number token on its own
+    // 3. the canonical form of the substituted token on its own (null: rejected, or not a value)
     let canon = null;
     try { canon = judge.canonicalJson(judge.parseJsonLossless(tokenOf(v))); } catch (e) {
-      if (!(e instanceof RangeError)) throw e;
+      if (!(e instanceof RangeError || e instanceof SyntaxError)) throw e;
     }
     assert.equal(canon, v.canonical_token, 'canonical_token');
   });

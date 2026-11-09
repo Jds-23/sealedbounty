@@ -131,15 +131,199 @@ const utf8Cmp = (a, b) => {
   return x.length - y.length;
 };
 
+// Numbers (#15). The deployed v3 contract parses the body with serde_json 1.0.154 (no
+// `arbitrary_precision`, no `float_roundtrip`) into `serde_json::Value` and prints it back, so a
+// number's canonical form depends on its source TOKEN, not just its value:
+//   - an integer token that fits u64 (or i64 if negative) stays an integer: `0`, `400`,
+//     `18446744073709551615`, `-9223372036854775808` (exact; JS Number would lose precision);
+//   - anything else (`.`, `e`/`E`, `-0`, out of u64/i64 range) becomes an f64, parsed with
+//     serde_json's fast (NOT always correctly rounded) algorithm and printed with zmij:
+//     `0.0`→`0.0`, `-0`→`-0.0`, `1.50`→`1.5`, `1e2`/`1E+2`→`100.0`, `1e-5`→`0.00001`,
+//     `0.000001`→`1e-6`, `1e16`→`1e+16`, `2.2250738585072011e-308`→`2.2250738585072014e-308`;
+//   - an f64 that overflows (`1e400`) is a parse error: the contract rejects the request.
+// The helpers below replay that algorithm exactly (vectors: contracts/sealed-bounty/tests/fixtures/
+// canonical-vectors.json, checked by shared/test/canonical-vectors.test.mjs).
+
+const U64_MAX = (1n << 64n) - 1n;
+const I32_MAX = 2 ** 31 - 1;
+const I32_MIN = -(2 ** 31);
+/** serde_json's POW10 table: the f64 literals 1e0..1e308. */
+const POW10 = Array.from({ length: 309 }, (_, i) => Number(`1e${i}`));
+
 /**
- * Canonical JSON (docs/INTERFACE.md v3 #1): object keys sorted recursively in utf8 byte order,
- * no whitespace, standard JSON.stringify escapes. Matches the contract's `canonical_json`.
- * Note: numbers are re-serialized by JSON.stringify, so `0.0` becomes `0` here while the contract
- * keeps `0.0` (the contract is stricter; the canonical request only has integer params).
- * @param {unknown} v JSON value
+ * A JSON number kept as its exact source token (what {@link parseJsonLossless} returns for numbers).
+ * {@link canonicalJson} prints it the way the contract does.
+ */
+export class JsonNumber {
+  /** @param {string} token a JSON number token, e.g. "0.0" */
+  constructor(token) {
+    this.token = token;
+    Object.freeze(this);
+  }
+}
+
+/**
+ * Parse a JSON number token exactly like serde_json 1.0.154 `deserialize_any` (default features).
+ * @param {string} token
+ * @returns {{u64: bigint} | {i64: bigint} | {f64: number}}
+ * @throws {RangeError} out of f64 range (serde_json "number out of range")
+ */
+function serdeParseNumber(token) {
+  const s = token;
+  let i = 0;
+  const isDigit = () => s[i] >= '0' && s[i] <= '9';
+  const bad = () => new SyntaxError(`not a JSON number: ${token}`);
+  const oor = () => new RangeError(`number out of range: ${token}`);
+  let positive = true;
+  if (s[i] === '-') { positive = false; i++; }
+
+  const fromParts = (sig, exponent) => { // f64_from_parts (not float_roundtrip)
+    let f = Number(sig); // u64 as f64: round to nearest, ties to even
+    for (;;) {
+      const idx = Math.abs(exponent);
+      if (idx < POW10.length) {
+        if (exponent >= 0) {
+          f *= POW10[idx];
+          if (!Number.isFinite(f)) throw oor();
+        } else {
+          f /= POW10[idx];
+        }
+        break;
+      }
+      if (f === 0) break;
+      if (exponent >= 0) throw oor();
+      f /= 1e308;
+      exponent += 308;
+    }
+    return positive ? f : -f;
+  };
+  const parseExponent = (sig, startingExp) => {
+    i++; // e | E
+    let positiveExp = true;
+    if (s[i] === '+') i++;
+    else if (s[i] === '-') { positiveExp = false; i++; }
+    if (!isDigit()) throw bad();
+    let exp = s.charCodeAt(i++) - 48;
+    while (isDigit()) {
+      const d = s.charCodeAt(i++) - 48;
+      if (exp * 10 + d > I32_MAX) { // parse_exponent_overflow
+        if (sig !== 0n && positiveExp) throw oor();
+        while (isDigit()) i++;
+        return positive ? 0 : -0;
+      }
+      exp = exp * 10 + d;
+    }
+    const finalExp = Math.min(I32_MAX, Math.max(I32_MIN, positiveExp ? startingExp + exp : startingExp - exp));
+    return fromParts(sig, finalExp);
+  };
+  const afterDigits = (sig, exponent) =>
+    s[i] === 'e' || s[i] === 'E' ? parseExponent(sig, exponent) : fromParts(sig, exponent);
+  const parseDecimal = (sig, expBefore) => {
+    i++; // '.'
+    let expAfter = 0;
+    while (isDigit()) {
+      const d = BigInt(s.charCodeAt(i) - 48);
+      if (sig * 10n + d > U64_MAX) { // parse_decimal_overflow: ignore all further digits
+        while (isDigit()) i++;
+        return afterDigits(sig, expBefore + expAfter);
+      }
+      i++;
+      sig = sig * 10n + d;
+      expAfter--;
+    }
+    if (expAfter === 0) throw bad();
+    return afterDigits(sig, expBefore + expAfter);
+  };
+  const parseLongInteger = (sig) => {
+    let exponent = 0;
+    while (isDigit()) { i++; exponent++; }
+    return s[i] === '.' ? parseDecimal(sig, exponent) : afterDigits(sig, exponent);
+  };
+  const parseNumber = (sig) => {
+    if (s[i] === '.') return { f64: parseDecimal(sig, 0) };
+    if (s[i] === 'e' || s[i] === 'E') return { f64: parseExponent(sig, 0) };
+    if (positive) return { u64: sig };
+    // (sig as i64).wrapping_neg() >= 0, i.e. -0 or below i64::MIN, becomes an f64
+    if (sig === 0n || sig > 1n << 63n) return { f64: -Number(sig) };
+    return { i64: -sig };
+  };
+
+  let out;
+  if (s[i] === '0') {
+    i++;
+    if (isDigit()) throw bad();
+    out = parseNumber(0n);
+  } else if (isDigit()) {
+    let sig = BigInt(s.charCodeAt(i++) - 48);
+    out = null;
+    while (isDigit()) {
+      const d = BigInt(s.charCodeAt(i) - 48);
+      if (sig * 10n + d > U64_MAX) { out = { f64: parseLongInteger(sig) }; break; }
+      i++;
+      sig = sig * 10n + d;
+    }
+    out ??= parseNumber(sig);
+  } else {
+    throw bad();
+  }
+  if (i !== s.length) throw bad();
+  return out;
+}
+
+/**
+ * Print a finite f64 like serde_json 1.0.154 (zmij 1.0.23): shortest round-trip digits, fixed
+ * notation with a mandatory fraction (`100.0`, `0.00001`) when the decimal exponent is in -5..=15,
+ * else `d[.ddd]e±x` (`1e+16`, `1e-6`, `1.5e-7`).
+ * @param {number} x
  * @returns {string}
  */
+function serdeFormatF64(x) {
+  if (x === 0) return Object.is(x, -0) ? '-0.0' : '0.0';
+  const sign = x < 0 ? '-' : '';
+  // shortest round-trip digits (same digit choice as zmij), from Number#toString
+  const m = /^(\d+)(?:\.(\d+))?(?:e([+-]\d+))?$/.exec(String(Math.abs(x)));
+  let digits = m[1] + (m[2] ?? '');
+  let exp = Number(m[3] ?? 0) + m[1].length - 1; // decimal exponent of digits[0]
+  const lead = digits.match(/^0*/)[0].length;
+  digits = digits.slice(lead).replace(/0+$/, '');
+  exp -= lead;
+  if (exp >= -5 && exp <= 15) {
+    if (digits.length - 1 <= exp) return `${sign}${digits}${'0'.repeat(exp - digits.length + 1)}.0`;
+    if (exp >= 0) return `${sign}${digits.slice(0, exp + 1)}.${digits.slice(exp + 1)}`;
+    return `${sign}0.${'0'.repeat(-exp - 1)}${digits}`;
+  }
+  const mant = digits.length > 1 ? `${digits[0]}.${digits.slice(1)}` : digits;
+  return `${sign}${mant}e${exp < 0 ? '-' : '+'}${Math.abs(exp)}`;
+}
+
+/**
+ * The contract's canonical form of a JSON number token.
+ * @param {string} token
+ * @returns {string}
+ * @throws {RangeError} if the contract would reject the token (out of f64 range)
+ */
+function canonicalNumber(token) {
+  const n = serdeParseNumber(token);
+  return 'f64' in n ? serdeFormatF64(n.f64) : String(n.u64 ?? n.i64);
+}
+
+/**
+ * Canonical JSON (docs/INTERFACE.md v3 #1): object keys sorted recursively in utf8 byte order,
+ * no whitespace, standard JSON.stringify escapes, numbers printed as the contract's
+ * `canonical_json` prints them (#15). Equal to what the contract computes for the JSON text:
+ * - {@link JsonNumber} (from {@link parseJsonLossless}): canonicalized from its exact token, so
+ *   `0.0` stays `0.0` and `0` stays `0`, as in the contract;
+ * - a plain JS number or bigint: canonicalized from its JSON.stringify token, i.e. what the
+ *   contract computes for a body built with JSON.stringify (`0` → `0`, `1.5` → `1.5`,
+ *   `1e21` → `1e+21`); a non-finite number is `null`, as JSON.stringify writes it.
+ * @param {unknown} v JSON value
+ * @returns {string}
+ * @throws {RangeError} a number token the contract rejects (e.g. `1e400`)
+ */
 export function canonicalJson(v) {
+  if (v instanceof JsonNumber) return canonicalNumber(v.token);
+  if (typeof v === 'number') return Number.isFinite(v) ? canonicalNumber(JSON.stringify(v)) : 'null';
+  if (typeof v === 'bigint') return canonicalNumber(v.toString());
   if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`;
   if (v !== null && typeof v === 'object') {
     return `{${Object.keys(v).sort(utf8Cmp).map((k) => `${JSON.stringify(k)}:${canonicalJson(v[k])}`).join(',')}}`;
@@ -162,9 +346,13 @@ const REQUEST_KEYS = ['model', 'messages', 'response_format', 'chat_template_kwa
 
 /**
  * Program.params_hash: sha256hex(canonicalJson({chat_template_kwargs, max_tokens, response_format, temperature})).
+ * To check a request body against a program use {@link requestParamsHash} (exact number tokens):
+ * `paramsHash(JSON.parse(body))` re-reads `0.0` as `0` and so differs from the contract for bodies
+ * with non-integer number tokens; `paramsHash(parseJsonLossless(body))` does not.
  * @param {{chat_template_kwargs?: unknown, max_tokens?: unknown, response_format?: unknown, temperature?: unknown}} [req]
  *   a parsed request (or just its params); defaults to the canonical JUDGE_PARAMS
  * @returns {string} 64 lowercase hex chars
+ * @throws {RangeError} a number token the contract rejects (e.g. `1e400`)
  */
 export function paramsHash(req = JUDGE_PARAMS) {
   const { chat_template_kwargs, max_tokens, response_format, temperature } = req;
@@ -172,15 +360,18 @@ export function paramsHash(req = JUDGE_PARAMS) {
 }
 
 /**
- * Paths of duplicated object keys in a JSON text (JSON.parse silently keeps the last copy; the
- * contract rejects them). Assumes `text` is valid JSON.
+ * Lossless JSON parse: like JSON.parse, but every number is a {@link JsonNumber} holding its exact
+ * source token, objects have a null prototype, and the paths of duplicated object keys are
+ * reported (the last copy wins, as in JSON.parse; the contract rejects duplicates).
  * @param {string} text
- * @returns {(string|number)[][]} e.g. [['temperature'], ['messages', 2, 'role']]
+ * @returns {{value: unknown, dups: (string|number)[][]}} dups e.g. [['temperature'], ['messages', 2, 'role']]
+ * @throws {SyntaxError} invalid JSON
  */
-function duplicateKeyPaths(text) {
+function parseLossless(text) {
+  JSON.parse(text); // validate; the scanner below assumes valid JSON
   const dups = [];
   let i = 0;
-  const ws = () => { while (/\s/.test(text[i] ?? '')) i++; };
+  const ws = () => { while (text[i] === ' ' || text[i] === '\t' || text[i] === '\n' || text[i] === '\r') i++; };
   const str = () => {
     const m = /"(?:[^"\\]|\\.)*"/y; m.lastIndex = i;
     const s = m.exec(text)[0]; i += s.length;
@@ -191,30 +382,85 @@ function duplicateKeyPaths(text) {
     const c = text[i];
     if (c === '{') {
       i++; ws();
-      const seen = new Set();
-      if (text[i] === '}') { i++; return; }
+      const obj = Object.create(null);
+      if (text[i] === '}') { i++; return obj; }
       for (;;) {
         ws(); const k = str(); ws(); i++; // ':'
-        if (seen.has(k)) dups.push([...path, k]);
-        seen.add(k);
-        value([...path, k]); ws();
-        if (text[i++] === '}') return; // else ','
+        if (Object.hasOwn(obj, k)) dups.push([...path, k]);
+        obj[k] = value([...path, k]); ws();
+        if (text[i++] === '}') return obj; // else ','
       }
     }
     if (c === '[') {
       i++; ws();
-      if (text[i] === ']') { i++; return; }
+      const arr = [];
+      if (text[i] === ']') { i++; return arr; }
       for (let n = 0; ; n++) {
-        value([...path, n]); ws();
-        if (text[i++] === ']') return;
+        arr.push(value([...path, n])); ws();
+        if (text[i++] === ']') return arr;
       }
     }
-    if (c === '"') { str(); return; }
+    if (c === '"') return str();
     const m = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null/y; m.lastIndex = i;
-    i += m.exec(text)[0].length;
+    const tok = m.exec(text)[0];
+    i += tok.length;
+    if (tok === 'true') return true;
+    if (tok === 'false') return false;
+    if (tok === 'null') return null;
+    return new JsonNumber(tok);
   };
-  value([]);
-  return dups;
+  const v = value([]);
+  return { value: v, dups };
+}
+
+/**
+ * Parse JSON keeping every number's exact token (as {@link JsonNumber}), so that
+ * `canonicalJson(parseJsonLossless(text))` is exactly the contract's canonical JSON of `text`.
+ * Objects have a null prototype. Duplicate keys: the last copy wins.
+ * @param {string} text
+ * @returns {unknown}
+ * @throws {SyntaxError} invalid JSON
+ */
+export function parseJsonLossless(text) {
+  return parseLossless(text).value;
+}
+
+/** True if any number in `v` (a parseJsonLossless value) would make the contract's parse fail. */
+const hasRejectedNumber = (v) => {
+  if (v instanceof JsonNumber) {
+    try { serdeParseNumber(v.token); return false; } catch { return true; }
+  }
+  if (v !== null && typeof v === 'object') return Object.values(v).some(hasRejectedNumber);
+  return false;
+};
+
+/** {value, dups} if `body` has exactly the canonical request shape (object form), else null. */
+function strictRequest(body) {
+  let p;
+  try { p = parseLossless(body); } catch { return null; }
+  const req = p.value;
+  const isObj = (o) => o !== null && typeof o === 'object' && !Array.isArray(o) && !(o instanceof JsonNumber);
+  if (!isObj(req) || p.dups.length) return null;
+  const keys = Object.keys(req);
+  if (keys.length !== REQUEST_KEYS.length || !REQUEST_KEYS.every((k) => Object.hasOwn(req, k))) return null;
+  const msgs = req.messages;
+  const isMsg = (m) => isObj(m) && Object.keys(m).length === 2 && Object.hasOwn(m, 'role') && Object.hasOwn(m, 'content');
+  if (!Array.isArray(msgs) || !msgs.every(isMsg)) return null;
+  if (hasRejectedNumber(req)) return null;
+  return req;
+}
+
+/**
+ * The contract's `request_params_hash(request_body)` (#15: computed from the exact number tokens of
+ * the body): the params hash if the body has exactly the canonical request shape (exactly
+ * model/messages/response_format/chat_template_kwargs/temperature/max_tokens, each message exactly
+ * {role, content}, no duplicate key anywhere, every number in f64 range), else null.
+ * @param {string} requestBody exact request body
+ * @returns {string|null} 64 lowercase hex chars, or null
+ */
+export function requestParamsHash(requestBody) {
+  const req = strictRequest(requestBody);
+  return req ? paramsHash(req) : null;
 }
 
 // ---------------------------------------------------------------- request body
@@ -293,9 +539,11 @@ export function buildRequestBodyV1({ model, repoUrl, commit, codeExcerpt, report
  */
 export function checkRequestAgainstProgram(requestBody, program, hunter) {
   const fail = (reason) => ({ ok: false, reason });
-  let req;
-  try { req = JSON.parse(requestBody); } catch { return fail('system prompt tampered'); }
-  if (req === null || typeof req !== 'object' || typeof req.model !== 'string' || !Array.isArray(req.messages)) {
+  let parsed;
+  try { parsed = parseLossless(requestBody); } catch { return fail('system prompt tampered'); }
+  const { value: req, dups } = parsed;
+  if (req === null || typeof req !== 'object' || req instanceof JsonNumber || typeof req.model !== 'string' ||
+    !Array.isArray(req.messages)) {
     return fail('system prompt tampered');
   }
   const msgs = req.messages;
@@ -303,10 +551,11 @@ export function checkRequestAgainstProgram(requestBody, program, hunter) {
   if (!msgs.every(isMsg)) return fail('system prompt tampered'); // contract: messages fail to deserialize
   // The contract's lenient serde structs reject a repeated `model`/`messages` key or a repeated
   // `role`/`content` key in a message; any other duplicate is caught at the params step.
-  const dups = duplicateKeyPaths(requestBody);
   const structDup = (p) => (p.length === 1 && (p[0] === 'model' || p[0] === 'messages')) ||
     (p.length === 3 && p[0] === 'messages' && (p[2] === 'role' || p[2] === 'content'));
   if (dups.some(structDup)) return fail('system prompt tampered');
+  // message content is a serde_json::Value there: an out-of-range number in it fails the parse
+  if (msgs.some((m) => hasRejectedNumber(m.content))) return fail('system prompt tampered');
   const m0 = msgs[0];
   if (!m0 || m0.role !== 'system' || typeof m0.content !== 'string' || sha256hex(m0.content) !== program.system_prompt_hash) {
     return fail('system prompt tampered');
@@ -316,11 +565,8 @@ export function checkRequestAgainstProgram(requestBody, program, hunter) {
 
   // v3 #1: exact request shape, no duplicate keys, params hash pinned. A v2 program (no
   // params_hash) skips this step, as the v2 contract does.
-  if (program.params_hash != null) {
-    const keys = Object.keys(req);
-    const exactShape = keys.length === REQUEST_KEYS.length && REQUEST_KEYS.every((k) => Object.hasOwn(req, k)) &&
-      msgs.every((m) => Object.keys(m).length === 2);
-    if (!exactShape || dups.length || paramsHash(req) !== program.params_hash) return fail('params tampered');
+  if (program.params_hash != null && requestParamsHash(requestBody) !== program.params_hash) {
+    return fail('params tampered');
   }
 
   const m1 = msgs[1];

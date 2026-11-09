@@ -338,6 +338,22 @@
       "canonical_token": "100.0",
       "params_hash": "d4607f54d1f7de74c9978d939a4284b8d0ea8d805650fd423d218aa16849265c",
       "tamper_reason": "params tampered"
+    },
+    {
+      "name": "messages[2].content [1e400]",
+      "find": "\"content\":\"REPORT\\n",
+      "replace": "\"content\":[1e400],\"c2\":\"REPORT\\n",
+      "canonical_token": null,
+      "params_hash": null,
+      "tamper_reason": "system prompt tampered"
+    },
+    {
+      "name": "messages[2] extra key x:1e400",
+      "find": "\"content\":\"REPORT\\n",
+      "replace": "\"content\":\"REPORT\\n\",\"x\":1e400,\"c2\":\"",
+      "canonical_token": null,
+      "params_hash": null,
+      "tamper_reason": "params tampered"
     }
   ]
 }

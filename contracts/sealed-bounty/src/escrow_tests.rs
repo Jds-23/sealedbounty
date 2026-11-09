@@ -2785,6 +2785,18 @@ const NUMBER_VECTORS: &[(&str, &str, &str)] = &[
     ("max_tokens 400 (honest)", "\"max_tokens\":400", "400"),
     ("response_format minimum 0.0", "\"minimum\":0", "0.0"),
     ("response_format maximum 1e2", "\"maximum\":100", "1e2"),
+    // out-of-range number inside a message: content is a Value (parse fails at step 1), an
+    // unknown message key is skipped unparsed at step 1 and rejected by the strict parse
+    (
+        "messages[2].content [1e400]",
+        "\"content\":\"REPORT\\n",
+        "[1e400],\"c2\":\"REPORT\\n",
+    ),
+    (
+        "messages[2] extra key x:1e400",
+        "\"content\":\"REPORT\\n",
+        "\"REPORT\\n\",\"x\":1e400,\"c2\":\"",
+    ),
 ];
 
 const VECTORS_PATH: &str = concat!(
