@@ -456,12 +456,25 @@ function strictRequest(body) {
  * model/messages/response_format/chat_template_kwargs/temperature/max_tokens, each message exactly
  * {role, content}, no duplicate key anywhere, every number in f64 range), else null.
  * @param {string} requestBody exact request body
+ * @param {{strictNumbers?: boolean}} [opts] strictNumbers: model the contract's proposed
+ *   STRICT_PARAM_NUMBERS hardening (#15, in source, NOT deployed): any non-integer number in the
+ *   params (`0.0`, `-0`, `1e2`, `0.5`, beyond u64/i64) gives null. Default false = deployed v3.
  * @returns {string|null} 64 lowercase hex chars, or null
  */
-export function requestParamsHash(requestBody) {
+export function requestParamsHash(requestBody, { strictNumbers = false } = {}) {
   const req = strictRequest(requestBody);
-  return req ? paramsHash(req) : null;
+  if (!req) return null;
+  const { chat_template_kwargs, max_tokens, response_format, temperature } = req;
+  if (strictNumbers && hasFloat({ chat_template_kwargs, max_tokens, response_format, temperature })) return null;
+  return paramsHash(req);
 }
+
+/** True if any number in `v` (a parseJsonLossless value, all in range) is an f64 for serde_json. */
+const hasFloat = (v) => {
+  if (v instanceof JsonNumber) return 'f64' in serdeParseNumber(v.token);
+  if (v !== null && typeof v === 'object') return Object.values(v).some(hasFloat);
+  return false;
+};
 
 // ---------------------------------------------------------------- request body
 
@@ -535,9 +548,12 @@ export function buildRequestBodyV1({ model, repoUrl, commit, codeExcerpt, report
  * @param {{repo_url: string, commit: string, model_id: string, system_prompt_hash: string, code_hash: string, params_hash?: string}} program
  *   contract Program view (snake_case, as returned by get_program)
  * @param {string} hunter the account that submits (or submitted) the claim
+ * @param {{strictNumbers?: boolean}} [opts] strictNumbers: model the proposed (NOT deployed)
+ *   STRICT_PARAM_NUMBERS contract hardening, see {@link requestParamsHash}. Default false = what
+ *   the deployed v3 contract (sealedbounty-v3.testnet) computes.
  * @returns {{ok: boolean, reason: null|'system prompt tampered'|'model mismatch'|'params tampered'|'code mismatch'|'hunter mismatch'|'report missing'}}
  */
-export function checkRequestAgainstProgram(requestBody, program, hunter) {
+export function checkRequestAgainstProgram(requestBody, program, hunter, { strictNumbers = false } = {}) {
   const fail = (reason) => ({ ok: false, reason });
   let parsed;
   try { parsed = parseLossless(requestBody); } catch { return fail('system prompt tampered'); }
@@ -565,7 +581,7 @@ export function checkRequestAgainstProgram(requestBody, program, hunter) {
 
   // v3 #1: exact request shape, no duplicate keys, params hash pinned. A v2 program (no
   // params_hash) skips this step, as the v2 contract does.
-  if (program.params_hash != null && requestParamsHash(requestBody) !== program.params_hash) {
+  if (program.params_hash != null && requestParamsHash(requestBody, { strictNumbers }) !== program.params_hash) {
     return fail('params tampered');
   }
 

@@ -2905,7 +2905,7 @@ fn canonical_number_vectors() {
 /// program pinned its hash, so params_hash never depends on serde_json's float parse/print.
 #[test]
 fn strict_param_numbers_reject_floats() {
-    assert!(STRICT_PARAM_NUMBERS);
+    const { assert!(STRICT_PARAM_NUMBERS) };
     let ok = v2_req("anyone").to_string();
     assert_eq!(request_params_hash(&ok), Some(v2_params_hash()));
     for tok in ["0.0", "-0", "1e2", "0.5", "18446744073709551616"] {
