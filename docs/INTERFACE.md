@@ -146,4 +146,4 @@ Each issue is fixed with TDD on its own branch: a RED test commit (proves the bu
 - `submit_claim` requires `attached >= storage_cost + program.bond` (else panic `"insufficient bond"`); stores `claim.bond`. On Paid → transfer `payout + bond` to the hunter. On any Rejected → the bond is added to `program.balance`.
 - Dedupe key is per program: `format!("{program_id}:{req_hash}")`. Releasing the hash on `hunter mismatch` uses the same key.
 - `claims_by_program: LookupMap<u64, Vector<u64>>`. `list_claims` paginates over it (no full scan). The views stay the same shape.
-- `finalize` returns `Promise::transfer(...).then(on_payout(claim_id))`. On failure → status `"PayoutFailed"`, and `payout + bond` is credited back to `program.balance`.
+- `finalize` returns `PromiseOrValue<()>`: on Paid, `Promise::transfer(payout + bond).then(on_payout(claim_id))` (10 Tgas, `#[private]`); on a rejection (`"signer revoked"`, `"undecryptable report"`) `Value(())`, no transfer, payout + bond to `program.balance`. On failure → status `"PayoutFailed"`, and `payout + bond` is credited back to `program.balance`.

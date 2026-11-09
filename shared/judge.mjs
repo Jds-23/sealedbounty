@@ -629,14 +629,30 @@ export function verifyFixture(obj, opts = {}) {
  * @returns {string} base64 ciphertext
  */
 export function encryptForOwner(requestBody, ownerPubB64) {
+  return encryptForOwnerWithSecret(requestBody, ownerPubB64).ciphertext;
+}
+
+/**
+ * Same as encryptForOwner, but also returns the ephemeral x25519 secret (hex). The hunter keeps
+ * it (CLI: ~/.sealedbounty/hunter-<contract>-<claim>.json) to answer a decryption challenge with
+ * `prove_ciphertext(claim_id, ephemeral_secret)` (INTERFACE.md v3 #2).
+ * @param {string} requestBody
+ * @param {string} ownerPubB64 base64 x25519 public key (Program.owner_enc_pubkey)
+ * @param {{ephemeralSecret?: Uint8Array, nonce?: Uint8Array}} [opts] fixed inputs (tests only)
+ * @returns {{ciphertext: string, ephemeralSecretHex: string}}
+ */
+export function encryptForOwnerWithSecret(requestBody, ownerPubB64, opts = {}) {
   const ownerPub = decodeBase64(ownerPubB64);
   if (ownerPub.length !== nacl.box.publicKeyLength) throw new Error('owner pubkey must be 32 bytes');
-  const eph = nacl.box.keyPair();
-  const nonce = nacl.randomBytes(nacl.box.nonceLength);
+  const eph = opts.ephemeralSecret
+    ? nacl.box.keyPair.fromSecretKey(opts.ephemeralSecret)
+    : nacl.box.keyPair();
+  const nonce = opts.nonce ?? nacl.randomBytes(nacl.box.nonceLength);
+  if (nonce.length !== nacl.box.nonceLength) throw new Error('nonce must be 24 bytes');
   const boxed = nacl.box(utf8(requestBody), nonce, ownerPub, eph.secretKey);
   const out = new Uint8Array(32 + 24 + boxed.length);
   out.set(eph.publicKey, 0); out.set(nonce, 32); out.set(boxed, 56);
-  return encodeBase64(out);
+  return { ciphertext: encodeBase64(out), ephemeralSecretHex: hexlify(eph.secretKey).slice(2) };
 }
 
 /**

@@ -40,6 +40,7 @@ container_build_command = [
 [dependencies]
 near-sdk = { version = "5.30.1", features = ["unstable"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
+crypto_box = { version = "0.9", default-features = false, features = ["salsa20", "alloc"] }
 
 [dev-dependencies]
 near-sdk = { version = "5.30", features = ["unit-testing", "unstable"] }
