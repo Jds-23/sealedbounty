@@ -4,9 +4,15 @@ Command-line client for the SealedBounty escrow (`contracts/sealed-bounty`). A N
 judges each exploit report and signs the verdict. The contract checks that signature onchain. The
 full report is encrypted so that only the program owner can read it.
 
-This is the **v2** CLI (docs/INTERFACE.md "v2"). Each program is bound to a published **code bundle**
+This is the **v3** CLI (docs/INTERFACE.md "v3"). Each program is bound to a published **code bundle**
 (`code_hash`). Each judge request is bound to that bundle and to the **hunter** account that submits
 it. A hunter therefore can't invent vulnerable code, and nobody can front-run a pending claim.
+
+v3 adds:
+- **params pinning** (`params_hash`): temperature, max_tokens, response_format and chat_template_kwargs are fixed.
+- a **decryption challenge**: `flag-undecryptable` and `prove-ciphertext`.
+- **per-program signer sets**: `set-program-signers` and `revoke-signer`.
+- a hunter **bond**, and a **PayoutFailed** status if the payout transfer fails.
 
 All judge, crypto and prompt logic comes from `../shared/judge.mjs`, through the typed facade in
 `src/shared.ts`, so the CLI and the web app hash and encrypt the same bytes.
@@ -23,7 +29,7 @@ Config is read from the repo-root `.env`:
 
 | var | default | used for |
 |---|---|---|
-| `ESCROW_CONTRACT_ID` | `sealedbounty-v2.testnet` | escrow contract (`--contract` overrides it). `CONTRACT_ID` is ignored because it points at the Phase 0 spike. The v1 escrow `escrow.baldingsucks7993.testnet` has no `code_hash`. |
+| `ESCROW_CONTRACT_ID` | `sealedbounty-v3.testnet` | escrow contract (`--contract` overrides it). `CONTRACT_ID` is ignored because it points at the Phase 0 spike. The older escrows `sealedbounty-v2.testnet` (no params_hash/bond/signers) and `escrow.baldingsucks7993.testnet` (v1, no `code_hash`) stay as history. |
 | `NEAR_NETWORK` / `NEAR_RPC_URL` | `testnet` / `https://test.rpc.fastnear.com` | RPC |
 | `NEAR_TESTNET_ACCOUNT_ID` | none | default signer (`--account` overrides it). For `submit` this account is also the `HUNTER` bound into the request. |
 | `NEAR_CREDENTIALS_PATH` | `~/.near-credentials/<network>/<account>.json` | signing key (near-cli JSON format) |
@@ -41,6 +47,17 @@ pnpm sb attest --register --account <admin>.testnet # add_signer for each VERIFI
 ```
 This prints a PASS/FAIL table for each attestation entry and the exact `add_signer` args for each verified model signer.
 
+Each program takes a snapshot of its signers when it is created (v3 #3), so a new global `add_signer`
+does **not** reach existing programs. After a rotation, `attest --register` prints a reminder: each
+program owner must run `set-program-signers`.
+
+```sh
+pnpm sb revoke-signer ed25519:<64 hex> --account <admin>.testnet [--dry-run]
+```
+`revoke_signer` removes the signer from the allowlist and marks it revoked. At `finalize`, its Pending
+claims are Rejected with `"signer revoked"`. The admin can block payouts this way, but can't redirect
+them.
+
 ### Program owner
 ```sh
 # publish an existing bundle file ...
@@ -48,7 +65,8 @@ pnpm sb create-program --name "vuln-app" \
   --repo https://github.com/sealedbounty/sealedbounty/tree/main/fixtures/vuln-app --commit demo-commit-0001 \
   --code ../fixtures/vuln-app/bundle.txt \
   --payout-low 0.1 --payout-medium 0.5 --payout-high 1 --payout-critical 2 \
-  --fund 5 --dispute-secs 300 --min-confidence 70 [--dry-run]
+  --fund 5 --dispute-secs 300 --min-confidence 70 \
+  [--bond 0.05] [--challenge-secs 600] [--signers ed25519:<hex>,eth:0x<hex>] [--dry-run]
 # ... or build it from source files (paths/globs relative to --code-root; writes <root>/bundle.txt + bundle.sha256)
 pnpm sb create-program ... --code-root ../fixtures/vuln-app --code-files 'src/**/*.ts'
 ```
@@ -61,7 +79,21 @@ own `bundle.txt`/`bundle.sha256`. Publish `bundle.txt` with the program, because
 against it byte for byte.
 
 The command also generates an x25519 keypair and registers `system_prompt_hash =
-sha256(shared/system-prompt.txt)`. It attaches `fund + 0.05 NEAR` (the storage allowance; the contract
+sha256(shared/system-prompt.txt)` and `params_hash = shared.paramsHash()`. The create_program args are,
+in order: `(name, repo_url, commit, model_id, system_prompt_hash, code_hash, params_hash, payouts,
+owner_enc_pubkey, dispute_secs, min_confidence, bond, challenge_secs, signers)`.
+- `--bond` (default 0.05 NEAR) is the stake each hunter attaches on top of storage. It is returned with
+  the payout on Paid, and goes to the pool on Rejected.
+- `--challenge-secs` (default 600) is how long a hunter has to `prove-ciphertext` after `flag-undecryptable`.
+- `--signers` sets an explicit signer list. Each signer must be allowlisted for the model. Without
+  it, `signers: null` is sent, and the contract takes a snapshot of every allowlisted signer whose
+  model matches.
+
+```sh
+pnpm sb set-program-signers --program 0 --signers ed25519:<hex> eth:0x<hex> [--dry-run]
+```
+This checks every signer against `get_signers` (`meta.model == program.model_id`) before sending. It
+only affects future submissions. It attaches `fund + 0.05 NEAR` (the storage allowance; the contract
 adds whatever is left of it to the pool). The secret key is written to
 `~/.sealedbounty/owner-pending-*.json` **before** the transaction is sent and renamed to
 `~/.sealedbounty/owner-<contract>-<programId>.json` (chmod 600) after it succeeds. Back this file up: without it
@@ -73,8 +105,25 @@ pnpm sb dispute --claim 3 [--dry-run]          # reveal the body on-chain to rej
 ```
 For every claim, `inbox` runs `checkRequestAgainstProgram(body, program, claim.hunter)`, the same
 checks the contract's `dispute` runs, in the same order: `system prompt tampered`, `model mismatch`,
-`code mismatch`, `hunter mismatch`, `report missing`. On a mismatch it prints the reason and the
-`dispute` command to run. The code bundle is printed only when it differs from `program.code_hash`.
+`params tampered`, `code mismatch`, `hunter mismatch`, `report missing`. On a mismatch it prints the
+reason and the `dispute` command to run. The code bundle is printed only when it differs from
+`program.code_hash`.
+
+A ciphertext can fail to decrypt, or decrypt to a body whose sha256 is not `req_hash`. In both
+cases there is nothing to reveal, so `dispute` can't work, and `inbox` prints
+``UNDECRYPTABLE → run `sb flag-undecryptable --claim N` ``. For each claim, `inbox` also shows the
+bond and the status. A Challenged claim shows its deadline and the time left.
+
+```sh
+pnpm sb flag-undecryptable --claim 3 [--dry-run]   # Pending -> Challenged; deadline = now + challenge_secs
+```
+The command first checks that the claim is Pending, that the dispute window is open, and that the
+caller is the owner. With a local owner key, it also checks that the ciphertext really is
+undecryptable.
+- If the hunter proves the ciphertext before the deadline, the claim goes back to Pending and can be
+  finalized.
+- If the hunter's proof fails, or `finalize` runs after the deadline, the claim is Rejected with
+  `"undecryptable report"` and the bond goes to the pool.
 
 `dispute` prints the expected outcome. If the request matches the program it refuses to send, because
 the contract would panic with `dispute invalid: request matches program` (`--force` sends it anyway).
@@ -94,11 +143,30 @@ The flow:
 1. Build the v2 body (`TARGET …@…\nHUNTER <you>\n\nCODE\n<bundle>` + `REPORT\n<report>`) and pre-check
    it with `checkRequestAgainstProgram` before spending a NEAR AI call.
 2. Judge it, then run `verifyFixture` (hashes, signed text, signature, verdict, prompt hash).
-3. Check the request against the program again. Any mismatch is refused unless `--force`.
-4. Run the contract pre-checks: open, valid, severity, `min_confidence`, pool balance, signer allowlist.
-5. `encryptForOwner(request_body, program.owner_enc_pubkey)`.
-6. Call `submit_claim` with a storage deposit of `(ciphertext bytes + 1500) × 1e19 + 0.01 NEAR`. The
-   contract refunds the unused part.
+3. Check the request against the program again (this includes `params tampered`). Any mismatch is
+   refused unless `--force`.
+4. Run the contract pre-checks: program open, verdict valid, severity, `min_confidence`, pool
+   balance. Then check the signer: it must be in the global allowlist, in **`program.signers`**, and
+   not revoked.
+5. `encryptForOwnerWithSecret(request_body, program.owner_enc_pubkey)`. The ephemeral secret
+   (together with `claim_id`, `req_hash` and `contract`) is written to
+   `~/.sealedbounty/hunter-pending-*.json` (chmod 600) **before** sending. After the transaction
+   succeeds, the file is renamed to `~/.sealedbounty/hunter-<contract>-<claimId>.json`.
+6. Call `submit_claim`, attaching `storage + program.bond`. Storage is
+   `(ciphertext bytes + 1500) × 1e19 + 0.01 NEAR`, and the contract refunds the unused part.
+
+```sh
+pnpm sb prove-ciphertext --claim 3 --dry-run   # local: open the box with the saved secret, hash, dispute checks
+pnpm sb prove-ciphertext --claim 3             # answer the owner's challenge on-chain
+```
+The command reads the saved secret and mirrors the contract:
+1. `x25519(secret) == ciphertext[0..32]`.
+2. The box opens.
+3. `sha256(plaintext) == req_hash`.
+4. The full dispute checks pass.
+
+Then it prints the expected outcome. It refuses to send if the contract would reject the claim
+(`--force` sends it anyway).
 
 `--fixture` sends the fixture's `request_body` as it is, and pre-checks it for *your* account. A
 fixture recorded for another hunter only prints `WARNING: hunter mismatch: the owner can dispute`.
@@ -113,10 +181,18 @@ args without elision.
 ### Anyone
 ```sh
 pnpm sb programs | pnpm sb program 0 | pnpm sb claims 0
-pnpm sb finalize --claim 3            # after finalize_after
+pnpm sb finalize --claim 3            # after finalize_after; prints outcome: Paid / Rejected (reason) / PayoutFailed
 pnpm sb verify-claim --claim 3        # offline sig check of model:req_hash:resp_hash from on-chain fields
 pnpm sb verify-fixture ../fixtures/live.ed25519.json
 ```
+
+`program` and `programs` show `params_hash`, `signers`, `bond` and `challenge_secs`. `claims` shows
+the bond and the Challenged status (with its countdown) or PayoutFailed. `finalize` reads the
+outcome from the `claim_paid`, `claim_rejected` and `payout_failed` events and from the claim's
+status after the transaction:
+- a revoked signer gives `Rejected (signer revoked)`.
+- a Challenged claim past its deadline gives `Rejected (undecryptable report)`.
+- a failed transfer gives `PayoutFailed`, and payout + bond are credited back to the pool.
 
 ## Tests
 ```sh
@@ -133,3 +209,16 @@ The tests cover:
   submit/dispute pre-check reasons, and offline `submit --dry-run` against `demo.sqli.json` (passes;
   warns on hunter mismatch) and `demo.fakecode.json` (refused with `code mismatch`). These tests also
   assert that no network is used.
+- v3 (`test/v3.test.ts`, which is pure, and `test/v3-commands.test.ts`, where `src/near.js` is mocked
+  so nothing touches the chain):
+  - the `create_program` arg order and its defaults (bond, challenge_secs, `signers: null`, params_hash)
+  - signer parsing
+  - the new method args
+  - deposit = storage + bond
+  - `params tampered` refused
+  - the hunter secret saved before sending and renamed afterwards (chmod 600)
+  - `inbox` UNDECRYPTABLE hints and the Challenged countdown
+  - the prove-ciphertext local check
+  - set-program-signers and revoke-signer
+  - the finalize outcome (Paid / Rejected / PayoutFailed)
+  - the v3 fields in the views

@@ -72,7 +72,7 @@ const tamper = (body: string, f: (r: any) => void) => {
   return JSON.stringify(r);
 };
 
-describe('shared v3 helpers (shim or integrate/v3)', () => {
+describe('shared v3 helpers (shared/judge.mjs)', () => {
   it('paramsHash = sha256(canonicalJson of the 4 params) and matches the demo request', () => {
     const req = JSON.parse(sqli.request_body);
     expect(shared.paramsHash()).toMatch(/^[0-9a-f]{64}$/);
