@@ -111,3 +111,39 @@ Everything else is unchanged (json_schema, `chat_template_kwargs.enable_thinking
 - Everything else is the same as v1. Deploy target: **`sealedbounty-v2.testnet`** (fresh state, admin `baldingsucks7993.testnet`). v1 `escrow.baldingsucks7993.testnet` stays as history.
 
 - v2 demo hashes: system_prompt_hash `aede4ebac53d6bae5f3ceefc8d60175faff90276ac7751fb26aebff39e5172c2`, code_hash `82faf3a0cd6148f95ba3b8011f8e9af67d5f9d5b8f8638002be7787a37285abd`. Fixtures `fixtures/demo.{sqli,sqli.ecdsa,idor,bogus,injection,fakecode}.json` (spec v2). Helpers: `shared/judge.mjs` checkRequestAgainstProgram, buildCodeBundle, codeHash, codeMessagePrefix; `shared/demo-data.mjs`.
+
+---
+# v3 (9 Nov 2026): fixes for issues #1–#8 (supersedes v2 where they conflict)
+Each issue is fixed with TDD on its own branch: a RED test commit (proves the bug) then a GREEN fix commit. Merge order: #1 → #3/#6 → #4/#5/#7/#8 → #2.
+
+## Program additions (field order after `code_hash`)
+`params_hash: String`, `signers: Vec<Signer>`, `bond: U128`, `challenge_secs: u64`.
+
+`create_program(name, repo_url, commit, model_id, system_prompt_hash, code_hash, params_hash, payouts, owner_enc_pubkey, dispute_secs, min_confidence, bond, challenge_secs, signers: Option<Vec<Signer>>)`
+- `signers` None → snapshot of the global allowlist with a matching `meta.model == model_id` (#3). Some(list) → every entry must be globally allowlisted with a matching model (panic `"signer not allowlisted"`). An empty result panics `"no signers for model"`.
+- `set_program_signers(program_id, signers)`: program owner only, same subset rule. Affects future submissions only.
+
+## Claim additions
+`bond: U128`, `challenge_deadline: Option<U64>`. `status` adds `"Challenged"` and `"PayoutFailed"`.
+
+## #1 params pinning
+- `params_hash` = sha256hex(canonical JSON of `{chat_template_kwargs, max_tokens, response_format, temperature}`). Canonical = recursively sorted object keys, no whitespace, standard JSON escapes. JS: `canonicalJson(v)` in shared/judge.mjs. Rust: `serde_json::Value` (BTreeMap → sorted); assert `preserve_order` is NOT enabled.
+- The dispute request must parse with `deny_unknown_fields`: top-level keys exactly `model, messages, response_format, chat_template_kwargs, temperature, max_tokens`, and each message exactly `{role, content}`. Any parse failure → `"system prompt tampered"` (as in v2).
+- Reason order: prompt → model → **`"params tampered"`** → code → hunter → report.
+
+## #2 decryption challenge
+- `flag_undecryptable(claim_id)`: program owner, `Pending`, `now < finalize_after` → `Challenged`, with `challenge_deadline = now + challenge_secs`.
+- `prove_ciphertext(claim_id, ephemeral_secret: String /*64 hex*/)`: claim hunter only, `Challenged`, `now < challenge_deadline`. Requires `x25519_base(secret) == ciphertext[0..32]`. Opens the nacl box (`xsalsa20poly1305` with key = `crypto_box` beforenm(owner_enc_pubkey, secret), nonce = `ciphertext[32..56]`). Requires `sha256hex(plaintext) == req_hash`, else Rejected `"undecryptable report"`. Then runs the full dispute checks on the plaintext: a failing reason → Rejected with it; all pass → back to `Pending` with `finalize_after = now` (finalizable).
+- `finalize` on `Challenged`: before the deadline → panic `"challenge open"`; after → Rejected `"undecryptable report"`.
+- `dispute` on `Challenged` → panic `"claim not pending"` (unchanged).
+- shared: `encryptForOwner` gains a variant `encryptForOwnerWithSecret(body, ownerPub) -> {ciphertext, ephemeralSecretHex}`. The CLI saves `~/.sealedbounty/hunter-<contract>-<claim>.json`.
+
+## #3 / #6 signers
+- `submit_claim` checks `signer ∈ program.signers` (and the global allowlist kind as before). The global `add_signer` no longer affects existing programs.
+- `revoke_signer(signer)`: admin; adds the signer to a global `revoked` set and removes it from the allowlist. `finalize` on a claim whose signer is revoked → Rejected `"signer revoked"`. (The admin can block payouts but can't steal; disclosed.) `remove_signer` stays (no effect on pending claims).
+
+## #4 bond / #5 dedupe / #7 index / #8 payout callback
+- `submit_claim` requires `attached >= storage_cost + program.bond` (else panic `"insufficient bond"`); stores `claim.bond`. On Paid → transfer `payout + bond` to the hunter. On any Rejected → the bond is added to `program.balance`.
+- Dedupe key is per program: `format!("{program_id}:{req_hash}")`. Releasing the hash on `hunter mismatch` uses the same key.
+- `claims_by_program: LookupMap<u64, Vector<u64>>`. `list_claims` paginates over it (no full scan). The views stay the same shape.
+- `finalize` returns `Promise::transfer(...).then(on_payout(claim_id))`. On failure → status `"PayoutFailed"`, and `payout + bond` is credited back to `program.balance`.
