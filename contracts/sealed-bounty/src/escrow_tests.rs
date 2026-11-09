@@ -15,6 +15,8 @@ const NEAR: u128 = 10u128.pow(24);
 /// code_hash for programs that only see v1 (live) bodies; never matches anything.
 const CODE_HASH_PLACEHOLDER: &str =
     "00000000000000000000000000000000000000000000000000000000000000c0";
+/// Hunter's window to prove a flagged ciphertext.
+const CHALLENGE_SECS: u64 = 120;
 const T0: u64 = 1_700_000_000 * NANOS_PER_SEC;
 
 struct Fx(Value);
@@ -126,6 +128,7 @@ fn create(
         "b3duZXJwdWI=".into(),
         secs,
         min_conf,
+        CHALLENGE_SECS,
     )
 }
 
@@ -751,6 +754,7 @@ fn create_v2(c: &mut Contract) -> u64 {
         "b3duZXJwdWI=".into(),
         60,
         0,
+        CHALLENGE_SECS,
     )
 }
 
@@ -835,6 +839,7 @@ fn create_program_bad_code_hash() {
         "k".into(),
         60,
         0,
+        CHALLENGE_SECS,
     );
 }
 
@@ -1152,4 +1157,58 @@ fn dispute_after_resubmission_panics() {
     let real = submit_v2(&mut c, hunter(), pid, &body);
     ctx(owner(), 0, T0);
     c.dispute(real, body);
+}
+
+// ---------------- v3 #2: decryption challenge ----------------
+
+/// Base64 junk that is not `ephPub || nonce || box` for any secret.
+const JUNK_CT: &str = "Y2lwaGVy";
+
+fn submit_ct(c: &mut Contract, pid: u64, body: &str, ciphertext: &str) -> u64 {
+    let (req_hash, resp, sig) = signed(body);
+    ctx(hunter(), NEAR, T0);
+    c.submit_claim(
+        pid,
+        req_hash,
+        resp,
+        sig,
+        test_signer(),
+        SigKind::ProviderTee,
+        ciphertext.into(),
+    )
+}
+
+/// Issue #2: a payable claim with junk ciphertext. The owner can't recover the body so can't
+/// dispute; they flag it, the hunter never proves, and finalize rejects instead of paying.
+#[test]
+fn junk_ciphertext_flagged_then_rejected() {
+    let (mut c, pid) = v2_program();
+    let bal = c.get_program(pid).unwrap().balance.0;
+    let body = v2_req(hunter().as_str()).to_string();
+    let cid = submit_ct(&mut c, pid, &body, JUNK_CT);
+
+    // The owner can't produce the body, so dispute is impossible.
+    ctx(owner(), 0, T0 + NANOS_PER_SEC);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c.dispute(cid, "unknown".into())
+    }));
+    assert!(r.is_err(), "body mismatch");
+
+    ctx(owner(), 0, T0 + NANOS_PER_SEC);
+    c.flag_undecryptable(cid);
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(cl.status, ClaimStatus::Challenged);
+    let deadline = T0 + NANOS_PER_SEC + CHALLENGE_SECS * NANOS_PER_SEC;
+    assert_eq!(cl.challenge_deadline, Some(U64(deadline)));
+    assert_eq!(serde_json::to_value(&cl).unwrap()["status"], "Challenged");
+
+    // Hunter stays silent; after the deadline finalize rejects and pays nothing.
+    ctx(stranger(), 0, deadline);
+    drop(c.finalize(cid));
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!(cl.status, ClaimStatus::Rejected);
+    assert_eq!(cl.reject_reason.as_deref(), Some("undecryptable report"));
+    assert!(transfers().is_empty(), "no payout");
+    let p = c.get_program(pid).unwrap();
+    assert_eq!((p.balance.0, p.reserved.0), (bal, 0));
 }

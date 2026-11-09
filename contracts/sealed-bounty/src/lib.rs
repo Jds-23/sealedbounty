@@ -58,6 +58,8 @@ pub struct Program {
     pub system_prompt_hash: String,
     /// sha256hex of the canonical code bundle (64 lowercase hex). v2.
     pub code_hash: String,
+    /// Seconds the hunter has to `prove_ciphertext` after the owner flags a claim. v3 (#2).
+    pub challenge_secs: u64,
     pub payouts: Payouts,
     pub owner_enc_pubkey: String,
     pub dispute_secs: u64,
@@ -76,6 +78,9 @@ pub enum ClaimStatus {
     Pending,
     Rejected,
     Paid,
+    /// The owner flagged the ciphertext as undecryptable; the hunter must `prove_ciphertext`
+    /// before `challenge_deadline`. v3 (#2).
+    Challenged,
 }
 
 #[near(serializers = [borsh, json])]
@@ -97,6 +102,8 @@ pub struct Claim {
     pub submitted_at: U64,
     pub finalize_after: U64,
     pub reject_reason: Option<String>,
+    /// Set while/after `Challenged`: the hunter must prove the ciphertext before this. v3 (#2).
+    pub challenge_deadline: Option<U64>,
 }
 
 #[near]
@@ -309,6 +316,7 @@ impl Contract {
         owner_enc_pubkey: String,
         dispute_secs: u64,
         min_confidence: u8,
+        challenge_secs: u64,
     ) -> u64 {
         let system_prompt_hash = tee::normalize_hash_hex(&system_prompt_hash)
             .unwrap_or_else(|_| env::panic_str("system_prompt_hash must be 64 hex chars"));
@@ -318,6 +326,10 @@ impl Contract {
         require!(
             dispute_secs.checked_mul(NANOS_PER_SEC).is_some(),
             "dispute_secs too large"
+        );
+        require!(
+            challenge_secs.checked_mul(NANOS_PER_SEC).is_some(),
+            "challenge_secs too large"
         );
 
         let before = env::storage_usage();
@@ -336,6 +348,7 @@ impl Contract {
                 model_id: model_id.clone(),
                 system_prompt_hash,
                 code_hash,
+                challenge_secs,
                 payouts,
                 owner_enc_pubkey,
                 dispute_secs,
@@ -479,6 +492,7 @@ impl Contract {
                 submitted_at: U64(now),
                 finalize_after: U64(finalize_after),
                 reject_reason: None,
+                challenge_deadline: None,
             },
         );
         self.programs.flush();
@@ -541,6 +555,19 @@ impl Contract {
             "claim_rejected",
             json!({"claim_id": claim_id, "program_id": program_id, "reason": reason}),
         );
+    }
+
+    /// Program owner only, while the claim is Pending and the dispute window is open: the
+    /// ciphertext does not decrypt to the judged request, so the owner cannot dispute.
+    pub fn flag_undecryptable(&mut self, claim_id: u64) {
+        let _ = claim_id;
+        env::panic_str("unimplemented")
+    }
+
+    /// Claim hunter only, while Challenged: reveal the nacl-box ephemeral secret (64 hex).
+    pub fn prove_ciphertext(&mut self, claim_id: u64, ephemeral_secret: String) {
+        let _ = (claim_id, ephemeral_secret);
+        env::panic_str("unimplemented")
     }
 
     /// Anyone, once the dispute window has passed. Pays the hunter.

@@ -8,6 +8,7 @@ use near_sdk::serde_json::{self, Value, json};
 
 const NEAR: u128 = 10u128.pow(24);
 const DISPUTE_SECS: u64 = 20;
+const CHALLENGE_SECS: u64 = 20;
 /// code_hash for programs judged with v1 (live) bodies; never matches.
 const PLACEHOLDER_CODE_HASH: &str =
     "00000000000000000000000000000000000000000000000000000000000000c0";
@@ -232,6 +233,7 @@ impl Env {
             "payouts": { "low": (NEAR / 2).to_string(), "medium": NEAR.to_string(),
                          "high": (2 * NEAR).to_string(), "critical": (4 * NEAR).to_string() },
             "owner_enc_pubkey": "b3duZXJwdWI=", "dispute_secs": DISPUTE_SECS, "min_confidence": min_conf,
+            "challenge_secs": CHALLENGE_SECS,
         });
         let r = self
             .ok(c, &self.owner, "create_program", args, deposit)
@@ -581,6 +583,7 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
         "payouts": { "low": (NEAR / 2).to_string(), "medium": NEAR.to_string(),
                      "high": (2 * NEAR).to_string(), "critical": (3 * NEAR).to_string() },
         "owner_enc_pubkey": "b3duZXJwdWI=", "dispute_secs": DISPUTE_SECS, "min_confidence": 80,
+        "challenge_secs": CHALLENGE_SECS,
     });
     let pid: u64 = e
         .ok(&c, &e.owner, "create_program", args, 10 * NEAR)
