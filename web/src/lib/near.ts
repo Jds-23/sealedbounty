@@ -1,12 +1,13 @@
 // Read-only NEAR JSON-RPC (call_function). No wallet, no writes.
-// Shapes checked against the live v1 contract (src/fixtures/live-views.json); v2 adds Program.code_hash:
+// Shapes checked against the live v1 contract (src/fixtures/live-views.json); v2 adds Program.code_hash,
+// v3 adds Program.{params_hash, signers, bond, challenge_secs}, Claim.{bond, challenge_deadline}, is_signer_revoked:
 //   list_programs {from_index, limit}  get_program {id}  list_claims {program_id, from_index, limit}
 //   get_claim {id}  get_signers {} -> [[signer, {kind, model}]]  get_owner {} -> account id
 // ids are u64 JSON numbers, amounts U128 decimal strings, timestamps U64 nanosecond strings.
 import type { Claim, ClaimStatus, Program, SignerEntry } from './types';
 import { normaliseSigners } from './verify';
 
-export const CONTRACT_ID: string = import.meta.env.VITE_ESCROW_CONTRACT_ID || 'sealedbounty-v2.testnet';
+export const CONTRACT_ID: string = import.meta.env.VITE_ESCROW_CONTRACT_ID || 'sealedbounty-v3.testnet';
 /**
  * Configured RPC first, then public fallbacks. FastNEAR is the default: rpc.testnet.near.org rate-limits
  * hard (HTTP 429 without CORS headers, so the browser sees a CORS error).
@@ -91,7 +92,11 @@ const sha256Hex = (v: unknown, f: string): string => {
   if (!/^[0-9a-f]{64}$/.test(h)) throw new Error(`${f}: expected 64 hex chars`);
   return h;
 };
-const STATUSES: ClaimStatus[] = ['Pending', 'Rejected', 'Paid'];
+const signerList = (v: unknown): string[] => {
+  if (!Array.isArray(v) || !v.every((x) => typeof x === 'string')) throw new Error('signers: expected string[]');
+  return v as string[];
+};
+const STATUSES: ClaimStatus[] = ['Pending', 'Rejected', 'Paid', 'Challenged', 'PayoutFailed'];
 
 export function parseProgram(r: unknown): Program {
   const p = r as Record<string, any>;
@@ -106,6 +111,11 @@ export function parseProgram(r: unknown): Program {
     system_prompt_hash: hex(p.system_prompt_hash, 'system_prompt_hash'),
     // v2 programs carry code_hash; v1 (escrow.baldingsucks7993.testnet) data has none.
     code_hash: p.code_hash == null ? null : sha256Hex(p.code_hash, 'code_hash'),
+    // v3 fields; v1/v2 programs have none (-> null).
+    params_hash: p.params_hash == null ? null : sha256Hex(p.params_hash, 'params_hash'),
+    signers: p.signers == null ? null : signerList(p.signers),
+    bond: p.bond == null ? null : big(p.bond, 'bond'),
+    challenge_secs: p.challenge_secs == null ? null : num(p.challenge_secs, 'challenge_secs'),
     payouts: {
       low: big(p.payouts?.low, 'payouts.low'),
       medium: big(p.payouts?.medium, 'payouts.medium'),
@@ -150,6 +160,8 @@ export function parseClaim(r: unknown): Claim {
     submitted_at: big(c.submitted_at, 'submitted_at'),
     finalize_after: big(c.finalize_after, 'finalize_after'),
     reject_reason: c.reject_reason ?? null,
+    bond: c.bond == null ? null : big(c.bond, 'bond'),
+    challenge_deadline: c.challenge_deadline == null ? null : big(c.challenge_deadline, 'challenge_deadline'),
   };
 }
 

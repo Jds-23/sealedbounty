@@ -28,6 +28,14 @@ export interface Program {
   system_prompt_hash: string;
   /** v2: sha256hex of the published code bundle. null for v1 programs (no code binding). */
   code_hash: string | null;
+  /** v3 #1: sha256hex(canonicalJson(request params)). null before v3 (params not pinned). */
+  params_hash: string | null;
+  /** v3 #3: the program's own signer set (snapshot of the allowlist). null before v3 (global allowlist). */
+  signers: Signer[] | null;
+  /** v3 #4: hunter bond (yocto) attached to submit_claim. null before v3. */
+  bond: string | null;
+  /** v3 #2: seconds the hunter has to prove_ciphertext after a flag. null before v3. */
+  challenge_secs: number | null;
   payouts: Payouts;
   owner_enc_pubkey: string;
   dispute_secs: number;
@@ -38,7 +46,7 @@ export interface Program {
   created_at: string;
 }
 
-export type ClaimStatus = 'Pending' | 'Rejected' | 'Paid';
+export type ClaimStatus = 'Pending' | 'Rejected' | 'Paid' | 'Challenged' | 'PayoutFailed';
 
 export interface Claim {
   id: number;
@@ -57,6 +65,10 @@ export interface Claim {
   submitted_at: string;
   finalize_after: string;
   reject_reason: string | null;
+  /** v3 #4: bond held by this claim. null before v3. */
+  bond: string | null;
+  /** v3 #2: set once the owner flags the ciphertext; the hunter must prove_ciphertext before it. */
+  challenge_deadline: string | null;
   /**
    * Demo only: this attempt never reached the chain because submit_claim reverted (e.g. "verdict not payable").
    * Shown so the real TEE outputs for refused reports are visible; never set from RPC data.

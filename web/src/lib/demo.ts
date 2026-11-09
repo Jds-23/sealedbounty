@@ -38,6 +38,10 @@ export function buildDemo(now = Date.now()): { programs: Program[]; claims: Clai
       model_id: C.sqli.model,
       system_prompt_hash: systemPromptHash(),
       code_hash: demo.code_bundle.code_hash,
+      params_hash: null,
+      signers: null,
+      bond: null,
+      challenge_secs: null,
       payouts: { low: NEAR(1), medium: NEAR(3), high: NEAR(8), critical: NEAR(20) },
       owner_enc_pubkey: demo.owner_secret.publicKey,
       dispute_secs: 86400,
@@ -73,6 +77,8 @@ export function buildDemo(now = Date.now()): { programs: Program[]; claims: Clai
       submitted_at: ns(submitted),
       finalize_after: ns(submitted + 86400_000),
       reject_reason: null,
+      bond: null,
+      challenge_deadline: null,
       ...extra,
     };
   };
