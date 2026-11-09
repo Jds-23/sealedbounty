@@ -2691,3 +2691,187 @@ fn proven_bonded_claim_paid_with_bond() {
     assert_eq!(transfers(), vec![(hunter(), 5 * NEAR + BOND)]);
     assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Paid);
 }
+
+// ---------------------------------------------------------------- #15 cross-language vectors
+
+/// (name, find, token): the honest demo request with the first `find` replaced by `<key>:<token>`.
+const NUMBER_VECTORS: &[(&str, &str, &str)] = &[
+    ("temperature 0 (honest)", "\"temperature\":0", "0"),
+    ("temperature 0.0", "\"temperature\":0", "0.0"),
+    ("temperature 0.00", "\"temperature\":0", "0.00"),
+    ("temperature -0", "\"temperature\":0", "-0"),
+    ("temperature -0.0", "\"temperature\":0", "-0.0"),
+    ("temperature 0e0", "\"temperature\":0", "0e0"),
+    ("temperature 1.50", "\"temperature\":0", "1.50"),
+    ("temperature 1.5", "\"temperature\":0", "1.5"),
+    ("temperature 1e2", "\"temperature\":0", "1e2"),
+    ("temperature 1E+2", "\"temperature\":0", "1E+2"),
+    ("temperature 100", "\"temperature\":0", "100"),
+    ("temperature 1e-2", "\"temperature\":0", "1e-2"),
+    ("temperature 0.1", "\"temperature\":0", "0.1"),
+    (
+        "temperature 0.30000000000000004",
+        "\"temperature\":0",
+        "0.30000000000000004",
+    ),
+    ("temperature 0.1e1", "\"temperature\":0", "0.1e1"),
+    ("temperature 1e-5", "\"temperature\":0", "1e-5"),
+    ("temperature 0.000001", "\"temperature\":0", "0.000001"),
+    ("temperature 1e-7", "\"temperature\":0", "1e-7"),
+    ("temperature 1e15", "\"temperature\":0", "1e15"),
+    ("temperature 1e16", "\"temperature\":0", "1e16"),
+    ("temperature 1.5e16", "\"temperature\":0", "1.5e16"),
+    ("temperature 1e17", "\"temperature\":0", "1e17"),
+    ("temperature 1e21", "\"temperature\":0", "1e21"),
+    ("temperature 1e22", "\"temperature\":0", "1e22"),
+    (
+        "temperature 123.456e-300",
+        "\"temperature\":0",
+        "123.456e-300",
+    ),
+    ("temperature 5e-324", "\"temperature\":0", "5e-324"),
+    (
+        "temperature 1.7976931348623157e308",
+        "\"temperature\":0",
+        "1.7976931348623157e308",
+    ),
+    (
+        "temperature 1e400 (out of range)",
+        "\"temperature\":0",
+        "1e400",
+    ),
+    (
+        "temperature 9007199254740993 (2^53+1)",
+        "\"temperature\":0",
+        "9007199254740993",
+    ),
+    (
+        "temperature u64::MAX",
+        "\"temperature\":0",
+        "18446744073709551615",
+    ),
+    (
+        "temperature u64::MAX+1",
+        "\"temperature\":0",
+        "18446744073709551616",
+    ),
+    (
+        "temperature i64::MIN",
+        "\"temperature\":0",
+        "-9223372036854775808",
+    ),
+    (
+        "temperature i64::MIN-1",
+        "\"temperature\":0",
+        "-9223372036854775809",
+    ),
+    (
+        "temperature 1e23 as integer",
+        "\"temperature\":0",
+        "100000000000000000000000",
+    ),
+    (
+        "temperature long-digit 0.1",
+        "\"temperature\":0",
+        "0.1000000000000000055511151231257827021181583404541015625000001",
+    ),
+    (
+        "temperature 2.2250738585072011e-308",
+        "\"temperature\":0",
+        "2.2250738585072011e-308",
+    ),
+    ("max_tokens 400.0", "\"max_tokens\":400", "400.0"),
+    ("max_tokens 4e2", "\"max_tokens\":400", "4e2"),
+    ("max_tokens 400 (honest)", "\"max_tokens\":400", "400"),
+    ("response_format minimum 0.0", "\"minimum\":0", "0.0"),
+    ("response_format maximum 1e2", "\"maximum\":100", "1e2"),
+];
+
+const VECTORS_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/canonical-vectors.json"
+);
+
+/// #15: canonical params of exotic number tokens, exactly as the contract computes them.
+/// shared/test/canonical-vectors.test.mjs asserts shared/judge.mjs reproduces every field.
+/// Regenerate with `UPDATE_VECTORS=1 cargo test canonical_number_vectors`.
+#[test]
+fn canonical_number_vectors() {
+    let base = Fx::load(include_str!("../tests/fixtures/demo.sqli.json")).request_body();
+    let req: Value = serde_json::from_str(&base).unwrap();
+    let m1 = req["messages"][1]["content"].as_str().unwrap();
+    let (target, rest) = m1
+        .strip_prefix("TARGET ")
+        .unwrap()
+        .split_once('\n')
+        .unwrap();
+    let (repo, commit) = target.rsplit_once('@').unwrap();
+    let (hunter_line, rest) = rest.split_once('\n').unwrap();
+    let hunter: AccountId = hunter_line
+        .strip_prefix("HUNTER ")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let bundle = rest.strip_prefix("\nCODE\n").unwrap();
+    let mut c = setup();
+    ctx(owner(), 20 * NEAR, T0);
+    let pid = c.create_program(
+        "demo".into(),
+        repo.into(),
+        commit.into(),
+        req["model"].as_str().unwrap().into(),
+        tee::sha256_hex(req["messages"][0]["content"].as_str().unwrap().as_bytes()),
+        tee::sha256_hex(bundle.as_bytes()),
+        DEMO_PARAMS_HASH_JS.into(),
+        payouts(),
+        "b3duZXJwdWI=".into(),
+        60,
+        0,
+        U128(0),
+        CHALLENGE_SECS,
+        None,
+    );
+    let p = c.get_program(pid).unwrap();
+
+    let vectors: Vec<Value> = NUMBER_VECTORS
+        .iter()
+        .map(|&(name, find, token)| {
+            assert!(base.contains(find), "{name}: {find} not in base");
+            let key = find.split_once(':').unwrap().0;
+            let replace = format!("{key}:{token}");
+            let body = base.replacen(find, &replace, 1);
+            let canonical_token = serde_json::from_str::<NoDupValue>(token)
+                .ok()
+                .map(|v| canonical_json(&v.0));
+            json!({
+                "name": name,
+                "find": find,
+                "replace": replace,
+                "canonical_token": canonical_token,
+                "params_hash": request_params_hash(&body),
+                "tamper_reason": tamper_reason(&p, &hunter, &body),
+            })
+        })
+        .collect();
+    let out = json!({
+        "_comment": "#15 cross-language vectors, GENERATED by `UPDATE_VECTORS=1 cargo test canonical_number_vectors` (src/escrow_tests.rs) from the contract's canonical_json. body = base_fixture request_body with the first `find` replaced by `replace`. shared/test/canonical-vectors.test.mjs checks shared/judge.mjs against every field.",
+        "base_fixture": "demo.sqli.json",
+        "hunter": hunter.as_str(),
+        "program": {
+            "repo_url": p.repo_url,
+            "commit": p.commit,
+            "model_id": p.model_id,
+            "system_prompt_hash": p.system_prompt_hash,
+            "code_hash": p.code_hash,
+            "params_hash": p.params_hash,
+        },
+        "vectors": vectors,
+    });
+    let text = serde_json::to_string_pretty(&out).unwrap() + "\n";
+    if std::env::var_os("UPDATE_VECTORS").is_some() {
+        std::fs::write(VECTORS_PATH, &text).unwrap();
+    }
+    let on_disk = std::fs::read_to_string(VECTORS_PATH)
+        .expect("missing vectors: run UPDATE_VECTORS=1 cargo test canonical_number_vectors");
+    assert_eq!(on_disk, text, "canonical-vectors.json is stale");
+}
