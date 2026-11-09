@@ -6,7 +6,9 @@ Live mode against the v1 contract `escrow.baldingsucks7993.testnet` (program 0, 
 
 ![live](./screenshot-live.png)
 
-Demo mode (program detail: the fakecode claim the TEE called valid, rejected with "code mismatch"):
+Default contract: **v3 `sealedbounty-v3.testnet`** (docs/INTERFACE.md "v3"). The UI shows params_hash, the program's own signer set, the bond and the challenge window. It handles the `Challenged` (with a countdown to the hunter's `prove_ciphertext` deadline) and `PayoutFailed` statuses, and the reject reasons "params tampered", "undecryptable report" and "signer revoked". v1/v2 data still parses: the missing fields become null and the matching checks show as n/a.
+
+Demo mode (v3 cases program: params tampered, junk ciphertext challenged then rejected "undecryptable report", one still challenged, and an honest claim that was challenged, proven and paid):
 
 ![screenshot](./screenshot.png)
 
@@ -17,14 +19,14 @@ pnpm install
 pnpm dev            # http://localhost:5173
 pnpm test           # vitest: signature verify, decrypt, v2 request checks, recorded v1 live view shapes
 pnpm build          # tsc + vite build -> dist/ (static, base './', hash routing)
-pnpm sync-fixtures  # re-copy ../fixtures into src/fixtures (run after fixtures change)
+pnpm sync-fixtures  # re-copy ../fixtures into src/fixtures and derive the v3 demo cases offline (no NEAR AI calls)
 ```
 
 Config (`.env.local`, optional):
 
 | var | default |
 |---|---|
-| `VITE_ESCROW_CONTRACT_ID` | `sealedbounty-v2.testnet` (v1 history: `escrow.baldingsucks7993.testnet`) |
+| `VITE_ESCROW_CONTRACT_ID` | `sealedbounty-v3.testnet` (history: v2 `sealedbounty-v2.testnet`, v1 `escrow.baldingsucks7993.testnet`) |
 | `VITE_NEAR_RPC` | `https://test.rpc.fastnear.com` (falls back to `rpc.testnet.near.org`, which now answers 429) |
 
 The web app never reads `NEARAI_API_KEY`, and it never calls NEAR AI. Network calls: NEAR RPC views, plus one best-effort read of the public nearblocks API (`api-testnet.nearblocks.io/v3`) to find the `finalize` tx that paid each claim. If that API fails, the claim links to the contract page instead.

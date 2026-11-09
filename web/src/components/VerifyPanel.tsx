@@ -9,15 +9,16 @@ import { StatusIcon } from './ui';
 const flip = (h: string) => h.slice(0, 8) + (h[8] === '0' ? '1' : '0') + h.slice(9);
 
 export function VerifyPanel({ claim, program }: { claim: Claim; program?: Program }) {
-  const { isDemo, signers } = useData();
+  const { isDemo, signers, revoked } = useData();
   const [tamper, setTamper] = useState(false);
   const checks = useMemo(() => {
     const c = tamper ? { ...claim, resp_hash: flip(claim.resp_hash) } : claim;
     return verifyClaim(c, program, signers, {
       respBodyB64: isDemo && !tamper ? DEMO_RESP_BODIES[claim.id] : undefined,
       signersSource: isDemo ? 'demo' : 'contract',
+      revoked,
     });
-  }, [claim, program, signers, isDemo, tamper]);
+  }, [claim, program, signers, revoked, isDemo, tamper]);
   const failed = checks.some((x) => x.status === 'fail');
   return (
     <div className={`verify ${failed ? 'verify-bad' : 'verify-ok'}`}>

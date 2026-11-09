@@ -3,35 +3,24 @@ import { Link, useParams } from 'react-router-dom';
 import { useData } from '../data';
 import { countdown, fmtDate, fmtSecs, nsToMs, yoctoToNear } from '../lib/format';
 import { CONTRACT_ID, explorerAccount, explorerTx, findPaidTxs } from '../lib/near';
-import type { Claim } from '../lib/types';
+import type { Claim, Program } from '../lib/types';
 import { Badge, Hash, StatusIcon } from '../components/ui';
 import { DEMO_CODE_BUNDLE } from '../lib/demo';
 import { sha256hex } from '../lib/verify';
 import { VerifyPanel } from '../components/VerifyPanel';
+import { claimStatusInfo, statusTone } from '../lib/status';
+import { proveCiphertext } from '../lib/crypto';
 
-function Countdown({ until }: { until: string }) {
+function Countdown({ until, kind = 'dispute' }: { until: string; kind?: 'dispute' | 'challenge' }) {
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
-  return <span className="mono">{countdown(nsToMs(until) - now)}</span>;
+  return <span className="mono">{countdown(nsToMs(until) - now, kind)}</span>;
 }
 
 const payable = (c: Claim, min: number) => c.verdict.valid && c.verdict.severity !== 'none' && c.verdict.confidence >= min;
-
-const tone = (s: Claim['status']) => (s === 'Paid' ? 'ok' : s === 'Rejected' ? 'bad' : 'warn');
-
-/** Why each v2 dispute reason matters, shown under a Rejected claim. */
-const REJECT_WHY: Record<string, string> = {
-  'code mismatch':
-    'The owner revealed the request: its CODE section does not hash to program.code_hash. The TEE judged code the hunter invented, not the published bundle, so its "valid" verdict says nothing about this program.',
-  'hunter mismatch':
-    'The owner revealed the request: its HUNTER line names another account. This claim copied someone else\'s pending submit_claim (front-run). req_hash is freed so the real hunter can resubmit.',
-  'system prompt tampered': 'The owner revealed the request: the system prompt differs from program.system_prompt_hash.',
-  'model mismatch': 'The owner revealed the request: it was judged by another model.',
-  'report missing': 'The owner revealed the request: it has no REPORT message.',
-};
 
 function usePaidTxs(enabled: boolean) {
   const [txs, setTxs] = useState<Record<number, string>>({});
@@ -51,6 +40,54 @@ function Ext({ href, children }: { href: string; children: React.ReactNode }) {
     <a href={href} target="_blank" rel="noreferrer noopener">
       {children} ↗
     </a>
+  );
+}
+
+function ClaimStatus({ c, program }: { c: Claim; program: Program }) {
+  if (c.refused_at_submit)
+    return (
+      <div className="muted">
+        Refused at submit: <code>submit_claim</code> reverts with &quot;{c.refused_at_submit}&quot;, so nothing is stored onchain. Shown here with its
+        real TEE output.
+      </div>
+    );
+  const info = claimStatusInfo(c);
+  const proof = c.proof_secret ? proveCiphertext(c.ciphertext, program.owner_enc_pubkey, c.proof_secret, c.req_hash) : null;
+  return (
+    <>
+      {c.status === 'Pending' && (
+        <div className="pending">
+          <Countdown until={c.finalize_after} />
+        </div>
+      )}
+      {c.status === 'Challenged' && (
+        <div className="challenged">
+          <strong>{info.headline}</strong>
+          {info.deadline && (
+            <>
+              {' · '}
+              <Countdown until={info.deadline} kind="challenge" />
+            </>
+          )}
+          <div className="small">{info.detail}</div>
+        </div>
+      )}
+      {(c.status === 'Rejected' || c.status === 'PayoutFailed') && (
+        <div className="rejected">
+          <strong>{info.headline}</strong>
+          {info.detail && <div className="small">{info.detail}</div>}
+        </div>
+      )}
+      {proof && (
+        <div className="row gap small">
+          <StatusIcon status={proof.ok ? 'pass' : 'fail'} />
+          <span>
+            prove_ciphertext re-checked in your browser: the revealed ephemeral secret derives ciphertext[0..32], opens the box, and{' '}
+            {proof.ok ? 'sha256(plaintext) = req_hash' : `fails (${proof.reason})`}. No owner key is needed.
+          </span>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -128,9 +165,42 @@ export function ProgramDetail() {
               <span className="muted small">none (v1 program: requests are not bound to the code or the hunter)</span>
             )}
           </dd>
+          <dt>Params hash</dt>
+          <dd>
+            {p.params_hash ? (
+              <>
+                <Hash value={p.params_hash} />
+                <div className="small muted">sha256 of the canonical temperature, max_tokens, response_format and chat_template_kwargs. Other params are disputable.</div>
+              </>
+            ) : (
+              <span className="muted small">none (pre-v3 program: request params are not pinned)</span>
+            )}
+          </dd>
+          <dt>Signers</dt>
+          <dd>
+            {p.signers ? (
+              <>
+                {p.signers.map((s) => (
+                  <div key={s}>
+                    <Hash value={s} head={16} />
+                  </div>
+                ))}
+                <div className="small muted">The program&apos;s own TEE key set. An admin add_signer does not change it.</div>
+              </>
+            ) : (
+              <span className="muted small">global allowlist (pre-v3 program)</span>
+            )}
+          </dd>
           <dt>Rules</dt>
           <dd className="small">
             dispute window {fmtSecs(p.dispute_secs)} · min confidence {p.min_confidence} · first valid claim per request wins · the request must name the submitting hunter
+            {p.bond !== null && (
+              <>
+                {' '}
+                · hunter bond <strong>{yoctoToNear(p.bond)} Ⓝ</strong> (returned when paid, goes to the pool when rejected)
+              </>
+            )}
+            {p.challenge_secs !== null && <> · {fmtSecs(p.challenge_secs)} to answer a decryption challenge</>}
           </dd>
         </dl>
       </div>
@@ -145,7 +215,7 @@ export function ProgramDetail() {
                 <strong>{c.refused_at_submit ? 'Attempt (not onchain)' : `Claim #${c.id}`}</strong> <span className="muted">by</span>{' '}
                 <span className="mono">{c.hunter}</span>
               </div>
-              {c.refused_at_submit ? <Badge>refused at submit</Badge> : <Badge tone={tone(c.status)}>{c.status}</Badge>}
+              {c.refused_at_submit ? <Badge>refused at submit</Badge> : <Badge tone={statusTone(c.status)}>{c.status}</Badge>}
             </div>
             <div className="small muted">
               submitted {fmtDate(c.submitted_at)}
@@ -170,7 +240,7 @@ export function ProgramDetail() {
                 <span title="Probability that this verdict is correct">{c.verdict.confidence}% confident in this verdict</span>
               </div>
               <div>
-                {payable(c, p.min_confidence) && c.status === 'Rejected' ? (
+                {payable(c, p.min_confidence) && (c.status === 'Rejected' || c.status === 'PayoutFailed') ? (
                   <span className="muted">
                     Payout: <s>{yoctoToNear(c.payout)} Ⓝ</s> returned to the pool
                   </span>
@@ -181,24 +251,28 @@ export function ProgramDetail() {
                 ) : (
                   <span className="muted">Not payable (needs valid, severity ≠ none, confidence ≥ {p.min_confidence})</span>
                 )}
+                {c.bond !== null && !c.refused_at_submit && (
+                  <span className="muted">
+                    {' '}
+                    · bond {yoctoToNear(c.bond)} Ⓝ{' '}
+                    {c.status === 'Paid' ? 'returned' : c.status === 'Rejected' ? 'forfeited to the pool' : c.status === 'PayoutFailed' ? 'back to the pool' : 'held'}
+                  </span>
+                )}
               </div>
-              {c.status === 'Pending' && !c.refused_at_submit && (
-                <div className="pending">
-                  <Countdown until={c.finalize_after} />
+              <ClaimStatus c={c} program={p} />
+              {c.synthetic && (
+                <div className="muted small">
+                  <strong>Synthetic demo claim:</strong> {c.synthetic}
                 </div>
               )}
-              {c.refused_at_submit ? (
-                <div className="muted">
-                  Refused at submit: <code>submit_claim</code> reverts with &quot;{c.refused_at_submit}&quot;, so nothing is stored onchain. Shown
-                  here with its real TEE output.
-                </div>
-              ) : (
-                c.status === 'Rejected' && (
-                  <div className="rejected">
-                    Rejected by owner dispute: <strong>{c.reject_reason ?? 'no reason given'}</strong>
-                    {c.reject_reason && REJECT_WHY[c.reject_reason] && <div className="small">{REJECT_WHY[c.reject_reason]}</div>}
-                  </div>
-                )
+              {c.history && (
+                <ol className="history small">
+                  {c.history.map((h) => (
+                    <li key={h.event}>
+                      <span className="muted">{fmtDate(h.at)}</span> {h.event}
+                    </li>
+                  ))}
+                </ol>
               )}
             </div>
             <div className="hashes small">

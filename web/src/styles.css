@@ -118,6 +118,11 @@ footer { text-align: center; padding: 24px; }
 .pending { color: var(--warn); }
 .rejected { color: var(--bad); }
 .rejected .small { color: var(--text); margin-top: 2px; }
+.challenged { color: var(--warn); padding: 6px 8px; border-radius: 6px; background: var(--warn-bg); }
+.challenged .small { color: var(--text); margin-top: 2px; }
+.history { margin: 4px 0 0; padding-left: 18px; }
+.history li { margin: 1px 0; }
+.undecryptable { margin-top: 10px; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--bad); background: var(--bad-bg); font-weight: 600; }
 .dispute-hint { margin-top: 10px; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--bad); background: var(--bad-bg); }
 .dispute-hint.ok { border-color: var(--ok); background: var(--ok-bg); }
 .check-ok { color: var(--ok); }

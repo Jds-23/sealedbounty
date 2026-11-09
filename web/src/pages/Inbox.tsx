@@ -6,6 +6,10 @@ import { sha256hex } from '../lib/verify';
 import { auditRequest, REASON_TEXT, type RequestAudit } from '../lib/requestChecks';
 import type { Claim, Program } from '../lib/types';
 import { Badge, Hash, StatusIcon } from '../components/ui';
+import { statusTone, undecryptableHint } from '../lib/status';
+
+/** Renders `code` spans in a hint string. */
+const withCode = (t: string) => t.split('`').map((part, i) => (i % 2 ? <code key={i}>{part}</code> : part));
 
 interface Decrypted {
   claim: Claim;
@@ -68,7 +72,21 @@ function Report({ d }: { d: Decrypted }) {
   if (error) {
     return (
       <div className="card">
-        <strong>Claim #{claim.id}</strong> <span className="bad">{error}</span>
+        <div className="row between wrap">
+          <strong>
+            Claim #{claim.id} · {program?.name ?? `program ${claim.program_id}`} · <span className="mono small">{claim.hunter}</span>
+          </strong>
+          <Badge tone={statusTone(claim.status)}>{claim.status}</Badge>
+        </div>
+        <p className="bad small">{error}</p>
+        <div className="undecryptable">{withCode(undecryptableHint(claim))}</div>
+        {claim.status === 'Pending' && (
+          <p className="small muted">
+            Flagging moves the claim to Challenged. The hunter then has {program?.challenge_secs ? `${Math.round(program.challenge_secs / 3600)}h` : 'challenge_secs'} to
+            reveal the ephemeral key with <code>prove_ciphertext</code>; if they don&apos;t, it is rejected as &quot;undecryptable report&quot; and the
+            bond goes to your pool.
+          </p>
+        )}
       </div>
     );
   }
@@ -82,7 +100,7 @@ function Report({ d }: { d: Decrypted }) {
         <strong>
           Claim #{claim.id} · {program?.name ?? `program ${claim.program_id}`} · <span className="mono small">{claim.hunter}</span>
         </strong>
-        <Badge tone={claim.status === 'Pending' ? 'warn' : claim.status === 'Paid' ? 'ok' : 'bad'}>{claim.status}</Badge>
+        <Badge tone={statusTone(claim.status)}>{claim.status}</Badge>
       </div>
       <ul className="checks">
         <li>

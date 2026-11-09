@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import type { Claim, Program, SignerEntry } from './lib/types';
-import { getSigners, listClaims, listPrograms } from './lib/near';
+import { getRevoked, getSigners, listClaims, listPrograms } from './lib/near';
 import { buildDemo, DEMO_SIGNERS } from './lib/demo';
 
 export type Mode = 'auto' | 'demo' | 'live';
@@ -16,9 +16,12 @@ interface DataState {
   programs: Program[];
   claims: Claim[];
   signers: SignerEntry[] | null;
+  /** v3 #6: revoked signers (null = unknown / pre-v3 contract). */
+  revoked: ReadonlySet<string> | null;
   reload: () => void;
 }
 
+const NO_REVOKED: ReadonlySet<string> = new Set();
 const Ctx = createContext<DataState | null>(null);
 
 const readMode = (): Mode => {
@@ -33,12 +36,13 @@ const readMode = (): Mode => {
 export function DataProvider({ children }: { children: ReactNode }) {
   const [mode, setModeState] = useState<Mode>(readMode);
   const [loading, setLoading] = useState(true);
-  const [live, setLive] = useState<{ programs: Program[]; claims: Claim[]; signers: SignerEntry[] | null; error: string | null }>({
-    programs: [],
-    claims: [],
-    signers: null,
-    error: null,
-  });
+  const [live, setLive] = useState<{
+    programs: Program[];
+    claims: Claim[];
+    signers: SignerEntry[] | null;
+    revoked: ReadonlySet<string> | null;
+    error: string | null;
+  }>({ programs: [], claims: [], signers: null, revoked: null, error: null });
   const [tick, setTick] = useState(0);
   const demo = useMemo(() => buildDemo(), []);
 
@@ -62,9 +66,10 @@ export function DataProvider({ children }: { children: ReactNode }) {
       try {
         const [programs, signers] = await Promise.all([listPrograms(), getSigners().catch(() => null)]);
         const claims = (await Promise.all(programs.map((p) => listClaims(p.id)))).flat();
-        if (!cancelled) setLive({ programs, claims, signers, error: null });
+        const revoked = programs.some((p) => p.signers) ? await getRevoked(claims.map((c) => c.signer)) : null;
+        if (!cancelled) setLive({ programs, claims, signers, revoked, error: null });
       } catch (e) {
-        if (!cancelled) setLive({ programs: [], claims: [], signers: null, error: (e as Error).message });
+        if (!cancelled) setLive({ programs: [], claims: [], signers: null, revoked: null, error: (e as Error).message });
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -94,6 +99,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
     programs: isDemo ? demo.programs : live.programs,
     claims: isDemo ? demo.claims : live.claims,
     signers: isDemo ? DEMO_SIGNERS : live.signers,
+    revoked: isDemo ? NO_REVOKED : live.revoked,
     reload,
   };
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
