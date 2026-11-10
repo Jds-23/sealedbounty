@@ -153,3 +153,29 @@ Each issue is fixed with TDD on its own branch: a RED test commit (proves the bu
 - Live demo program: **1** "vuln-app demo (v3)" (`create_program` tx `BQ94ZkNELjxoae1wr7MvW7syyK8gWeX5Gryo7xT1ZXDD`; payouts 0.05/0.1/0.2/0.3, dispute 180 s, challenge 150 s, bond 0.05, min_confidence 80; params_hash `61b52e7b87e42a2bc4b6f417d21ba0e9d44f3e1f4ff49fa9d2f3334e5aa0eda7`). Program 0 was created with a wrong `repo_url`, then closed and refunded.
 - Claims on program 1: 0 Paid (after a challenge answered by `prove_ciphertext`), 1 Rejected `params tampered` (real TEE-signed attack, `fixtures/attack.params-tampered.json`), 2 `code mismatch`, 3 `hunter mismatch`, 4 `undecryptable report`. The README has the tx table.
 - History: v2 `sealedbounty-v2.testnet`, v1 `escrow.baldingsucks7993.testnet`.
+
+---
+# v4 (in source, not deployed): hunter liveness fixes for #23 and #24
+`sealedbounty-v3.testnet` is unchanged; this is for the next fresh deploy (no migration of v3 state: `Claim` gains a
+borsh field). TDD pairs `test(#23)`/`fix(#23)` and `test(#24)`/`fix(#24)`.
+
+## #23 minimum windows
+- `create_program` panics `"dispute_secs below minimum"` / `"challenge_secs below minimum"` if a window is under
+  `MIN_DISPUTE_SECS` / `MIN_CHALLENGE_SECS`. Checked after the overflow checks, dispute first.
+- Production build (default features): both minimums are **86400 s (1 day)**. The v3 demo windows (dispute 180 s,
+  challenge 150 s) are refused.
+- Cargo feature `short-windows` (and `cfg(test)`): minimum dispute 0 s, challenge 10 s. The sandbox tests build
+  the wasm with it; a short-window demo deploy would need it too. Never enable it for a real deploy.
+
+## #24 owner flag bond
+- `flag_undecryptable(claim_id)` is **payable**: attach at least `program.bond` (else `"insufficient flag bond"`);
+  the excess is refunded to the owner. A zero-bond program has a zero flag bond.
+- `Claim` gains `flag_bond: U128` (last field; `"0"` until flagged).
+- Settlement reuses the existing paths:
+  - proven, all checks pass → back to `Pending`; `finalize` transfers `payout + bond + flag_bond` to the hunter;
+    if that transfer fails, `on_payout` → `PayoutFailed` and credits `payout + bond + flag_bond` to `program.balance`.
+  - any rejection (no proof by the deadline, bogus secret, proven body fails a check, or a revoked signer) → the
+    flag bond goes to `program.balance` with the payout and the hunter bond.
+- Events: `claim_challenged`, `claim_proven` and `claim_paid` add `flag_bond`.
+- CLI / web: unchanged. They target v3, where attaching a deposit to `flag_undecryptable` would fail
+  (not payable). Against a v4 deploy, `sb flag-undecryptable` needs a deposit of `program.bond` added.

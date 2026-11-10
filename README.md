@@ -176,6 +176,14 @@ Each v3 issue was fixed with TDD on its own branch: a **RED** commit with a fail
 [PR #11](https://github.com/Jds-23/sealedbounty/pull/11), and every attack was then replayed on the live v3 contract
 (the table above). The spec for each fix is in [`docs/INTERFACE.md`](./docs/INTERFACE.md), section "v3".
 
+**v4, in source, not on `sealedbounty-v3.testnet`** (next deploy; spec in
+[`docs/INTERFACE.md`](./docs/INTERFACE.md), section "v4"):
+- [#23](https://github.com/Jds-23/sealedbounty/issues/23): `create_program` requires `dispute_secs` and
+  `challenge_secs` of at least one day, so an owner can't pick a challenge window an offline hunter can't answer.
+  The `short-windows` build feature lowers this for the sandbox tests and short-window demos.
+- [#24](https://github.com/Jds-23/sealedbounty/issues/24): `flag_undecryptable` is payable. The owner stakes the
+  program's `bond`; it goes to the hunter if they prove the ciphertext, and to the program pool otherwise.
+
 ## History
 
 ### v2 (`sealedbounty-v2.testnet`)
