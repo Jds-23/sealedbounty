@@ -268,6 +268,12 @@ payouts 0.1/0.2/0.3/0.5, 90 s window) paid claim 0, a live IDOR report (high, 98
      (11 `PASS` lines), `checkRequestAgainstProgram  ok: a dispute would fail`, the request body encrypted to a
      throwaway key, the exact `submit_claim` args, the storage deposit (about 0.1225 NEAR) plus the 0.05 NEAR bond,
      and `--dry-run: not sent`. No network is used.
+
+   This output is for a clean clone with no `.env` and no `~/.sealedbounty`. With `NEAR_TESTNET_ACCOUNT_ID` (or
+   `NEAR_ACCOUNT_ID`) set to an account other than the fixture's hunter, the dry-run pre-checks as that account and
+   prints `FAIL checkRequestAgainstProgram  hunter mismatch` plus a `WARNING: hunter mismatch` line. With an owner
+   key file `~/.sealedbounty/owner-<contract>-0.json`, the body is encrypted to that local key instead of a throwaway
+   one. The exit code is 0 in both cases.
 5. Run `make test-cli` to see `Tests 89 passed (89)`, and `make test-web` to see `Tests 128 passed | 1 skipped (129)`
    (the skipped test needs the v1 owner key file, which only exists on the deployer's machine, where all 129 pass).
    The shared library's own tests run with `pnpm test` in `shared/` (`tests 101`, `pass 101`, including the Rust/JS canonical-number vectors).
@@ -451,7 +457,28 @@ Limits:
   cross-checked against `contracts/sealed-bounty/tests/fixtures/canonical-vectors.json`; fixed in #15). serde_json's
   float parsing isn't correctly rounded, so the next deploy rejects any non-integer param (`STRICT_PARAM_NUMBERS`,
   in source, not on `sealedbounty-v3.testnet`). Honest clients always send integer params.
-- On duplicate bugs, the first claim wins. There is no semantic deduplication across different reports.
+- **The same bug can be paid more than once.** Deduplication is exact-request only: `submit_claim` rejects a
+  `req_hash` already used in the program (`already claimed`), nothing more. Re-judging the same bug with any byte
+  changed (a reworded or extra line in the REPORT) gives a new `req_hash`, a fresh TEE signature and a payable claim,
+  and no dispute reason covers it. On `sealedbounty-v3.testnet`, program 2 claims 5, 7, 8 and 9 were all Paid to the
+  same hunter for the same critical CWE-89 SQLi (0.3 NEAR each); the demo helper appends a run trailer to the REPORT
+  to get past `already claimed`. Owners should size the pool for this and watch the inbox for repeats. Next step: the
+  judge emits a canonical finding key (CWE + file + route) inside the signed verdict and the contract dedupes on it
+  per program, or a per-severity payout cap.
+- **Hunters must stay online to answer a challenge.** `flag_undecryptable` costs the owner nothing (no bond), and the
+  hunter must `prove_ciphertext` within `challenge_secs`, which has no enforced minimum (the demo uses 150 s; the CLI
+  default is 600 s). An offline hunter loses the claim and the bond even when honest, and the owner may already have
+  read the report. Hunters should run a watcher, and real programs need long windows. Next step: a minimum challenge
+  window and an owner bond on `flag_undecryptable`.
+- **Attestation doesn't pin TEE measurements.** `sb attest` verifies the TDX quote (DCAP via dcap-qvl), the NVIDIA
+  NRAS GPU evidence, the `report_data` binding of the signing key and nonce, and that MRCONFIGID equals the hash of
+  the `app_compose` the CVM reports. It doesn't compare MRTD, the RTMRs or the compose hash with expected values, so
+  it trusts that any genuine NEAR AI CVM runs the expected software.
+- **Requests aren't bound to a program id.** The request names the target only by its `TARGET <repo>@<commit>` line,
+  and `already claimed` is per program. A judgement for one program is therefore also valid in any other program
+  with the same system prompt, model, params, `code_hash` and repo@commit (and a signer in its set): the named
+  `HUNTER` can re-encrypt the body to the second owner's key and get paid again, and no dispute reason applies.
+  Owners re-posting a program for the same commit should expect old judgements to be claimable.
 - **The contract accounts still hold full-access keys on testnet** (`sealedbounty-v3.testnet`, and the v2 and v1
   escrows), so their deployer could redeploy the code. Before mainnet, delete those keys (or hand upgrades to a DAO)
   so the code is locked.
