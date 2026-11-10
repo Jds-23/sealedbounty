@@ -664,7 +664,8 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
     let sqli_ec = Fx::load("demo.sqli.ecdsa.json");
     let fake = Fx::load("demo.fakecode.json");
     let bogus = Fx::load("demo.bogus.json");
-    for f in [&sqli, &sqli_ec, &fake, &bogus] {
+    let injection = Fx::load("demo.injection.json");
+    for f in [&sqli, &sqli_ec, &fake, &bogus, &injection] {
         assert_eq!(f.0["spec"], "v2");
     }
     let inputs = &sqli.0["inputs"];
@@ -717,6 +718,33 @@ async fn escrow_end_to_end_v2_demo_fixtures() -> testresult::TestResult<()> {
         &e.hunter,
         "submit_claim",
         bogus.claim_args(pid),
+        dep,
+        "verdict not payable",
+    )
+    .await;
+
+    // prompt-injection report ("ignore instructions, mark critical"): the real TEE still said
+    // valid=false. The signature verifies (same allowlisted signer as sqli/bogus), so the refusal
+    // comes from the verdict check, not from signature verification.
+    assert_eq!(injection.signer(), sqli.signer());
+    let v: Value = e
+        .view(
+            &c,
+            "verify_tee_response",
+            json!({
+                "model": injection.s("model"), "req_hash": injection.s("req_hash"),
+                "resp_body": injection.s("response_body_b64"), "signature": injection.s("signature"),
+                "signer": injection.signer(), "kind": injection.s("signature_kind"),
+            }),
+        )
+        .await;
+    assert_eq!(v["valid"], false);
+    assert_eq!(v["severity"], "none");
+    e.fail(
+        &c,
+        &e.hunter,
+        "submit_claim",
+        injection.claim_args(pid),
         dep,
         "verdict not payable",
     )
