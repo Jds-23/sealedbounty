@@ -355,6 +355,43 @@ fn has_float(v: &serde_json::Value) -> bool {
     }
 }
 
+/// #23 minimum windows, in source, NOT on `sealedbounty-v3.testnet` (which has no minimum).
+/// A production build (`cargo near build`, default features) requires `dispute_secs` and
+/// `challenge_secs` of at least one day, so an owner can't pick a challenge window an honest but
+/// offline hunter can't answer (#23). Unit tests (`cfg(test)`) and the sandbox wasm (feature
+/// `short-windows`, also what a short-window demo deploy would need) use [`SHORT_MIN_DISPUTE_SECS`]
+/// / [`SHORT_MIN_CHALLENGE_SECS`] so they can run in seconds.
+pub(crate) const PROD_MIN_DISPUTE_SECS: u64 = 24 * 60 * 60;
+pub(crate) const PROD_MIN_CHALLENGE_SECS: u64 = 24 * 60 * 60;
+pub(crate) const SHORT_MIN_DISPUTE_SECS: u64 = 0;
+pub(crate) const SHORT_MIN_CHALLENGE_SECS: u64 = 10;
+#[cfg(not(any(test, feature = "short-windows")))]
+pub(crate) const MIN_DISPUTE_SECS: u64 = PROD_MIN_DISPUTE_SECS;
+#[cfg(not(any(test, feature = "short-windows")))]
+pub(crate) const MIN_CHALLENGE_SECS: u64 = PROD_MIN_CHALLENGE_SECS;
+#[cfg(any(test, feature = "short-windows"))]
+pub(crate) const MIN_DISPUTE_SECS: u64 = SHORT_MIN_DISPUTE_SECS;
+#[cfg(any(test, feature = "short-windows"))]
+pub(crate) const MIN_CHALLENGE_SECS: u64 = SHORT_MIN_CHALLENGE_SECS;
+
+/// `create_program`'s window check: the first failing rule, or `None`. Order: dispute overflow,
+/// challenge overflow, dispute minimum, challenge minimum.
+pub(crate) fn window_error(
+    dispute_secs: u64,
+    challenge_secs: u64,
+    min_dispute_secs: u64,
+    min_challenge_secs: u64,
+) -> Option<&'static str> {
+    let _ = (min_dispute_secs, min_challenge_secs);
+    if dispute_secs.checked_mul(NANOS_PER_SEC).is_none() {
+        return Some("dispute_secs too large");
+    }
+    if challenge_secs.checked_mul(NANOS_PER_SEC).is_none() {
+        return Some("challenge_secs too large");
+    }
+    None
+}
+
 pub(crate) const TAMPERED: &str = "system prompt tampered";
 pub(crate) const MODEL_MISMATCH: &str = "model mismatch";
 pub(crate) const PARAMS_TAMPERED: &str = "params tampered";
@@ -594,14 +631,14 @@ impl Contract {
         let params_hash = tee::normalize_hash_hex(&params_hash)
             .unwrap_or_else(|_| env::panic_str("params_hash must be 64 hex chars"));
         require!(min_confidence <= 100, "min_confidence must be <= 100");
-        require!(
-            dispute_secs.checked_mul(NANOS_PER_SEC).is_some(),
-            "dispute_secs too large"
-        );
-        require!(
-            challenge_secs.checked_mul(NANOS_PER_SEC).is_some(),
-            "challenge_secs too large"
-        );
+        if let Some(e) = window_error(
+            dispute_secs,
+            challenge_secs,
+            MIN_DISPUTE_SECS,
+            MIN_CHALLENGE_SECS,
+        ) {
+            env::panic_str(e);
+        }
         let signers = self.program_signers(&model_id, signers);
 
         let before = env::storage_usage();

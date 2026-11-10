@@ -290,8 +290,14 @@ impl Env {
 
 /// Build the wasm, start a sandbox, create admin/owner/stranger and the given hunter account
 /// (sandbox accounts are state patches, so any name works, e.g. a `.testnet` one).
+/// The wasm is built with the `short-windows` feature (#23) so programs can use the 20 s windows
+/// above; the production minimums (one day) are checked against the default build in test_verify.rs.
 async fn start(hunter: &str) -> testresult::TestResult<Env> {
-    let wasm_path = cargo_near_build::build_with_cli(Default::default())?;
+    let wasm_path = cargo_near_build::build_with_cli(cargo_near_build::BuildOpts {
+        features: Some("short-windows".into()),
+        out_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/target/near/short-windows").into()),
+        ..Default::default()
+    })?;
     let wasm = std::fs::read(&wasm_path)?;
     println!("wasm size: {} bytes", wasm.len());
 
@@ -958,6 +964,18 @@ async fn escrow_end_to_end_decryption_challenge() -> testresult::TestResult<()> 
         "owner_enc_pubkey": b64(&owner_pub), "dispute_secs": DISPUTE_SECS, "min_confidence": 80,
         "bond": BOND.to_string(), "challenge_secs": CHALLENGE_SECS, "signers": null,
     });
+    // #23: even the short-windows build refuses a challenge window under 10 s
+    let mut short = args.clone();
+    short["challenge_secs"] = json!(5);
+    e.fail(
+        &c,
+        &e.owner,
+        "create_program",
+        short,
+        10 * NEAR,
+        "challenge_secs below minimum",
+    )
+    .await;
     let pid: u64 = e
         .ok(&c, &e.owner, "create_program", args, 10 * NEAR)
         .await

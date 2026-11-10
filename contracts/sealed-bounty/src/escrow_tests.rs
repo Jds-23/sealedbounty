@@ -2551,6 +2551,89 @@ fn create_program_challenge_secs_overflow() {
     );
 }
 
+// ---------------- #23: minimum dispute / challenge windows ----------------
+
+/// v2 program with the given windows (bond 0).
+fn create_windows(c: &mut Contract, dispute_secs: u64, challenge_secs: u64) -> u64 {
+    ctx(owner(), NEAR, T0);
+    c.create_program(
+        "x".into(),
+        REPO.into(),
+        COMMIT.into(),
+        MODEL.into(),
+        tee::sha256_hex(SYS.as_bytes()),
+        tee::sha256_hex(BUNDLE.as_bytes()),
+        v2_params_hash(),
+        payouts(),
+        "k".into(),
+        dispute_secs,
+        0,
+        U128(0),
+        challenge_secs,
+        None,
+    )
+}
+
+/// #23: a production build requires one day for both windows; the v3 demo windows (dispute 180 s,
+/// challenge 150 s) and a 1 s challenge are refused.
+#[test]
+fn prod_min_windows_enforced() {
+    const DAY: u64 = 24 * 60 * 60;
+    assert_eq!((PROD_MIN_DISPUTE_SECS, PROD_MIN_CHALLENGE_SECS), (DAY, DAY));
+    let prod = |d, ch| window_error(d, ch, PROD_MIN_DISPUTE_SECS, PROD_MIN_CHALLENGE_SECS);
+    assert_eq!(prod(DAY, DAY), None);
+    assert_eq!(prod(7 * DAY, 3 * DAY), None);
+    assert_eq!(prod(DAY, 150), Some("challenge_secs below minimum"));
+    assert_eq!(prod(DAY, 1), Some("challenge_secs below minimum"));
+    assert_eq!(prod(DAY, 0), Some("challenge_secs below minimum"));
+    assert_eq!(prod(DAY, DAY - 1), Some("challenge_secs below minimum"));
+    assert_eq!(prod(180, DAY), Some("dispute_secs below minimum"));
+    assert_eq!(prod(DAY - 1, DAY), Some("dispute_secs below minimum"));
+    // dispute is checked first; overflow before the minimums
+    assert_eq!(prod(180, 150), Some("dispute_secs below minimum"));
+    assert_eq!(prod(u64::MAX, 0), Some("dispute_secs too large"));
+    assert_eq!(prod(DAY, u64::MAX), Some("challenge_secs too large"));
+}
+
+/// #23: unit tests run with the short-window minimums (same as the sandbox `short-windows` wasm).
+#[test]
+fn test_build_uses_short_min_windows() {
+    assert_eq!(
+        (MIN_DISPUTE_SECS, MIN_CHALLENGE_SECS),
+        (SHORT_MIN_DISPUTE_SECS, SHORT_MIN_CHALLENGE_SECS)
+    );
+    assert!(
+        SHORT_MIN_CHALLENGE_SECS > 0,
+        "a zero challenge window is never allowed"
+    );
+    assert!(CHALLENGE_SECS >= MIN_CHALLENGE_SECS);
+}
+
+#[test]
+#[should_panic(expected = "challenge_secs below minimum")]
+fn create_program_challenge_secs_below_min() {
+    let mut c = setup();
+    create_windows(&mut c, 60, MIN_CHALLENGE_SECS - 1);
+}
+
+#[test]
+#[should_panic(expected = "challenge_secs below minimum")]
+fn create_program_zero_challenge_secs() {
+    let mut c = setup();
+    create_windows(&mut c, 60, 0);
+}
+
+#[test]
+fn create_program_challenge_secs_at_min_ok() {
+    let mut c = setup();
+    let pid = create_windows(&mut c, MIN_DISPUTE_SECS, MIN_CHALLENGE_SECS);
+    let p = c.get_program(pid).unwrap();
+    assert_eq!(
+        (p.dispute_secs, p.challenge_secs),
+        (MIN_DISPUTE_SECS, MIN_CHALLENGE_SECS)
+    );
+}
+
 #[test]
 fn json_shapes_challenge() {
     let body = v2_req(hunter().as_str()).to_string();

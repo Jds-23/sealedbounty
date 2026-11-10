@@ -112,7 +112,10 @@ async fn verify_tee_response_on_sandbox() -> testresult::TestResult<()> {
             .fetch_from(&net)
             .await
             .unwrap_or_else(|e| panic!("view verify_tee_response ({label}) failed: {e:?}"));
-        println!("[OK] view verify_tee_response {label}: verdict = {:?}", v.data);
+        println!(
+            "[OK] view verify_tee_response {label}: verdict = {:?}",
+            v.data
+        );
         assert!(v.data.valid, "{label}: view verdict should be valid");
     }
 
@@ -189,6 +192,49 @@ async fn verify_tee_response_on_sandbox() -> testresult::TestResult<()> {
         "signer not allowlisted",
     )
     .await;
+
+    // #23: the production (default-feature) wasm requires one-day dispute and challenge windows.
+    // The v3 demo windows (dispute 180 s, challenge 150 s) are refused.
+    const DAY: u64 = 24 * 60 * 60;
+    let zero = "00".repeat(32);
+    let program = |dispute_secs: u64, challenge_secs: u64| {
+        json!({
+            "name": "x", "repo_url": "https://github.com/x/y", "commit": "abc123",
+            "model_id": ec.s("model"), "system_prompt_hash": zero, "code_hash": zero,
+            "params_hash": zero,
+            "payouts": { "low": "1", "medium": "1", "high": "1", "critical": "1" },
+            "owner_enc_pubkey": "k", "dispute_secs": dispute_secs, "min_confidence": 0,
+            "bond": "0", "challenge_secs": challenge_secs, "signers": null,
+        })
+    };
+    for (dispute_secs, challenge_secs, needle) in [
+        (180, 150, "dispute_secs below minimum"),
+        (DAY, 150, "challenge_secs below minimum"),
+        (DAY, DAY - 1, "challenge_secs below minimum"),
+    ] {
+        let err = contract
+            .call_function("create_program", program(dispute_secs, challenge_secs))
+            .transaction()
+            .gas(NearGas::from_tgas(300))
+            .deposit(NearToken::from_near(1))
+            .with_signer(owner.account_id().clone(), signer.clone())
+            .send_to(&net)
+            .await?
+            .assert_failure();
+        let msg = format!("{err:?}");
+        assert!(msg.contains(needle), "expected '{needle}' in {msg}");
+        println!("[FAIL as expected] create_program({dispute_secs}, {challenge_secs}): '{needle}'");
+    }
+    contract
+        .call_function("create_program", program(DAY, DAY))
+        .transaction()
+        .gas(NearGas::from_tgas(300))
+        .deposit(NearToken::from_near(1))
+        .with_signer(owner.account_id().clone(), signer.clone())
+        .send_to(&net)
+        .await?
+        .assert_success();
+    println!("[OK] create_program with one-day windows");
 
     // non-owner cannot add signers
     contract
