@@ -123,6 +123,8 @@ pub struct Claim {
     pub bond: U128,
     /// Set while/after `Challenged`: the hunter must prove the ciphertext before this. v3 (#2).
     pub challenge_deadline: Option<U64>,
+    /// Owner stake attached to `flag_undecryptable` (= `program.bond`; 0 until flagged). #24.
+    pub flag_bond: U128,
 }
 
 #[near]
@@ -844,6 +846,7 @@ impl Contract {
                 reject_reason: None,
                 bond: U128(bond),
                 challenge_deadline: None,
+                flag_bond: U128(0),
             },
         );
         let ids = self

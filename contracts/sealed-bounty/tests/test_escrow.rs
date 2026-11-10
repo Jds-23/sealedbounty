@@ -995,18 +995,29 @@ async fn escrow_end_to_end_decryption_challenge() -> testresult::TestResult<()> 
         .ok(&c, &e.hunter, "submit_claim", ca, NEAR / 2 + BOND)
         .await
         .json()?;
+    // #24: flagging needs the owner flag bond (= program.bond)
+    e.fail(
+        &c,
+        &e.owner,
+        "flag_undecryptable",
+        json!({ "claim_id": cid }),
+        0,
+        "insufficient flag bond",
+    )
+    .await;
     let r = e
         .ok(
             &c,
             &e.owner,
             "flag_undecryptable",
             json!({ "claim_id": cid }),
-            0,
+            BOND,
         )
         .await;
     println!("  [GAS] flag_undecryptable: {}", tgas(r.total_gas_burnt));
     let claim: Value = e.view(&c, "get_claim", json!({ "id": cid })).await;
     assert_eq!(claim["status"], "Challenged");
+    assert_eq!(u128_of(&claim["flag_bond"]), BOND);
     let secret = hex::encode(eph_sk);
     e.fail(
         &c,
@@ -1046,7 +1057,11 @@ async fn escrow_end_to_end_decryption_challenge() -> testresult::TestResult<()> 
     let before = e.balance(&e.hunter).await;
     e.ok(&c, &e.stranger, "finalize", json!({ "claim_id": cid }), 0)
         .await;
-    assert_eq!(e.balance(&e.hunter).await - before, 3 * NEAR + BOND);
+    assert_eq!(
+        e.balance(&e.hunter).await - before,
+        3 * NEAR + BOND + BOND,
+        "payout + hunter bond + the owner's flag bond (#24)"
+    );
 
     // ---- junk ciphertext: flag, the hunter stays silent, finalize rejects ----
     let p: Value = e.view(&c, "get_program", json!({ "id": pid })).await;
@@ -1066,7 +1081,7 @@ async fn escrow_end_to_end_decryption_challenge() -> testresult::TestResult<()> 
         &e.owner,
         "flag_undecryptable",
         json!({ "claim_id": fid }),
-        0,
+        BOND,
     )
     .await;
     e.fail(
@@ -1097,8 +1112,8 @@ async fn escrow_end_to_end_decryption_challenge() -> testresult::TestResult<()> 
     assert_eq!(u128_of(&p["reserved"]), 0);
     assert_eq!(
         u128_of(&p["balance"]),
-        bal_before + BOND,
-        "undecryptable: bond forfeited to the pool (#4)"
+        bal_before + BOND + BOND,
+        "undecryptable: hunter bond forfeited (#4) and flag bond (#24) to the pool"
     );
     Ok(())
 }
