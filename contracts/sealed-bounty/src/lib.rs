@@ -124,6 +124,8 @@ pub struct Claim {
     /// Set while/after `Challenged`: the hunter must prove the ciphertext before this. v3 (#2).
     pub challenge_deadline: Option<U64>,
     /// Owner stake attached to `flag_undecryptable` (= `program.bond`; 0 until flagged). #24.
+    /// Paid to the hunter with the claim if the ciphertext is proven (Paid; credited to the pool
+    /// with the rest on PayoutFailed); goes to the program balance on any rejection.
     pub flag_bond: U128,
 }
 
@@ -363,9 +365,13 @@ fn has_float(v: &serde_json::Value) -> bool {
 /// offline hunter can't answer (#23). Unit tests (`cfg(test)`) and the sandbox wasm (feature
 /// `short-windows`, also what a short-window demo deploy would need) use [`SHORT_MIN_DISPUTE_SECS`]
 /// / [`SHORT_MIN_CHALLENGE_SECS`] so they can run in seconds.
+#[allow(dead_code)] // unused by a `short-windows` build
 pub(crate) const PROD_MIN_DISPUTE_SECS: u64 = 24 * 60 * 60;
+#[allow(dead_code)]
 pub(crate) const PROD_MIN_CHALLENGE_SECS: u64 = 24 * 60 * 60;
+#[allow(dead_code)] // unused by a production build
 pub(crate) const SHORT_MIN_DISPUTE_SECS: u64 = 0;
+#[allow(dead_code)]
 pub(crate) const SHORT_MIN_CHALLENGE_SECS: u64 = 10;
 #[cfg(not(any(test, feature = "short-windows")))]
 pub(crate) const MIN_DISPUTE_SECS: u64 = PROD_MIN_DISPUTE_SECS;
@@ -911,21 +917,23 @@ impl Contract {
         self.reject_claim(claim_id, reason);
     }
 
-    /// Reject a Pending/Challenged claim: its payout and the hunter's bond (#4) go to the program
-    /// balance. On "hunter mismatch" (front-run) the req_hash is released so the real hunter can resubmit.
+    /// Reject a Pending/Challenged claim: its payout, the hunter's bond (#4) and the owner's flag
+    /// bond, if any (#24), go to the program balance. On "hunter mismatch" (front-run) the
+    /// req_hash is released so the real hunter can resubmit.
     fn reject_claim(&mut self, claim_id: u64, reason: &str) {
         let c = self.claims.get_mut(&claim_id).expect("claim exists");
         c.status = ClaimStatus::Rejected;
         c.reject_reason = Some(reason.to_string());
-        let (program_id, payout, bond) = (c.program_id, c.payout.0, c.bond.0);
+        let (program_id, payout, bonds) = (c.program_id, c.payout.0, c.bond.0 + c.flag_bond.0);
         if reason == HUNTER_MISMATCH {
             let key = dedupe_key(program_id, &c.req_hash);
             self.used_req_hashes.remove(&key);
         }
         let p = self.program_mut(program_id);
         p.reserved = U128(p.reserved.0 - payout);
-        // Payout back to the pool; the hunter's bond (#4) is forfeited to it too.
-        p.balance = U128(p.balance.0 + payout + bond);
+        // Payout back to the pool; the hunter's bond (#4) is forfeited to it too, and the owner's
+        // flag bond (#24) joins it (the flag was right, or the claim is unpayable anyway).
+        p.balance = U128(p.balance.0 + payout + bonds);
         emit(
             "claim_rejected",
             json!({"claim_id": claim_id, "program_id": program_id, "reason": reason}),
@@ -936,6 +944,10 @@ impl Contract {
     /// ciphertext does not decrypt to the judged request, so the owner cannot dispute. The claim
     /// becomes Challenged; the hunter has `challenge_secs` to `prove_ciphertext`, else
     /// `finalize` rejects it ("undecryptable report").
+    /// Payable (#24): the owner stakes `program.bond` as the flag bond (else "insufficient flag
+    /// bond"); the rest is refunded. A successful proof pays it to the hunter with the claim; a
+    /// rejection puts it in the program balance.
+    #[payable]
     pub fn flag_undecryptable(&mut self, claim_id: u64) {
         let claim = self
             .claims
@@ -951,12 +963,26 @@ impl Contract {
         require!(now < claim.finalize_after.0, "dispute window closed");
         let deadline = now + program.challenge_secs * NANOS_PER_SEC;
         let program_id = claim.program_id;
+        let flag_bond = program.bond.0;
+        let attached = env::attached_deposit().as_yoctonear();
+        require!(attached >= flag_bond, "insufficient flag bond");
         let c = self.claims.get_mut(&claim_id).unwrap();
         c.status = ClaimStatus::Challenged;
         c.challenge_deadline = Some(U64(deadline));
+        // Fixed-size field (set to 0 at submit_claim): no storage change.
+        c.flag_bond = U128(flag_bond);
+        let refund = attached - flag_bond;
+        if refund > 0 {
+            Promise::new(env::predecessor_account_id())
+                .transfer(NearToken::from_yoctonear(refund))
+                .detach();
+        }
         emit(
             "claim_challenged",
-            json!({"claim_id": claim_id, "program_id": program_id, "challenge_deadline": U64(deadline)}),
+            json!({
+                "claim_id": claim_id, "program_id": program_id,
+                "challenge_deadline": U64(deadline), "flag_bond": U128(flag_bond),
+            }),
         );
     }
 
@@ -999,13 +1025,17 @@ impl Contract {
         match reason {
             Some(r) => self.reject_claim(claim_id, r),
             None => {
-                let program_id = claim.program_id;
+                let (program_id, flag_bond) = (claim.program_id, claim.flag_bond);
                 let c = self.claims.get_mut(&claim_id).unwrap();
                 c.status = ClaimStatus::Pending;
                 c.finalize_after = U64(now);
+                // The flag bond (#24) stays on the claim and is paid to the hunter by finalize.
                 emit(
                     "claim_proven",
-                    json!({"claim_id": claim_id, "program_id": program_id, "finalize_after": U64(now)}),
+                    json!({
+                        "claim_id": claim_id, "program_id": program_id,
+                        "finalize_after": U64(now), "flag_bond": flag_bond,
+                    }),
                 );
             }
         }
@@ -1029,7 +1059,8 @@ impl Contract {
         String::from_utf8(plain).ok()
     }
 
-    /// Anyone, once the dispute window has passed. Pays the hunter `payout + bond`, then
+    /// Anyone, once the dispute window has passed. Pays the hunter `payout + bond + flag_bond`
+    /// (the owner's flag bond is non-zero only after a proven challenge, #24), then
     /// `on_payout` credits it back to the program if the transfer failed. Rejects the claim with
     /// "signer revoked" if its signer was revoked meanwhile (#6), or, on a Challenged claim whose
     /// hunter did not prove the ciphertext by the deadline, "undecryptable report" (#2). Every
@@ -1058,16 +1089,24 @@ impl Contract {
             return PromiseOrValue::Value(());
         }
         c.status = ClaimStatus::Paid;
-        let (program_id, payout, bond, hunter) =
-            (c.program_id, c.payout.0, c.bond.0, c.hunter.clone());
+        let (program_id, payout, bond, flag_bond, hunter) = (
+            c.program_id,
+            c.payout.0,
+            c.bond.0,
+            c.flag_bond.0,
+            c.hunter.clone(),
+        );
         let p = self.program_mut(program_id);
         p.reserved = U128(p.reserved.0 - payout);
         emit(
             "claim_paid",
-            json!({"claim_id": claim_id, "program_id": program_id, "hunter": hunter, "payout": U128(payout), "bond": U128(bond)}),
+            json!({
+                "claim_id": claim_id, "program_id": program_id, "hunter": hunter,
+                "payout": U128(payout), "bond": U128(bond), "flag_bond": U128(flag_bond),
+            }),
         );
         Promise::new(hunter)
-            .transfer(NearToken::from_yoctonear(payout + bond))
+            .transfer(NearToken::from_yoctonear(payout + bond + flag_bond))
             .then(
                 Self::ext(env::current_account_id())
                     .with_static_gas(GAS_ON_PAYOUT)
@@ -1077,8 +1116,8 @@ impl Contract {
     }
 
     /// Callback of `finalize`'s transfer. On failure the transfer was refunded to this contract:
-    /// mark the claim PayoutFailed and credit payout + bond back to the program balance, so the
-    /// funds are not stranded. Returns whether the payout succeeded.
+    /// mark the claim PayoutFailed and credit payout + bond + flag_bond (#24) back to the program
+    /// balance, so the funds are not stranded. Returns whether the payout succeeded.
     #[private]
     pub fn on_payout(&mut self, claim_id: u64) -> bool {
         // A transfer has no return data; any non-empty result is still a success.
@@ -1091,7 +1130,11 @@ impl Contract {
             .unwrap_or_else(|| env::panic_str("claim not found"));
         require!(c.status == ClaimStatus::Paid, "claim not paid");
         c.status = ClaimStatus::PayoutFailed;
-        let (program_id, amount, hunter) = (c.program_id, c.payout.0 + c.bond.0, c.hunter.clone());
+        let (program_id, amount, hunter) = (
+            c.program_id,
+            c.payout.0 + c.bond.0 + c.flag_bond.0,
+            c.hunter.clone(),
+        );
         let p = self.program_mut(program_id);
         p.balance = U128(p.balance.0 + amount);
         emit(

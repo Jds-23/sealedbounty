@@ -2602,11 +2602,13 @@ fn test_build_uses_short_min_windows() {
         (MIN_DISPUTE_SECS, MIN_CHALLENGE_SECS),
         (SHORT_MIN_DISPUTE_SECS, SHORT_MIN_CHALLENGE_SECS)
     );
-    assert!(
-        SHORT_MIN_CHALLENGE_SECS > 0,
-        "a zero challenge window is never allowed"
-    );
-    assert!(CHALLENGE_SECS >= MIN_CHALLENGE_SECS);
+    const {
+        assert!(
+            SHORT_MIN_CHALLENGE_SECS > 0,
+            "a zero challenge window is never allowed"
+        )
+    };
+    const { assert!(CHALLENGE_SECS >= MIN_CHALLENGE_SECS) };
 }
 
 #[test]
