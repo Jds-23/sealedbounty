@@ -2551,6 +2551,91 @@ fn create_program_challenge_secs_overflow() {
     );
 }
 
+// ---------------- #23: minimum dispute / challenge windows ----------------
+
+/// v2 program with the given windows (bond 0).
+fn create_windows(c: &mut Contract, dispute_secs: u64, challenge_secs: u64) -> u64 {
+    ctx(owner(), NEAR, T0);
+    c.create_program(
+        "x".into(),
+        REPO.into(),
+        COMMIT.into(),
+        MODEL.into(),
+        tee::sha256_hex(SYS.as_bytes()),
+        tee::sha256_hex(BUNDLE.as_bytes()),
+        v2_params_hash(),
+        payouts(),
+        "k".into(),
+        dispute_secs,
+        0,
+        U128(0),
+        challenge_secs,
+        None,
+    )
+}
+
+/// #23: a production build requires one day for both windows; the v3 demo windows (dispute 180 s,
+/// challenge 150 s) and a 1 s challenge are refused.
+#[test]
+fn prod_min_windows_enforced() {
+    const DAY: u64 = 24 * 60 * 60;
+    assert_eq!((PROD_MIN_DISPUTE_SECS, PROD_MIN_CHALLENGE_SECS), (DAY, DAY));
+    let prod = |d, ch| window_error(d, ch, PROD_MIN_DISPUTE_SECS, PROD_MIN_CHALLENGE_SECS);
+    assert_eq!(prod(DAY, DAY), None);
+    assert_eq!(prod(7 * DAY, 3 * DAY), None);
+    assert_eq!(prod(DAY, 150), Some("challenge_secs below minimum"));
+    assert_eq!(prod(DAY, 1), Some("challenge_secs below minimum"));
+    assert_eq!(prod(DAY, 0), Some("challenge_secs below minimum"));
+    assert_eq!(prod(DAY, DAY - 1), Some("challenge_secs below minimum"));
+    assert_eq!(prod(180, DAY), Some("dispute_secs below minimum"));
+    assert_eq!(prod(DAY - 1, DAY), Some("dispute_secs below minimum"));
+    // dispute is checked first; overflow before the minimums
+    assert_eq!(prod(180, 150), Some("dispute_secs below minimum"));
+    assert_eq!(prod(u64::MAX, 0), Some("dispute_secs too large"));
+    assert_eq!(prod(DAY, u64::MAX), Some("challenge_secs too large"));
+}
+
+/// #23: unit tests run with the short-window minimums (same as the sandbox `short-windows` wasm).
+#[test]
+fn test_build_uses_short_min_windows() {
+    assert_eq!(
+        (MIN_DISPUTE_SECS, MIN_CHALLENGE_SECS),
+        (SHORT_MIN_DISPUTE_SECS, SHORT_MIN_CHALLENGE_SECS)
+    );
+    const {
+        assert!(
+            SHORT_MIN_CHALLENGE_SECS > 0,
+            "a zero challenge window is never allowed"
+        )
+    };
+    const { assert!(CHALLENGE_SECS >= MIN_CHALLENGE_SECS) };
+}
+
+#[test]
+#[should_panic(expected = "challenge_secs below minimum")]
+fn create_program_challenge_secs_below_min() {
+    let mut c = setup();
+    create_windows(&mut c, 60, MIN_CHALLENGE_SECS - 1);
+}
+
+#[test]
+#[should_panic(expected = "challenge_secs below minimum")]
+fn create_program_zero_challenge_secs() {
+    let mut c = setup();
+    create_windows(&mut c, 60, 0);
+}
+
+#[test]
+fn create_program_challenge_secs_at_min_ok() {
+    let mut c = setup();
+    let pid = create_windows(&mut c, MIN_DISPUTE_SECS, MIN_CHALLENGE_SECS);
+    let p = c.get_program(pid).unwrap();
+    assert_eq!(
+        (p.dispute_secs, p.challenge_secs),
+        (MIN_DISPUTE_SECS, MIN_CHALLENGE_SECS)
+    );
+}
+
 #[test]
 fn json_shapes_challenge() {
     let body = v2_req(hunter().as_str()).to_string();
@@ -2594,6 +2679,17 @@ fn proven_params_tampered_rejected() {
 /// Rust-keyed program with a hunter bond, and a claim for `body` (sealed as `ciphertext`)
 /// submitted at T0 with storage + bond, flagged at T0+1s. Returns the balance after submit.
 fn challenged_bonded(body: &str, ciphertext: &str) -> (Contract, u64, u64, u128) {
+    let (mut c, pid, cid) = bonded_pending(body, ciphertext);
+    let bal = c.get_program(pid).unwrap().balance.0;
+    // #24: the owner stakes the flag bond (= program.bond)
+    ctx(owner(), BOND, T0 + NANOS_PER_SEC);
+    c.flag_undecryptable(cid);
+    (c, pid, cid, bal)
+}
+
+/// Rust-keyed program with a hunter bond and a Pending claim for `body` (sealed as `ciphertext`),
+/// submitted at T0 with storage + bond. Not flagged.
+fn bonded_pending(body: &str, ciphertext: &str) -> (Contract, u64, u64) {
     let mut c = setup();
     ctx(owner(), 20 * NEAR, T0);
     let pid = c.create_program(
@@ -2624,13 +2720,11 @@ fn challenged_bonded(body: &str, ciphertext: &str) -> (Contract, u64, u64, u128)
         ciphertext.into(),
     );
     assert_eq!(c.get_claim(cid).unwrap().bond.0, BOND);
-    let bal = c.get_program(pid).unwrap().balance.0;
-    ctx(owner(), 0, T0 + NANOS_PER_SEC);
-    c.flag_undecryptable(cid);
-    (c, pid, cid, bal)
+    (c, pid, cid)
 }
 
 /// #2 x #4: an undecryptable claim (hunter never proves) forfeits its bond to the pool.
+/// #24: the owner's flag bond (the flag was right) goes to the pool too.
 #[test]
 fn undecryptable_forfeits_bond() {
     let body = v2_req(hunter().as_str()).to_string();
@@ -2642,8 +2736,8 @@ fn undecryptable_forfeits_bond() {
     let p = c.get_program(pid).unwrap();
     assert_eq!(
         p.balance.0,
-        bal + 5 * NEAR + BOND,
-        "payout + bond to the pool"
+        bal + 5 * NEAR + BOND + BOND,
+        "payout + hunter bond + flag bond to the pool"
     );
 }
 
@@ -2672,8 +2766,8 @@ fn prove_rejection_forfeits_bond() {
         let p = c.get_program(pid).unwrap();
         assert_eq!(
             p.balance.0,
-            bal + 5 * NEAR + BOND,
-            "{reason}: bond forfeited"
+            bal + 5 * NEAR + BOND + BOND,
+            "{reason}: hunter bond forfeited, flag bond to the pool"
         );
     }
 }
@@ -2688,8 +2782,116 @@ fn proven_bonded_claim_paid_with_bond() {
     assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Pending);
     ctx(stranger(), 0, t);
     assert!(matches!(c.finalize(cid), PromiseOrValue::Promise(_)));
-    assert_eq!(transfers(), vec![(hunter(), 5 * NEAR + BOND)]);
+    // #24: the owner's flag bond goes to the hunter with the payout
+    assert_eq!(transfers(), vec![(hunter(), 5 * NEAR + BOND + BOND)]);
     assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::Paid);
+    let ev = events();
+    assert_eq!(ev[0]["event"], "claim_paid");
+    assert_eq!(ev[0]["data"][0]["flag_bond"], BOND.to_string());
+}
+
+// ---------------- #24: owner flag bond ----------------
+
+/// #24: flagging used to be free; now the owner must stake `program.bond`.
+#[test]
+#[should_panic(expected = "insufficient flag bond")]
+fn flag_without_bond_panics() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (mut c, _, cid) = bonded_pending(&body, &seal(&body));
+    ctx(owner(), BOND - 1, T0 + NANOS_PER_SEC);
+    c.flag_undecryptable(cid);
+}
+
+#[test]
+fn flag_bond_held_and_excess_refunded() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (mut c, pid, cid) = bonded_pending(&body, &seal(&body));
+    assert_eq!(c.get_claim(cid).unwrap().flag_bond.0, 0);
+    let bal = c.get_program(pid).unwrap().balance.0;
+    ctx(owner(), BOND + 3 * NEAR, T0 + NANOS_PER_SEC);
+    c.flag_undecryptable(cid);
+    let cl = c.get_claim(cid).unwrap();
+    assert_eq!((cl.status, cl.flag_bond.0), (ClaimStatus::Challenged, BOND));
+    assert_eq!(transfers(), vec![(owner(), 3 * NEAR)], "excess refunded");
+    let ev = events();
+    assert_eq!(ev[0]["event"], "claim_challenged");
+    assert_eq!(ev[0]["data"][0]["flag_bond"], BOND.to_string());
+    // held by the claim, not by the pool
+    assert_eq!(c.get_program(pid).unwrap().balance.0, bal);
+    let j = serde_json::to_value(&cl).unwrap();
+    assert_eq!(j["flag_bond"], BOND.to_string());
+}
+
+/// A zero-bond program has a zero flag bond: flagging needs no deposit (the minimum challenge
+/// window, #23, is what protects hunters there). Unflagged claims show flag_bond "0".
+#[test]
+fn flag_bond_zero_for_zero_bond_program() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (c, _, cid) = challenged(&body, JUNK_CT);
+    assert_eq!(c.get_claim(cid).unwrap().flag_bond.0, 0);
+    let (c2, _, cid2, _) = pending();
+    let j = serde_json::to_value(c2.get_claim(cid2).unwrap()).unwrap();
+    assert_eq!(j["flag_bond"], "0");
+}
+
+/// A proven claim keeps its flag bond until finalize pays it out with the claim.
+#[test]
+fn flag_bond_proven_event() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (mut c, _, cid, _) = challenged_bonded(&body, &seal(&body));
+    prove_as(
+        &mut c,
+        hunter(),
+        T0 + 2 * NANOS_PER_SEC,
+        cid,
+        &hex::encode(EPH_SK),
+    );
+    let ev = events();
+    assert_eq!(ev[0]["event"], "claim_proven");
+    assert_eq!(ev[0]["data"][0]["flag_bond"], BOND.to_string());
+    assert!(transfers().is_empty(), "paid with the claim at finalize");
+    assert_eq!(c.get_claim(cid).unwrap().flag_bond.0, BOND);
+}
+
+/// #24 x #8: a failed payout of a proven claim credits payout + bond + flag bond to the pool.
+#[test]
+fn on_payout_failure_credits_flag_bond() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (mut c, pid, cid, bal) = challenged_bonded(&body, &seal(&body));
+    let t = T0 + 2 * NANOS_PER_SEC;
+    prove_as(&mut c, hunter(), t, cid, &hex::encode(EPH_SK));
+    ctx(stranger(), 0, t);
+    drop(c.finalize(cid));
+    callback_ctx(near_sdk::PromiseResult::Failed);
+    assert!(!c.on_payout(cid));
+    assert_eq!(c.get_claim(cid).unwrap().status, ClaimStatus::PayoutFailed);
+    let p = c.get_program(pid).unwrap();
+    assert_eq!(
+        (p.balance.0, p.reserved.0),
+        (bal + 5 * NEAR + BOND + BOND, 0)
+    );
+    assert_eq!(
+        events()[0]["data"][0]["amount"],
+        (5 * NEAR + BOND + BOND).to_string()
+    );
+}
+
+/// #24 x #6: a proven claim whose signer is revoked before finalize is Rejected; the flag bond
+/// goes to the pool with the payout and the hunter bond (nothing is stranded).
+#[test]
+fn revoked_after_proof_flag_bond_to_pool() {
+    let body = v2_req(hunter().as_str()).to_string();
+    let (mut c, pid, cid, bal) = challenged_bonded(&body, &seal(&body));
+    let t = T0 + 2 * NANOS_PER_SEC;
+    prove_as(&mut c, hunter(), t, cid, &hex::encode(EPH_SK));
+    ctx(admin(), 0, t);
+    c.revoke_signer(test_signer());
+    ctx(stranger(), 0, t);
+    assert!(matches!(c.finalize(cid), PromiseOrValue::Value(())));
+    assert_rejected(&c, pid, cid, SIGNER_REVOKED);
+    assert!(transfers().is_empty());
+    let p = c.get_program(pid).unwrap();
+    assert_eq!(p.balance.0, bal + 5 * NEAR + BOND + BOND);
 }
 
 // ---------------------------------------------------------------- #15 cross-language vectors

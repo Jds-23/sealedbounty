@@ -41,6 +41,11 @@ near-sdk = { version = "5.30.1", features = ["unstable"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 crypto_box = { version = "0.9", default-features = false, features = ["salsa20", "alloc"] }
 
+[features]
+# #23: lowers the create_program window minimums (MIN_DISPUTE_SECS / MIN_CHALLENGE_SECS) from one day
+# to seconds. For the sandbox tests and short-window demo deploys only; never for production builds.
+short-windows = []
+
 [dev-dependencies]
 near-sdk = { version = "5.30", features = ["unit-testing", "unstable"] }
 near-sandbox = "0.4.0"

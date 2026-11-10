@@ -8,6 +8,10 @@ decrypted, the owner can challenge it, and the hunter must then prove the cipher
 bond. The spec is [`docs/INTERFACE.md`](../../docs/INTERFACE.md) (v3 section), but this README is
 written from `src/lib.rs`, and `tests/readme_methods.rs` checks that every `pub fn` is listed here.
 
+**In source, not on `sealedbounty-v3.testnet`** (v4, next deploy; [`docs/INTERFACE.md`](../../docs/INTERFACE.md)
+"v4"): minimum dispute/challenge windows (#23) and the owner flag bond on `flag_undecryptable` (#24), marked
+"v4" below. The deployed v3 contract has neither: no window minimum, and `flag_undecryptable` is not payable.
+
 ## State
 `Contract`:
 | Field | Type | Notes |
@@ -28,7 +32,8 @@ reserved: U128 (sum of Pending payouts), open, created_at`.
 
 `Claim`: `id, program_id, hunter, req_hash, resp_hash (sha256 of resp_body; the body itself is not
 stored), verdict: {valid, severity, cwe?, confidence}, signer, kind, signature, model, ciphertext,
-status, payout, submitted_at, finalize_after, reject_reason?, bond, challenge_deadline?`.
+status, payout, submitted_at, finalize_after, reject_reason?, bond, challenge_deadline?, flag_bond` (v4:
+the owner's stake from `flag_undecryptable`, `"0"` until flagged).
 
 `status` ∈ `Pending`, `Challenged`, `Rejected`, `Paid`, `PayoutFailed`.
 
@@ -43,9 +48,10 @@ stateDiagram-v2
     Pending --> Paid: finalize (after finalize_after)
     Paid --> PayoutFailed: on_payout (transfer failed)
 ```
-- Rejected: the payout goes from `reserved` back to `balance`, and the hunter's bond is forfeited to `balance`.
-- Paid: the contract transfers `payout + bond` to the hunter. If that transfer fails, `on_payout` sets
-  `PayoutFailed` and credits `payout + bond` back to `balance`.
+- Rejected: the payout goes from `reserved` back to `balance`, and the hunter's bond is forfeited to `balance`
+  (v4: so is the owner's `flag_bond`, if the claim was flagged).
+- Paid: the contract transfers `payout + bond` (v4: `+ flag_bond`, non-zero only after a proven challenge) to the
+  hunter. If that transfer fails, `on_payout` sets `PayoutFailed` and credits the same amount back to `balance`.
 - `Rejected`, `Paid` and `PayoutFailed` are terminal.
 
 ## Dispute reason order
@@ -80,7 +86,7 @@ Challenged claim after the deadline) and `signer revoked` (from `finalize`).
 ### Programs
 | Method | Who | Effect | Panics |
 |---|---|---|---|
-| `create_program(name, repo_url, commit, model_id, system_prompt_hash, code_hash, params_hash, payouts, owner_enc_pubkey, dispute_secs, min_confidence, bond: U128, challenge_secs, signers: Option<Vec<Signer>>) -> u64` | anyone, **payable** | caller becomes the program owner. The hashes are stored lowercase. `signers` = None → every allowlisted signer whose `meta.model == model_id`. Some(list) → each entry must be allowlisted with that model (duplicates are dropped). `balance` = deposit − storage. Emits `program_created` | `system_prompt_hash must be 64 hex chars`, `code_hash must be 64 hex chars`, `params_hash must be 64 hex chars`, `min_confidence must be <= 100`, `dispute_secs too large`, `challenge_secs too large`, `signer not allowlisted`, `no signers for model`, `insufficient storage deposit` |
+| `create_program(name, repo_url, commit, model_id, system_prompt_hash, code_hash, params_hash, payouts, owner_enc_pubkey, dispute_secs, min_confidence, bond: U128, challenge_secs, signers: Option<Vec<Signer>>) -> u64` | anyone, **payable** | caller becomes the program owner. The hashes are stored lowercase. `signers` = None → every allowlisted signer whose `meta.model == model_id`. Some(list) → each entry must be allowlisted with that model (duplicates are dropped). `balance` = deposit − storage. Emits `program_created` | `system_prompt_hash must be 64 hex chars`, `code_hash must be 64 hex chars`, `params_hash must be 64 hex chars`, `min_confidence must be <= 100`, `dispute_secs too large`, `challenge_secs too large`, v4: `dispute_secs below minimum`, `challenge_secs below minimum` (one day each in a production build; 0 s / 10 s with the `short-windows` feature), `signer not allowlisted`, `no signers for model`, `insufficient storage deposit` |
 | `set_program_signers(program_id, signers: Vec<Signer>)` | program owner, **payable** (storage growth; the rest is refunded) | replaces `program.signers` (same subset rule). Only future submissions use the new set. Emits `program_signers_set` | `program not found`, `program owner only`, `signer not allowlisted`, `no signers for model`, `insufficient storage deposit` |
 | `fund_program(program_id)` | anyone, **payable** | adds the deposit to `balance`. Emits `program_funded` | `attach a deposit`, `program not found`, `program closed` |
 | `close_program(program_id)` | program owner | sets `open = false` and refunds `balance`. `reserved` stays for pending claims. Can be called again to sweep funds that come back later (rejections, failed payouts). Emits `program_closed` | `program not found`, `program owner only` |
@@ -90,10 +96,10 @@ Challenged claim after the deadline) and `signer revoked` (from `finalize`).
 |---|---|---|---|
 | `submit_claim(program_id, req_hash, resp_body: Base64VecU8, signature, signer, kind, ciphertext) -> u64` | hunter (caller), **payable** (storage + `program.bond`; the rest is refunded) | verifies the TEE signature against `program.model_id`, parses the verdict, moves the payout from `balance` to `reserved`, and sets `finalize_after = now + dispute_secs`. Emits `claim_submitted` | `program not found`, `program closed`, `signer not allowlisted` (not in `program.signers` or not in the global allowlist), `signer kind mismatch`, `req_hash must be 64 hex chars`, `bad signature`, `bad completion json: ...`, `missing choices[0].message.content`, `bad verdict json: ...`, `verdict not payable` (invalid, severity none, or confidence < `min_confidence`), `already claimed`, `insufficient pool`, `insufficient storage deposit`, `insufficient bond` |
 | `dispute(claim_id, request_body: String)` | program owner, while Pending and `now < finalize_after` | → Rejected with the first failing reason (see above) | `claim not found`, `program owner only`, `claim not pending`, `dispute window closed`, `body mismatch`, `dispute invalid: request matches program` |
-| `flag_undecryptable(claim_id)` | program owner, while Pending and `now < finalize_after` | → Challenged with `challenge_deadline = now + challenge_secs`. Emits `claim_challenged` | `claim not found`, `program owner only`, `claim not pending`, `dispute window closed` |
+| `flag_undecryptable(claim_id)` | program owner, while Pending and `now < finalize_after`; v4: **payable** (`program.bond` as the flag bond; the rest is refunded) | → Challenged with `challenge_deadline = now + challenge_secs`; v4: stores `flag_bond`. Emits `claim_challenged` | `claim not found`, `program owner only`, `claim not pending`, `dispute window closed`, v4: `insufficient flag bond` |
 | `prove_ciphertext(claim_id, ephemeral_secret: String /* 64 hex */)` | claim hunter, while Challenged and `now < challenge_deadline` | opens the nacl box with the ephemeral secret and the owner's key. If it doesn't open, or sha256(plaintext) ≠ `req_hash` → Rejected `undecryptable report`. Otherwise it runs the dispute checks: a failing reason → Rejected with that reason, and if all pass → Pending with `finalize_after = now`. Emits `claim_proven` or `claim_rejected` | `claim not found`, `claim hunter only`, `claim not challenged`, `challenge closed`, `ephemeral_secret must be 64 hex chars` |
-| `finalize(claim_id) -> PromiseOrValue<()>` | anyone | Challenged after the deadline → Rejected `undecryptable report`. Pending with a revoked signer → Rejected `signer revoked`. Otherwise → Paid, then transfers `payout + bond` to the hunter and calls `on_payout` (10 Tgas). Emits `claim_paid` or `claim_rejected` | `claim not found`, `challenge open`, `claim not pending`, `dispute window open` |
-| `on_payout(claim_id) -> bool` | contract only (`#[private]`), as the callback of `finalize` | if the transfer failed: Paid → PayoutFailed, and `payout + bond` goes back to `balance`. Emits `payout_failed` | `Method on_payout is private`, `claim not found`, `claim not paid` |
+| `finalize(claim_id) -> PromiseOrValue<()>` | anyone | Challenged after the deadline → Rejected `undecryptable report`. Pending with a revoked signer → Rejected `signer revoked`. Otherwise → Paid, then transfers `payout + bond` (v4: `+ flag_bond`) to the hunter and calls `on_payout` (10 Tgas). Emits `claim_paid` or `claim_rejected` | `claim not found`, `challenge open`, `claim not pending`, `dispute window open` |
+| `on_payout(claim_id) -> bool` | contract only (`#[private]`), as the callback of `finalize` | if the transfer failed: Paid → PayoutFailed, and `payout + bond` (v4: `+ flag_bond`) goes back to `balance`. Emits `payout_failed` | `Method on_payout is private`, `claim not found`, `claim not paid` |
 
 ### Views
 | Method | Returns |
@@ -119,10 +125,10 @@ NEP-297 log `EVENT_JSON:{"standard":"sealedbounty","version":"1.0.0","event":E,"
 | `program_funded` | `program_id, amount, balance` |
 | `program_closed` | `program_id, refund` |
 | `claim_submitted` | `claim_id, program_id, hunter, req_hash, severity, payout, bond, finalize_after` |
-| `claim_challenged` | `claim_id, program_id, challenge_deadline` |
-| `claim_proven` | `claim_id, program_id, finalize_after` |
+| `claim_challenged` | `claim_id, program_id, challenge_deadline` (v4: `, flag_bond`) |
+| `claim_proven` | `claim_id, program_id, finalize_after` (v4: `, flag_bond`) |
 | `claim_rejected` | `claim_id, program_id, reason` |
-| `claim_paid` | `claim_id, program_id, hunter, payout, bond` |
+| `claim_paid` | `claim_id, program_id, hunter, payout, bond` (v4: `, flag_bond`) |
 | `payout_failed` | `claim_id, program_id, hunter, amount` |
 
 ## Storage, bond, gas
@@ -151,7 +157,8 @@ NEP-297 log `EVENT_JSON:{"standard":"sealedbounty","version":"1.0.0","event":E,"
 
 ## Build / test / deploy
 ```sh
-cargo near build non-reproducible-wasm      # -> target/near/sealed_bounty.wasm
+cargo near build non-reproducible-wasm      # -> target/near/sealed_bounty.wasm (v4: one-day window minimums)
+cargo near build non-reproducible-wasm --features short-windows   # v4: tests/demos only (10 s challenge minimum)
 cargo test -- --nocapture                   # unit tests + near-sandbox e2e (real TEE fixtures), prints gas
 cargo test --test readme_methods            # docs check: every pub fn in src/lib.rs is in this README
 cargo clippy --all-targets
