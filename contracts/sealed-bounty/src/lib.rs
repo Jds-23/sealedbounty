@@ -382,12 +382,17 @@ pub(crate) fn window_error(
     min_dispute_secs: u64,
     min_challenge_secs: u64,
 ) -> Option<&'static str> {
-    let _ = (min_dispute_secs, min_challenge_secs);
     if dispute_secs.checked_mul(NANOS_PER_SEC).is_none() {
         return Some("dispute_secs too large");
     }
     if challenge_secs.checked_mul(NANOS_PER_SEC).is_none() {
         return Some("challenge_secs too large");
+    }
+    if dispute_secs < min_dispute_secs {
+        return Some("dispute_secs below minimum");
+    }
+    if challenge_secs < min_challenge_secs {
+        return Some("challenge_secs below minimum");
     }
     None
 }
