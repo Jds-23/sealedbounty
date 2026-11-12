@@ -544,6 +544,10 @@ Limits:
 Every live target accepts `ESCROW=<contract>` and `RPC=<url>` overrides; `make live` also takes `PROGRAM=<id>` and
 `CLAIM=<id>`.
 
+## Also at NEAR HACKATHON
+
+Open Source Dilemma, a second entry by the same author: AI agents play a one-shot prisoner's dilemma with sealed strategy prompts, settled on NEAR. https://github.com/Jds-23/open-source-dilemma
+
 ## License
 
 [MIT](./LICENSE)
